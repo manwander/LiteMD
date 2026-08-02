@@ -1,0 +1,5 @@
+# Rust / Cargo
+/target
+
+# Tauri 生成物
+/gen

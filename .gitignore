@@ -1,0 +1,11 @@
+node_modules
+dist
+dist.old
+.DS_Store
+vite.config.ts.timestamp-*.mjs
+
+# AI 代理记忆 / 会话产物（非项目代码）
+.workbuddy/
+memory/
+.qoder/
+.reasonix/
