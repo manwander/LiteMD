@@ -14,6 +14,14 @@
   --hl-comment: #a0a1a7;
   --hl-func: #4078f2;
   --hl-type: #c18401;
+
+  /* 安全区域：支持刘海屏 / 圆角屏 / Windows 11 Mica */
+  /* stylelint-disable-next-line value-keyword-case */
+  --safe-top: env(safe-area-inset-top, 0px);
+  /* stylelint-disable-next-line value-keyword-case */
+  --safe-left: env(safe-area-inset-left, 0px);
+  /* stylelint-disable-next-line value-keyword-case */
+  --safe-right: env(safe-area-inset-right, 0px);
 }
 
 :root[data-theme="dark"] {
@@ -31,6 +39,14 @@
   --hl-comment: #7f848e;
   --hl-func: #61afef;
   --hl-type: #e5c07b;
+
+  /* 安全区域 */
+  /* stylelint-disable-next-line value-keyword-case */
+  --safe-top: env(safe-area-inset-top, 0px);
+  /* stylelint-disable-next-line value-keyword-case */
+  --safe-left: env(safe-area-inset-left, 0px);
+  /* stylelint-disable-next-line value-keyword-case */
+  --safe-right: env(safe-area-inset-right, 0px);
 }
 
 * {
@@ -64,8 +80,13 @@ body {
   align-items: center;
   gap: 16px;
   padding: 0 12px;
+  padding-left: calc(12px + var(--safe-left));
+  padding-right: calc(12px + var(--safe-right));
+  padding-top: var(--safe-top);
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  /* 防止刘海屏 / 圆角内容被裁剪 */
+  box-sizing: border-box;
 }
 
 .brand {
@@ -166,6 +187,8 @@ body {
   align-items: center;
   margin-left: auto;
   gap: 2px;
+  /* 安全区域右对齐 */
+  padding-right: var(--safe-right);
 }
 
 .wc {
@@ -179,17 +202,22 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  transition: background 0.15s, color 0.15s;
 }
 
 .wc:hover {
   background: var(--border);
   color: var(--text);
-  border-color: transparent;
 }
 
 .wc-close:hover {
   background: #e81123;
   color: #fff;
+}
+
+/* 深色主题下关闭按钮 hover 红色更深，提升对比度 */
+:root[data-theme="dark"] .wc-close:hover {
+  background: #c01020;
 }
 
 /* 窗口边缘 / 四角缩放手柄（decorations: false 无系统缩放边框） */
@@ -246,6 +274,13 @@ body {
   flex-shrink: 0;
 }
 
+/* 超大文档预览降级提示 */
+.pv-hint {
+  font-size: 12px;
+  color: var(--text-2);
+  opacity: 0.85;
+}
+
 /* 面板头按钮：统一小尺寸，图标/短文字居中 */
 .panel-head button {
   min-width: 26px;
@@ -290,6 +325,13 @@ button:disabled:hover {
   padding: 4px 8px;
   border-radius: 4px;
   cursor: pointer;
+}
+
+/* 文件树虚拟化占位行（大目录时撑起滚动高度） */
+.sidebar li.vsp {
+  padding: 0;
+  cursor: default;
+  pointer-events: none;
 }
 
 .sidebar li.folder {
@@ -535,11 +577,13 @@ button:disabled:hover {
   flex-shrink: 0;
 }
 
+/* preview-content 仅作为 VirtualPreview 容器，滚动由 VirtualPreview 自身处理 */
 .preview-content {
   flex: 1;
-  overflow: auto;
-  padding: 16px 24px;
-  line-height: 1.7;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .preview-content h1 {
@@ -776,4 +820,463 @@ button.on {
 
 .statusbar .spacer {
   flex: 1;
+}
+
+/* ===== 多标签栏 ===== */
+.tabbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 34px;
+  padding: 4px 8px 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-shrink: 0;
+  scrollbar-width: thin;
+}
+
+.tabbar::-webkit-scrollbar {
+  height: 4px;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 200px;
+  height: 30px;
+  padding: 0 8px 0 12px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s, color 0.15s;
+}
+
+.tab:hover {
+  color: var(--text);
+  background: var(--pill);
+}
+
+.tab.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-dot {
+  color: var(--accent);
+  font-size: 9px;
+  margin-left: 2px;
+}
+
+.tab-close {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.tab-close:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.tab.active .tab-close:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 编辑区文件名旁的关闭按钮 */
+.file-close {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 预览开关图标（SVG 眼睛） */
+.ico {
+  display: block;
+}
+
+/* 中文查找/替换面板（CodeMirror 内嵌，跟随主题变量，浅色/深色通用） */
+.cm-search-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.cm-search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cm-search-label {
+  flex-shrink: 0;
+  width: 32px;
+  color: var(--text-2);
+}
+.cm-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+.cm-search-input:focus {
+  border-color: var(--accent);
+}
+.cm-search-opts {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-2);
+}
+.cm-search-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.cm-search-check input {
+  accent-color: var(--accent);
+}
+.cm-search-count {
+  margin-left: auto;
+  color: var(--text-2);
+}
+.cm-search-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cm-search-btns button {
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cm-search-btns button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cm-search-btns .cm-search-btn-main {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.cm-search-btns .cm-search-btn-main:hover {
+  opacity: 0.88;
+  color: #fff;
+}
+
+/* 预览编辑模式容器：contenteditable 渲染预览 */
+.preview-edit {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 24px 28px;
+  font-size: 14px;
+  line-height: 1.7;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.preview-edit:focus {
+  outline: none;
+}
+
+.preview-edit img {
+  max-width: 100%;
+}
+
+/* 预览编辑模式下渲染的 markdown 元素样式（与右侧预览保持一致的视觉） */
+.preview-edit h1 {
+  font-size: 24px;
+}
+.preview-edit h2 {
+  font-size: 19px;
+}
+.preview-edit h3 {
+  font-size: 16px;
+}
+.preview-edit blockquote {
+  border-left: 3px solid var(--accent);
+  margin: 0;
+  padding-left: 12px;
+  color: var(--text-2);
+}
+.preview-edit pre {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow: auto;
+}
+.preview-edit code {
+  font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+  font-size: 13px;
+}
+.preview-edit table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 12px 0;
+  font-size: 14px;
+}
+.preview-edit th,
+.preview-edit td {
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  text-align: left;
+}
+.preview-edit th {
+  background: var(--panel);
+  font-weight: 600;
+}
+.preview-edit li.task {
+  list-style: none;
+  margin-left: -20px;
+}
+.preview-edit li.task input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+
+/* 隐藏文件/文件夹管理弹窗 */
+.hm-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 130;
+}
+
+.hm-pop {
+  width: 460px;
+  max-width: 92vw;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
+  padding: 18px 20px;
+  gap: 12px;
+}
+
+.hm-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.hm-empty {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.6;
+  padding: 8px 0;
+}
+
+.hm-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hm-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.hm-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text);
+  direction: rtl; /* 路径过长时优先保留文件名（右侧） */
+  text-align: left;
+}
+
+.hm-unhide {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.hm-unhide:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.hm-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.hm-close {
+  height: 32px;
+  padding: 0 16px;
+  font-size: 13px;
+}
+
+/* ===== 深色主题：滚动条暗色化（与背景保持一点颜色差） ===== */
+:root[data-theme="dark"] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: #3a3b40; /* 比背景 #1a1b1e 亮一档，可见但不刺眼 */
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: #4c4d55;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Firefox 深色滚动条 */
+:root[data-theme="dark"] {
+  scrollbar-color: #3a3b40 transparent;
+  scrollbar-width: thin;
+}
+
+/* 预览编辑模式下 CodeMirror 隐藏、状态栏路径显示当前标签 */
+.editor-host:empty {
+  display: none;
+}
+
+/* 大文档载入遮罩：打开 >8MB 文件期间覆盖编辑器区，FCP 与文档大小解耦 */
+.loading-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: var(--bg, #fff);
+  color: var(--text-2, #6b6b6b);
+  font-size: 13px;
+}
+.loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--border, #e3e5e8);
+  border-top-color: var(--accent, #0f6e56);
+  border-radius: 50%;
+  animation: litemd-spin 0.8s linear infinite;
+}
+.loading-text {
+  letter-spacing: 0.04em;
+}
+/* 分片流式载入进度条 */
+.loading-bar {
+  width: 220px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border, #e3e5e8);
+  overflow: hidden;
+}
+.loading-bar-fill {
+  height: 100%;
+  background: var(--accent, #0f6e56);
+  transition: width 80ms linear;
+}
+@keyframes litemd-spin {
+  to { transform: rotate(360deg); }
+}
+/* 预览面板「已暂停实时预览」旁的手动刷新按钮：大文档禁用态 */
+.panel-head button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* P1-1：窗口拖拽/缩放期间冻结预览渲染。content-visibility:hidden 跳过子树 layout+paint，
+   即使此时发生任何强制重排也不占用主线程；窗口恢复后于下次滚动重新渲染。 */
+.window-busy .virtual-preview {
+  content-visibility: hidden;
+}
+
+/* P1-5：预览图片尺寸约束。markdown-it 渲染规则会按尺寸索引注入 width/height 作为
+   aspect-ratio 提示预留空间，避免加载完成滚动跳变；max-width:100% + height:auto 保证
+   大图不溢出容器、且高度随比例自适应（仅占位，不改变可见尺寸）。 */
+.virtual-preview img,
+.vblock img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* P1-7：低端模式全局关闭 backdrop-filter（集显上最贵的单项合成成本） */
+body.low-end * {
+  backdrop-filter: none !important;
 }

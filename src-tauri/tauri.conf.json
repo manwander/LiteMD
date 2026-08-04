@@ -38,6 +38,12 @@
       "icons/128x128@2x.png",
       "icons/icon.ico",
       "icons/icon.png"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese"],
+        "installerHooks": "custom.nsh"
+      }
+    }
   }
 }

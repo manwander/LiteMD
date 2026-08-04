@@ -7,9 +7,10 @@
   export let message = "";
   export let confirmText = "确定";
   export let cancelText = "取消";
+  export let thirdText = ""; // 可选第三按钮（如“保存并关闭”），为空则不显示
   export let danger = false;
 
-  const dispatch = createEventDispatcher<{ confirm: void; cancel: void }>();
+  const dispatch = createEventDispatcher<{ confirm: void; cancel: void; third: void }>();
 
   let btn: HTMLButtonElement;
   onMount(() => btn?.focus());
@@ -39,6 +40,9 @@
     <div class="cm-title">{title}</div>
     <div class="cm-msg">{message}</div>
     <div class="cm-btns">
+      {#if thirdText}
+        <button class="cm-btn cm-btn-third" on:click={() => dispatch("third")}>{thirdText}</button>
+      {/if}
       <button class="cm-btn" on:click={() => dispatch("cancel")}>{cancelText}</button>
       <button class="cm-btn" class:danger bind:this={btn} on:click={() => dispatch("confirm")}
         >{confirmText}</button>
@@ -105,5 +109,19 @@
     background: #d32f2f;
     border-color: #d32f2f;
     color: #fff;
+  }
+
+  /* 第三按钮（保存并关闭）：主操作强调色 */
+  .cm-btn-third {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+
+  .cm-btn-third:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    filter: brightness(1.1);
   }
 </style>

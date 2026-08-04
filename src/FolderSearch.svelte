@@ -3,6 +3,7 @@
   // 结果按文件分组，点击单条结果跳转到对应文件对应行。
   import { createEventDispatcher } from "svelte";
   import { searchInFolder, replaceInFolder, type FolderMatch } from "./fs";
+  import ConfirmModal from "./ConfirmModal.svelte";
 
   export let folder: string;
 
@@ -18,6 +19,11 @@
   let busy = false;
   let searched = false;
   let message = "";
+  let truncated = false;
+
+  // 结果按文件分组后仅渲染前 N 组，其余懒展开，避免上万节点一次性挂载
+  const GROUP_BATCH = 30;
+  let visibleGroups = GROUP_BATCH;
 
   const norm = (s: string) => s.replace(/\\/g, "/");
 
@@ -29,9 +35,14 @@
     busy = true;
     message = "";
     try {
-      results = await searchInFolder(folder, query, caseSensitive);
+      const res = await searchInFolder(folder, query, caseSensitive);
+      results = res.matches;
+      truncated = res.truncated;
+      visibleGroups = GROUP_BATCH;
       searched = true;
-      message = results.length ? `找到 ${results.length} 处匹配` : "未找到匹配";
+      message = results.length
+        ? `找到 ${results.length} 处匹配${truncated ? "（结果过多，已截断）" : ""}`
+        : "未找到匹配";
     } catch (e) {
       message = "查找失败：" + String(e);
     } finally {
@@ -39,15 +50,18 @@
     }
   }
 
+  let confirmReplace = false;
+
   async function doReplaceAll() {
     if (!query) {
       message = "请输入查找内容";
       return;
     }
-    const ok = window.confirm(
-      `将在文件夹下所有 .md 中把「${query}」替换为「${replacement}」。\n此操作不可撤销，确定继续？`
-    );
-    if (!ok) return;
+    confirmReplace = true;
+  }
+
+  async function onReplaceConfirm() {
+    confirmReplace = false;
     busy = true;
     message = "";
     try {
@@ -126,7 +140,7 @@
 
     <div class="results">
       {#if grouped.length}
-        {#each grouped as [path, matches]}
+        {#each grouped.slice(0, visibleGroups) as [path, matches]}
           <div class="file-group">
             <div class="file-name" title={path}>
               {rel(path)}
@@ -141,6 +155,11 @@
             {/each}
           </div>
         {/each}
+        {#if grouped.length > visibleGroups}
+          <button class="more" on:click={() => (visibleGroups += GROUP_BATCH)}>
+            展开更多（还有 {grouped.length - visibleGroups} 个文件）
+          </button>
+        {/if}
       {:else if searched}
         <div class="empty">无匹配结果</div>
       {:else}
@@ -149,6 +168,17 @@
     </div>
   </div>
 </div>
+
+{#if confirmReplace}
+  <ConfirmModal
+    title="批量替换确认"
+    message={`将在文件夹下所有 .md 中把「${query}」替换为「${replacement}」。\n此操作不可撤销，确定继续？`}
+    confirmText="全部替换"
+    danger={true}
+    on:confirm={onReplaceConfirm}
+    on:cancel={() => (confirmReplace = false)}
+  />
+{/if}
 
 <style>
   .mask {
@@ -308,6 +338,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .more {
+    display: block;
+    margin: 8px auto 4px;
+    padding: 4px 14px;
+    font-size: 12px;
   }
 
   .empty {

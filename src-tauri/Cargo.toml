@@ -21,10 +21,19 @@ tauri-plugin-dialog = "2"
 # 图片压缩：仅启用 JPEG/PNG 编解码，控制二进制体积
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 base64 = "0.22"
+# 孤儿清理精确匹配 Markdown 图片引用
+regex = "1"
+# 导出 PDF：markdown 解析 + PDF 渲染（默认无额外 feature，依赖轻）
+pulldown-cmark = "0.12"
+printpdf = "0.6"
+# 测量文本宽度做换行（printpdf 同款字体解析器）
+owned_ttf_parser = "0.21"
 
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "s"
+# 速度优先（原 "s" 为体积优先：搜索/压缩/序列化等所有 Rust 热路径换体积牺牲了速度）；
+# exe 体积预计仅增 10~20%，对桌面应用无影响
+opt-level = 3
 strip = true

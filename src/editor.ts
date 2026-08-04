@@ -1,21 +1,42 @@
 // CodeMirror 6 封装：创建编辑器、外观（主题 + 字号）热切换、格式化命令、数据驱动快捷键。
 // 所有命令供工具栏按钮与「快捷键设置」面板统一调用。
 import { EditorView, lineNumbers, highlightActiveLineGutter, highlightSpecialChars,
-  drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightActiveLine,
+  drawSelection, dropCursor, rectangularSelection, highlightActiveLine,
   keymap, gutter, GutterMarker, type KeyBinding, type Command } from "@codemirror/view";
-import { EditorState, EditorSelection, Compartment, StateField } from "@codemirror/state";
+import { EditorState, EditorSelection, Compartment, StateField, Prec, Annotation } from "@codemirror/state";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { LanguageDescription, LanguageSupport, StreamLanguage, syntaxHighlighting, defaultHighlightStyle, indentOnInput, indentUnit, bracketMatching, foldGutter, foldKeymap } from "@codemirror/language";
+import { LanguageDescription, LanguageSupport, StreamLanguage, syntaxHighlighting, defaultHighlightStyle, indentOnInput, indentUnit, bracketMatching, foldGutter, foldKeymap, syntaxTree } from "@codemirror/language";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { history, historyKeymap, indentWithTab, undo, redo } from "@codemirror/commands";
-import { closeBrackets, closeBracketsKeymap, autocompletion, completionKeymap } from "@codemirror/autocomplete";
-import { highlightSelectionMatches, searchKeymap, openSearchPanel } from "@codemirror/search";
+import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
+import { highlightSelectionMatches } from "@codemirror/search";
+// 代码块围栏检查点索引（Enter 智能换行用，避免大文档逐行扫描）
+import {
+  type FenceDoc,
+  markFenceDirty,
+  scheduleFenceRebuild,
+  isInsideCodeBlock as fenceInsideCodeBlock,
+} from "./fence-index";
+// 中文查找/替换面板（替代 @codemirror/search 默认英文面板）
+import { chineseSearchPanel, openSearchPanel as openCnSearchPanel } from "./search-panel";
 
 // 撤销 / 重做命令再导出，供工具栏按钮调用
 export { undo, redo };
 
+// 大选区保护：全选 50MB 文档后触发格式化（bold/italic/链接/代码块等）会
+// sliceDoc(0, len) 物化整个 50MB 字符串，再 startsWith/endsWith/slice 构建等价副本，
+// 造成 ~200ms + ~100MB 临时分配。超过此阈值的选区直接短路（安全降级），
+// 仅做 O(1) 的范围差值判定，绝不物化全文。
+const MAX_FORMAT_SELECTION = 256 * 1024;
+function selectionTooLarge(state: EditorState): boolean {
+  const { from, to } = state.selection.main;
+  return to - from > MAX_FORMAT_SELECTION;
+}
+
 // 自组 setup（等效 basicSetup 但去掉 @codemirror/lint，省 30~40KB）：
-// 历史 / 行号 / 代码折叠 / 括号补全 / 自动补全 / 选区高亮 / 搜索 / 缩进
+// 历史 / 行号 / 代码折叠 / 括号补全 / 选区高亮 / 搜索 / 缩进
+// 性能瘦身：移除 autocompletion（未注册任何补全源，纯开销 + ~30KB bundle）与 crosshairCursor（写作场景无用）；
+// highlightSelectionMatches 保留但超长文档自动禁用（见 createEditor）。
 const liteSetup = [
   lineNumbers(),
   highlightActiveLineGutter(),
@@ -29,12 +50,12 @@ const liteSetup = [
   syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
   bracketMatching(),
   closeBrackets(),
-  autocompletion(),
   rectangularSelection(),
-  crosshairCursor(),
   highlightActiveLine(),
-  highlightSelectionMatches(),
-  keymap.of([...closeBracketsKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...completionKeymap]),
+  // 中文搜索面板（状态 + 键位）；原 searchKeymap 移除：Mod-f/Mod-h 由用户键位驱动，
+  // Mod-g/Mod-Shift-g/Escape 由面板 keymap 处理（Escape 无面板时返回 false 让位）
+  chineseSearchPanel(),
+  keymap.of([...closeBracketsKeymap, ...historyKeymap, ...foldKeymap]),
 ];
 
 // 注意：本模块刻意不依赖 ./settings —— 快捷键映射由 App 层转成
@@ -155,12 +176,27 @@ const liteTheme = EditorView.theme(
 const darkPatch = EditorView.theme({ "&": { height: "100%" } }, { dark: true });
 
 // 字号主题按尺寸缓存，避免每次调整都新建 StyleModule
+// 使用简单 LRU 策略：超过 MAX_CACHE_SIZE 时淘汰最老的条目
+const MAX_FONT_CACHE_SIZE = 12;
 const fontThemes = new Map<number, ReturnType<typeof EditorView.theme>>();
+const fontThemesAccessOrder: number[] = [];
+
 function fontTheme(size: number) {
   let t = fontThemes.get(size);
   if (!t) {
     t = EditorView.theme({ "&": { fontSize: `${size}px` } });
+    // 淘汰最老的条目，保持缓存不超过上限
+    if (fontThemes.size >= MAX_FONT_CACHE_SIZE) {
+      const oldest = fontThemesAccessOrder.shift();
+      if (oldest !== undefined) fontThemes.delete(oldest);
+    }
     fontThemes.set(size, t);
+    fontThemesAccessOrder.push(size);
+  } else {
+    // 更新访问顺序（移到最末表示最新）
+    const idx = fontThemesAccessOrder.indexOf(size);
+    if (idx !== -1) fontThemesAccessOrder.splice(idx, 1);
+    fontThemesAccessOrder.push(size);
   }
   return t;
 }
@@ -172,6 +208,35 @@ function appearance(dark: boolean, fontSize: number) {
 
 const appearanceCompartment = new Compartment();
 const keymapCompartment = new Compartment();
+// 选区匹配高亮开关舱：超长文档自动禁用（每次选区变化全文扫描匹配项，大文档上非常昂贵）
+const selMatchCompartment = new Compartment();
+const SEL_MATCH_LIMIT = 200_000;
+
+// 分片流式载入（P1-4 前端实现）：超过 STREAM_THRESHOLD 字符的文档改用
+// setDocStreaming 分块插入，把 Lezer 对整篇 50MB 的同步解析摊到多个事件循环
+// tick（主线程不硬冻结、遮罩可显示进度）；CM6 为虚拟化编辑器，每块 dispatch
+// 仅对视口做布局，全文解析走增量（只解析新增块区域）。
+export const STREAM_THRESHOLD = 2_000_000; // ~2MB 起启用分片
+export const STREAM_CHUNK = 1_000_000;     // 每块 ~1MB
+
+// 流式期间抑制 updateListener 的副作用（围栏索引维护 / onChange 预览推送 /
+// 选区匹配切换），全部推迟到末尾统一处理一次，避免每块重复触发。
+let suppressListener = false;
+
+// 分块区间计算抽到独立纯模块，便于无依赖单测（见 scripts/test-stream.mjs）
+import { chunkRanges } from "./chunk-ranges";
+
+// 分片流式载入（磁盘侧，P0）：Rust 经 Channel 分片推送，前端空闲帧逐片尾部 append。
+// 携带本注解的事务被 updateListener 完全跳过副作用（预览推送/自动保存/围栏维护），
+// 流结束后由 finishStreamingLoad 统一重建围栏索引。
+export const Loading = Annotation.define<boolean>();
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 0);
+  });
+}
 
 // ---------------- 数据驱动快捷键 ----------------
 function wrapCmd(marker: string): Command {
@@ -207,8 +272,8 @@ const EDITOR_COMMANDS: Record<string, Command> = {
   "format.h5": headingCmd(5),
   "edit.undo": undo,
   "edit.redo": redo,
-  "edit.find": openSearchPanel,
-  "edit.replace": openSearchPanel, // CM6 搜索面板自带替换行
+  "edit.find": (v) => openCnSearchPanel(false)(v), // Ctrl+F：中文查找面板
+  "edit.replace": (v) => openCnSearchPanel(true)(v), // Ctrl+H：中文查找替换面板
   "table.duplicateRow": duplicateTableRow,
 };
 
@@ -276,7 +341,10 @@ export function createEditor(opts: {
   fontSize: number;
   /** actionId -> CM key（Mod-Shift-o） */
   cmKeys: Record<string, string>;
-  onChange: (value: string) => void;
+  /** 文档变化通知（不携带文本；消费方在防抖到期时用 getDoc() 拉全文，避免每击键 O(n) 拷贝）。
+   *  参数为本事务合并后的变更区间：旧文档 [fromA, toA) 被替换为新文档 [fromB, toB)，
+   *  供上层累计出预览增量切块所需的脏区间（O(1) 传递，不读文档内容） */
+  onChange: (fromA: number, toA: number, fromB: number, toB: number) => void;
   onCursor?: (line: number, col: number) => void;
   /** 行内快捷按钮被点击，传入按钮位置供上层弹出菜单 */
   onQuickAction?: (rect: DOMRect) => void;
@@ -288,12 +356,14 @@ export function createEditor(opts: {
       extensions: [
         // 用户键位优先于基础键位
         keymapCompartment.of(keymap.of(buildKeymap(opts.cmKeys))),
-        // 换行：Enter 跳出表格/代码块成为全新一行（普通文本走默认回车）；
-        // Shift+Enter 留在块内（表格格内插 <br>、代码块加一行代码）；Alt+Enter 复制表格行（用户键位）
-        keymap.of([
+        // 换行：Enter 跳出表格/代码块/引用成为全新一行（普通文本走默认回车）；
+        // Shift+Enter 留在块内（表格格内插 <br>、引用内保留「> 」前缀、代码块加一行代码）；Alt+Enter 复制表格行（用户键位）
+        // 注意：markdown 语言的 Enter keymap（insertNewlineContinueMarkup）是 Prec.high，
+        // 必须用相同优先级且注册在其之前，才能拦截引用/列表续行
+        Prec.high(keymap.of([
           { key: "Enter", run: smartEnter },
           { key: "Shift-Enter", preventDefault: true, run: (v) => { softBreak(v); return true; } },
-        ]),
+        ])),
         liteSetup,
         // Tab 缩进为 4 个半角空格（约两个中文字符宽）
         indentUnit.of("    "),
@@ -301,13 +371,51 @@ export function createEditor(opts: {
         markdown({ base: markdownLanguage, codeLanguages }),
         quickActionGutter((rect) => opts.onQuickAction?.(rect)),
         orderedListRenumber,
+        selMatchCompartment.of(
+          opts.doc.length <= SEL_MATCH_LIMIT ? highlightSelectionMatches() : []
+        ),
         appearanceCompartment.of(appearance(opts.dark, opts.fontSize)),
         EditorView.updateListener.of((u) => {
-          if (u.docChanged) opts.onChange(u.state.doc.toString());
+          if (suppressListener) return;
+          // 流式载入分片：跳过一切副作用（不推预览、不触发保存、不维护围栏）
+          if (u.transactions.some((t) => t.annotation(Loading))) return;
+          if (u.docChanged) {
+            // 围栏索引维护：若本次变更涉及换行或 ``` 字面量，标记索引落后，
+            // 空闲帧重建（期间 Enter 判定走有界上扫，安全降级）。
+            let touchesFence = false;
+            u.changes.iterChanges((_fa, _ta, fb, tb) => {
+              if (touchesFence) return;
+              const ins = u.state.doc.sliceString(fb, Math.min(tb, fb + 600));
+              if (ins.includes("\n") || /```/.test(ins)) touchesFence = true;
+            });
+            if (touchesFence) {
+              markFenceDirty();
+              scheduleFenceRebuild(() => u.view.state.doc as unknown as FenceDoc);
+            }
+            // 合并本事务所有变更为单个外包区间（iterChanges 的 A/B 坐标各自相对同一旧/新文档，
+            // 取外包后仍为合法替换区间）；单点打字时即单字符区间
+            let fA = Infinity, tA = -1, fB = Infinity, tB = -1;
+            u.changes.iterChanges((fa, ta, fb, tb) => {
+              if (fa < fA) fA = fa;
+              if (ta > tA) tA = ta;
+              if (fb < fB) fB = fb;
+              if (tb > tB) tB = tb;
+            });
+            opts.onChange(fA, tA, fB, tB);
+          }
           if (opts.onCursor && (u.docChanged || u.selectionSet)) {
             const head = u.state.selection.main.head;
             const line = u.state.doc.lineAt(head);
             opts.onCursor(line.number, head - line.from + 1);
+          }
+          // 选区匹配高亮：跨越长度阈值时切换开关（避免大文档每次选区变化全文扫描）
+          if (u.docChanged) {
+            const over = u.state.doc.length > SEL_MATCH_LIMIT;
+            if (over !== u.startState.doc.length > SEL_MATCH_LIMIT) {
+              u.view.dispatch({
+                effects: selMatchCompartment.reconfigure(over ? [] : highlightSelectionMatches()),
+              });
+            }
           }
         }),
       ],
@@ -332,15 +440,81 @@ export function setDoc(view: EditorView, text: string): void {
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: text },
   });
+  // 文档整体替换后重建围栏索引：改为空闲帧重建。
+  // 旧实现逐行 .text 分配整行字符串，50MB 下同步重建约 ~1.3s 冻结；
+  // 现在（1）rebuildFenceIndex 仅取行首 ≤32 字符检测、零整行分配，
+  // （2）经 scheduleFenceRebuild 在空闲帧执行，彻底不阻塞打开/载入。
+  // 重建前索引为脏，Enter 判定走有界上扫（≤8192 行精确，超出保守降级，绝不错插）。
+  markFenceDirty();
+  scheduleFenceRebuild(() => view.state.doc as unknown as FenceDoc);
   view.focus();
+}
+
+// 分片流式载入（P1-4 前端实现）：大文档按块插入并让出主线程，
+// 避免一次性 EditorState.create 对整个 50MB 做同步解析造成的硬冻结。
+// 小文档（<= threshold）直接回退 setDoc。
+export async function setDocStreaming(
+  view: EditorView,
+  text: string,
+  opts?: { threshold?: number; chunkSize?: number; onProgress?: (r: number) => void },
+): Promise<void> {
+  const threshold = opts?.threshold ?? STREAM_THRESHOLD;
+  if (text.length <= threshold) {
+    setDoc(view, text);
+    return;
+  }
+  const chunk = opts?.chunkSize ?? STREAM_CHUNK;
+  suppressListener = true;
+  try {
+    // 先清空，再逐块追加：CM6 为持久化 rope，追加为 O(log n)；
+    // 解析增量，仅解析每块新增区域，整体被摊到多次 dispatch 间。
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
+    const ranges = chunkRanges(text.length, chunk);
+    for (let i = 0; i < ranges.length; i++) {
+      const [from, to] = ranges[i];
+      view.dispatch({ changes: { from, insert: text.slice(from, to) } });
+      // 每写入一块让出一次，保证遮罩进度绘制、主线程不饿死
+      opts?.onProgress?.((i + 1) / ranges.length);
+      if (i < ranges.length - 1) await yieldToEventLoop();
+    }
+  } finally {
+    suppressListener = false;
+  }
+  // 文档整体替换后重建围栏索引：空闲帧重建（同上，避免流式载入末尾再同步冻结一次）。
+  // 流式期间击键级维护已被 suppressListener 禁用，此处显式标脏并交予空闲帧重建。
+  markFenceDirty();
+  scheduleFenceRebuild(() => view.state.doc as unknown as FenceDoc);
+  view.focus();
+}
+
+// 流式载入（磁盘侧）：尾部追加一片，携带 Loading 注解；rope 尾部 append 为 O(log n)
+export function appendLoadChunk(view: EditorView, text: string): void {
+  view.dispatch({
+    changes: { from: view.state.doc.length, insert: text },
+    annotations: [Loading.of(true)],
+    scrollIntoView: false,
+  });
+}
+
+// 流式载入收尾：重建围栏索引（空闲帧）；不 focus（载入期编辑器只读，避免抢焦点）
+export function finishStreamingLoad(view: EditorView): void {
+  markFenceDirty();
+  scheduleFenceRebuild(() => view.state.doc as unknown as FenceDoc);
+}
+
+// 拉取全文（仅在保存/预览防抖到期等低频点调用，避免每击键 O(n) toString）
+export function getDoc(view: EditorView): string {
+  return view.state.doc.toString();
 }
 
 // ---------------- 编辑命令（工具栏共用）----------------
 
 // 行内包裹 / 取消包裹：选中文本前后加 marker（如 ** 加粗、* 斜体、__ 下划线、~~ 删除线）
 // 若选中文本已被同一 marker 包裹，则移除（toggle）。
-export function wrapSelection(view: EditorView, marker: string): void {
+export function wrapSelection(view: EditorView, marker: string, onSkip?: () => void): void {
   const { state } = view;
+  // 大选区短路：避免 sliceDoc 全量物化（详见 MAX_FORMAT_SELECTION）
+  if (selectionTooLarge(state)) { onSkip?.(); return; }
   const changes = state.changeByRange((range) => {
     const text = state.sliceDoc(range.from, range.to);
     // 检测是否已被包裹（选区内或光标两侧）
@@ -448,9 +622,11 @@ export function insertText(view: EditorView, text: string): void {
 }
 
 // 插入链接：选中文本作为链接文字
-export function insertLink(view: EditorView): void {
+export function insertLink(view: EditorView, onSkip?: () => void): void {
   const { state } = view;
   const sel = state.selection.main;
+  // 大选区短路：链接文字取全文会物化 50MB，跳过（详见 MAX_FORMAT_SELECTION）
+  if (selectionTooLarge(state)) { onSkip?.(); return; }
   const text = state.sliceDoc(sel.from, sel.to) || "链接文字";
   const insert = `[${text}](https://)`;
   view.dispatch({
@@ -460,11 +636,14 @@ export function insertLink(view: EditorView): void {
   view.focus();
 }
 
-// 插入图片：![描述](路径)；选中文本作为描述，光标定位到路径处
+// 插入图片：![描述](路径)；选中文本作为描述，光标定位到路径处。
+// 图片宽高记录交由调用方（App.svelte，已知 noteDir）通过 image-dims.setDims 完成，
+// 预览渲染规则据此注入 width/height 预留空间，避免加载完成滚动跳变（P1-5）。
 export function insertImage(view: EditorView, path: string): void {
   const { state } = view;
   const sel = state.selection.main;
-  const alt = state.sliceDoc(sel.from, sel.to) || "图片描述";
+  // 大选区保护：直接用占位描述，避免 sliceDoc 全量物化（详见 MAX_FORMAT_SELECTION）
+  const alt = selectionTooLarge(state) ? "图片描述" : (state.sliceDoc(sel.from, sel.to) || "图片描述");
   // 绝对路径（盘符或 / 开头）用尖括号包裹 + 正斜杠，兼容路径中的空格；
   // 相对路径（收编后的 assets/xxx，文件名无空格）直接引用，更干净、可移植
   const normalized = path.replace(/\\/g, "/");
@@ -482,6 +661,8 @@ export function insertImage(view: EditorView, path: string): void {
 export function insertCodeBlock(view: EditorView, lang = ""): void {
   const { state } = view;
   const sel = state.selection.main;
+  // 大选区短路：代码块取全文会物化 50MB，跳过（详见 MAX_FORMAT_SELECTION）
+  if (selectionTooLarge(state)) return;
   const code = state.sliceDoc(sel.from, sel.to);
   const insert = `\n\`\`\`${lang}\n${code}\n\`\`\`\n`;
   // 内容行起始位置：\n + ``` + lang + \n
@@ -692,30 +873,63 @@ const orderedListRenumber = EditorView.updateListener.of((u) => {
 });
 
 // ---------------- 软 / 硬换行 ----------------
-// 判断 pos 是否在代码块内：当前行之前 ``` 行为奇数
+// 代码块判定：优先走增量语法树 O(log n)；树未覆盖/出错时回退「围栏检查点索引」（O(≤511 行），
+// 避免 50MB 文档下逐行扫描百万行——旧 isInsideCodeBlockLinear 最坏 ~180ms）。
+// 索引由 setDoc 整体重建；编辑涉及围栏时 markFenceDirty，空闲帧重建（期间走有界上扫，安全降级）。
 function isInsideCodeBlock(state: EditorState, pos: number): boolean {
-  const lineNo = state.doc.lineAt(pos).number;
-  let fences = 0;
-  for (let n = 1; n < lineNo; n++) {
-    if (/^\s*```/.test(state.doc.line(n).text)) fences++;
+  const tree = syntaxTree(state);
+  if (tree.length >= pos) {
+    const node = tree.resolve(pos, 1);
+    const name = node.type.name;
+    if (name === "FencedCode" || name === "CodeBlock") return true;
+    if (!node.type.isError) return false;
   }
-  return fences % 2 === 1;
+  const lineNo = state.doc.lineAt(pos).number;
+  return fenceInsideCodeBlock(state.doc as unknown as FenceDoc, lineNo);
 }
 
-// 软换行（Shift+Enter）：表格单元格内插 <br> 保持在格内；代码块 / 普通文本普通换行、留在当前块
+// 引用行前缀（含嵌套 > > 与空白），无引用返回 null
+function quotePrefixOf(lineText: string): string | null {
+  const m = lineText.match(/^\s*(?:(?:>\s*)+)/);
+  return m ? m[0] : null;
+}
+
+// 软换行（Shift+Enter）：表格单元格内插 <br> 保持在格内；引用行内保留「> 」前缀（渲染仍属同一段）；
+// 代码块 / 普通文本普通换行、留在当前块
 export function softBreak(view: EditorView): void {
   const { state } = view;
-  const line = state.doc.lineAt(state.selection.main.head);
-  view.dispatch(state.replaceSelection(/^\s*\|/.test(line.text) ? "<br>" : "\n"));
+  const head = state.selection.main.head;
+  const line = state.doc.lineAt(head);
+  const qp = quotePrefixOf(line.text);
+  if (qp) {
+    // 光标处插入换行 + 原引用前缀，光标落在前缀之后（同一引用段内的软换行）
+    const insert = "\n" + qp;
+    view.dispatch({
+      changes: { from: head, insert },
+      selection: { anchor: head + insert.length },
+    });
+  } else {
+    view.dispatch(state.replaceSelection(/^\s*\|/.test(line.text) ? "<br>" : "\n"));
+  }
   view.focus();
 }
 
-// Enter 智能换行：表格内跳到表格块后、代码块内跳到闭合 ``` 后，成为全新一行；
-// 普通文本返回 false，交还默认回车行为（正常换行、保留列表续行等）。
+// Enter 智能换行：表格内跳到表格块后、代码块内跳到闭合 ``` 后、引用块内跳到新的一行（跳出引用），
+// 成为全新一行；普通文本返回 false，交还默认回车行为（正常换行、保留列表续行等）。
 export function smartEnter(view: EditorView): boolean {
   const { state } = view;
   const head = state.selection.main.head;
   const line = state.doc.lineAt(head);
+  if (quotePrefixOf(line.text)) {
+    // 引用块内 Enter：在光标处换行且新行不带「> 」前缀（跳出引用，直接写正文）。
+    // 若光标在行首（head === line.from），等价于在引用前插入一个空行。
+    view.dispatch({
+      changes: { from: head, insert: "\n" },
+      selection: { anchor: head + 1 },
+    });
+    view.focus();
+    return true;
+  }
   if (/^\s*\|/.test(line.text)) {
     let end = line.number;
     while (end < state.doc.lines && /^\s*\|/.test(state.doc.line(end + 1).text)) end++;
@@ -747,6 +961,8 @@ export function detectMarkers(view: EditorView): string[] {
   const { state } = view;
   const range = state.selection.main;
   const found: string[] = [];
+  // 大选区短路：检测包裹标记会 sliceDoc 全量物化，直接返回空（详见 MAX_FORMAT_SELECTION）
+  if (selectionTooLarge(state)) return found;
   let text = state.sliceDoc(range.from, range.to);
   if (text) {
     // 逐层剥皮：优先取最长匹配（** 先于 *）
@@ -774,6 +990,8 @@ export function detectMarkers(view: EditorView): string[] {
 export function applyMarkers(view: EditorView, markers: string[]): void {
   if (!markers.length) return;
   const { state } = view;
+  // 大选区短路：包裹全文会 sliceDoc 物化 50MB，跳过（详见 MAX_FORMAT_SELECTION）
+  if (selectionTooLarge(state)) return;
   const changes = state.changeByRange((range) => {
     const text = state.sliceDoc(range.from, range.to) || "文本";
     let wrapped = text;

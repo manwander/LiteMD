@@ -49,6 +49,16 @@ let loading: Promise<void> | null = null;
 const pending = new Set<string>(); // 正在加载的语言，避免重复触发
 let onLangLoaded: (() => void) | null = null;
 
+// 高亮结果缓存：键 = lang + code 长度 + code 前 48 字符（快速判等），值 = 高亮 HTML。
+// 长文档滚动/多次渲染时复用同一代码块的高亮结果，避免重复 hljs.highlight（开销不小）。
+// 简单 LRU：超过上限时整体清空（代码块集合通常有限，清空成本可接受）。
+const HL_CACHE_MAX = 60;
+const hlCache = new Map<string, { html: string; full: string }>();
+
+function hlCacheKey(lang: string, code: string): string {
+  return `${lang}:${code.length}:${code.slice(0, 48)}`;
+}
+
 /** 语言加载完成后触发重渲染的回调（由 App 注册） */
 export function setOnLangLoaded(cb: () => void): void {
   onLangLoaded = cb;
@@ -88,8 +98,18 @@ export function highlightCode(code: string, lang: string): string {
     ensureLanguage(name);
     return "";
   }
+  // 命中缓存直接返回，避免重复全量高亮
+  const key = hlCacheKey(name, code);
+  const cached = hlCache.get(key);
+  if (cached) {
+    // 前 48 字符相同但内容不同（极小概率）：校验完整内容
+    if (cached.full === code) return cached.html;
+  }
   try {
-    return hljs.highlight(code, { language: name }).value;
+    const html = hljs.highlight(code, { language: name }).value;
+    if (hlCache.size >= HL_CACHE_MAX) hlCache.clear();
+    hlCache.set(key, { html, full: code });
+    return html;
   } catch {
     return "";
   }

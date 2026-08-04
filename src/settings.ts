@@ -21,6 +21,10 @@ export interface Settings {
   lastFolder: string | null;
   /** 上次打开的文件（重启后自动恢复内容） */
   lastFile: string | null;
+  /** 会话恢复：上次打开的所有标签路径（保持关闭时顺序，第一个为激活标签） */
+  openTabs: string[];
+  /** 隐藏的文件/文件夹路径（文件树不显示，可管理取消隐藏） */
+  hiddenPaths: string[];
   /** 最近打开的文件（最多 5 个，新的在前） */
   recentFiles: string[];
   /** 附件文件夹名（插图时自动收编到笔记目录下的该文件夹） */
@@ -29,6 +33,10 @@ export interface Settings {
   compressImages: boolean;
   /** JPEG 压缩质量（1-100，越小体积越小） */
   jpegQuality: number;
+  /** 预览实时模式阈值（KB）：文档超过该大小后预览改为手动刷新，避免超大文档打字时反复跑预览管线 */
+  previewRealtimeMaxKB: number;
+  /** 低端设备降级模式：auto=按检测，on=强制降级，off=强制标准。影响预览阈值/预读/图片转码等（P1-7） */
+  lowEndMode: "auto" | "on" | "off";
   /** 快捷键：actionId -> 加速键字符串 */
   shortcuts: Record<string, string>;
 }
@@ -55,6 +63,7 @@ export const SHORTCUT_GROUPS: ActionGroup[] = [
   {
     title: "文件",
     actions: [
+      { id: "file.new", label: "新建笔记", scope: "app" },
       { id: "file.open", label: "打开文件", scope: "app" },
       { id: "file.openFolder", label: "打开文件夹", scope: "app" },
       { id: "file.save", label: "保存", scope: "app" },
@@ -85,6 +94,7 @@ export const SHORTCUT_GROUPS: ActionGroup[] = [
       { id: "format.h3", label: "三级标题", scope: "editor" },
       { id: "format.h4", label: "四级标题", scope: "editor" },
       { id: "format.h5", label: "五级标题", scope: "editor" },
+      { id: "format.quote", label: "引用", scope: "app" },
     ],
   },
   {
@@ -115,6 +125,7 @@ export function actionLabel(id: string): string {
 }
 
 export const DEFAULT_SHORTCUTS: Record<string, string> = {
+  "file.new": "Ctrl+N",
   "file.open": "Ctrl+O",
   "file.openFolder": "Ctrl+Shift+O",
   "file.save": "Ctrl+S",
@@ -137,6 +148,7 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
   "format.h3": "Alt+3",
   "format.h4": "Alt+4",
   "format.h5": "Alt+5",
+  "format.quote": "Alt+>",
 
   "insert.image": "Alt+Q",
   "insert.codeBlock": "Alt+W",
@@ -159,10 +171,14 @@ export const DEFAULT_SETTINGS: Settings = {
   showPreview: true,
   lastFolder: null,
   lastFile: null,
+  openTabs: [],
+  hiddenPaths: [],
   recentFiles: [],
   assetsDir: "assets",
   compressImages: true,
   jpegQuality: 80,
+  previewRealtimeMaxKB: 2048,
+  lowEndMode: "auto",
   shortcuts: { ...DEFAULT_SHORTCUTS },
 };
 
@@ -354,6 +370,11 @@ function sanitize(raw: unknown): Settings {
   if (shortcuts["format.strike"] === normalizeAccel("Alt+Shift+5")) {
     shortcuts["format.strike"] = DEFAULT_SHORTCUTS["format.strike"];
   }
+  // 迁移：「引用」默认键由 Alt+R 改为 Alt+>（对应「>」引用标记，语义更直观）。
+  // 已保存值若仍为旧默认则跟随新默认；用户自定义键位不受影响。
+  if (shortcuts["format.quote"] === normalizeAccel("Alt+R")) {
+    shortcuts["format.quote"] = DEFAULT_SHORTCUTS["format.quote"];
+  }
   const fontSize = Number(s.fontSize);
   return {
     theme: s.theme === "dark" ? "dark" : "light",
@@ -369,6 +390,12 @@ function sanitize(raw: unknown): Settings {
     showPreview: s.showPreview !== false,
     lastFolder: typeof s.lastFolder === "string" ? s.lastFolder : null,
     lastFile: typeof s.lastFile === "string" ? s.lastFile : null,
+    openTabs: Array.isArray(s.openTabs)
+      ? s.openTabs.filter((p): p is string => typeof p === "string" && !!p).slice(0, 30)
+      : [],
+    hiddenPaths: Array.isArray(s.hiddenPaths)
+      ? s.hiddenPaths.filter((p): p is string => typeof p === "string" && !!p)
+      : [],
     recentFiles: Array.isArray(s.recentFiles)
       ? s.recentFiles.filter((f): f is string => typeof f === "string").slice(0, 5)
       : [],
@@ -378,6 +405,12 @@ function sanitize(raw: unknown): Settings {
       Number.isFinite(Number(s.jpegQuality))
         ? Math.min(95, Math.max(50, Math.round(Number(s.jpegQuality))))
         : DEFAULT_SETTINGS.jpegQuality,
+    previewRealtimeMaxKB:
+      Number.isFinite(Number(s.previewRealtimeMaxKB))
+        ? Math.min(8192, Math.max(256, Math.round(Number(s.previewRealtimeMaxKB))))
+        : DEFAULT_SETTINGS.previewRealtimeMaxKB,
+    lowEndMode:
+      s.lowEndMode === "on" || s.lowEndMode === "off" ? s.lowEndMode : "auto",
     shortcuts,
   };
 }

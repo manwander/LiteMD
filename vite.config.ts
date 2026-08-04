@@ -13,8 +13,9 @@ export default defineConfig({
     // 2. 手动分包会破坏 CM 语言包的异步拆分，因此不设 manualChunks，
     //    让 Vite 按动态 import 边界自动分包。
     chunkSizeWarningLimit: 1200,
-    // 不预先清空 dist（safe-delete/回收站在本机偶发失败），直接覆盖写入
-    emptyOutDir: false,
+    // 每次构建先清空 dist：避免历史 chunk 残留累积（曾积累 30MB/320 个旧文件），
+    // 也防止发布时打进无用文件。Vite 用 fs.rm 直接删除，不走回收站。
+    emptyOutDir: true,
   },
   server: {
     port: 1420,

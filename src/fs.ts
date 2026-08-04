@@ -1,6 +1,6 @@
 // 与 src-tauri/src/lib.rs 中的 Tauri command 一一对应。
 // invoke 的参数名（path / content / root / html）必须与 Rust 命令形参一致。
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 
 export interface MdFile {
   name: string;
@@ -19,11 +19,34 @@ export const readFile = (path: string) => invoke<string>("read_file", { path });
 export const writeFile = (path: string, content: string) =>
   invoke<void>("write_file", { path, content });
 
+/** 文件字节数（O(1) stat）；大文档判定走流式载入用 */
+export const fileSize = (path: string) => invoke<number>("file_size", { path });
+
+/** 分片流式载入头片：head 按 UTF-8 字符边界对齐；headBytes 供续读偏移 */
+export interface ReadHead {
+  head: string;
+  headBytes: number;
+  total: number;
+}
+export const readFileHead = (path: string, bytes: number) =>
+  invoke<ReadHead>("read_file_head", { path, bytes });
+
+/** 从 offset 字节起分片推送剩余内容；Promise resolve = 流结束 */
+export const streamFileRest = (
+  path: string,
+  offset: number,
+  chunk: number,
+  onChunk: Channel<string>
+) => invoke<void>("stream_file_rest", { path, offset, chunk, onChunk });
+
 export const pickOpenFile = () => invoke<string | null>("pick_open_file");
 
 export const pickOpenFolder = () => invoke<string | null>("pick_open_folder");
 
 export const pickSaveFile = () => invoke<string | null>("pick_save_file");
+
+/** 导出 PDF 时选择保存路径（带 .pdf 过滤器） */
+export const pickSavePdfFile = () => invoke<string | null>("pick_save_pdf_file");
 
 export const pickImageFile = () => invoke<string | null>("pick_image_file");
 
@@ -66,6 +89,26 @@ export const importAssetBytes = (
   quality: number
 ) => invoke<string>("import_asset_bytes", { noteDir, assetsName, ext, dataB64, compress, quality });
 
+/** 粘贴图片收编（原始字节版）：Uint8Array 作为 InvokeBody::Raw 直传（零 base64），
+ *  元数据走请求头；返回相对路径。旧运行时不支持 raw body 时调用方回退 importAssetBytes */
+export const importAssetRaw = (
+  noteDir: string,
+  assetsName: string,
+  ext: string,
+  bytes: Uint8Array,
+  compress: boolean,
+  quality: number
+) =>
+  invoke<string>("import_asset_raw", bytes, {
+    headers: {
+      "x-note-dir": noteDir,
+      "x-assets-name": assetsName,
+      "x-ext": ext,
+      "x-compress": compress ? "1" : "0",
+      "x-quality": String(quality),
+    },
+  });
+
 /** 递归列出文件夹下所有 .md 文件路径（整夹批量迁移用） */
 export const listMdFiles = (root: string) => invoke<string[]>("list_md_files", { root });
 
@@ -76,15 +119,21 @@ export interface FolderMatch {
   text: string;
 }
 
+/** 跨文件查找结果：matches 最多 2000 条，truncated 表示因上限被截断 */
+export interface FolderSearchResult {
+  matches: FolderMatch[];
+  truncated: boolean;
+}
+
 /** 跨文件替换的汇总结果 */
 export interface FolderReplaceResult {
   filesChanged: number;
   count: number;
 }
 
-/** 在当前文件夹下所有 .md 中查找（字面子串，可选大小写敏感） */
+/** 在当前文件夹下所有 .md 中查找（字面子串，可选大小写敏感；结果上限 2000 条） */
 export const searchInFolder = (folder: string, query: string, caseSensitive: boolean) =>
-  invoke<FolderMatch[]>("search_in_folder", { folder, query, caseSensitive });
+  invoke<FolderSearchResult>("search_in_folder", { folder, query, caseSensitive });
 
 /** 在当前文件夹下所有 .md 中批量替换，返回受影响文件数与替换总次数 */
 export const replaceInFolder = (
@@ -100,6 +149,10 @@ export const cleanupOrphans = (noteDir: string, assetsName: string) =>
 
 export const exportHtml = (path: string, html: string) =>
   invoke<void>("export_html", { path, html });
+
+/** 导出 PDF：Rust 侧用 pulldown-cmark + printpdf 渲染（A4、自动换行/分页、中文字体） */
+export const exportPdf = (path: string, markdown: string) =>
+  invoke<void>("export_pdf", { path, markdown });
 
 /** 设置文件所在路径（仅用于设置面板展示）；非 Tauri 环境返回空串 */
 export const settingsFilePath = async (): Promise<string> => {

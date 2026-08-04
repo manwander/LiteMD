@@ -184,6 +184,31 @@
                 on:change={changed}
               />
             </div>
+            <div class="row">
+              <span class="row-label">
+                预览实时阈值
+                <small>文档超过 {settings.previewRealtimeMaxKB} KB 后预览改为手动刷新，保障超大文档打字流畅</small>
+              </span>
+              <input
+                type="range"
+                min="256"
+                max="8192"
+                step="256"
+                bind:value={settings.previewRealtimeMaxKB}
+                on:change={changed}
+              />
+            </div>
+            <div class="row">
+              <span class="row-label">
+                低端设备降级
+                <small>自动按硬件检测；低端模式更激进降级预览/预读/图片转码，保流畅</small>
+              </span>
+              <select bind:value={settings.lowEndMode} on:change={changed}>
+                <option value="auto">自动检测</option>
+                <option value="on">强制开启</option>
+                <option value="off">强制关闭</option>
+              </select>
+            </div>
           </div>
           <div class="divider" />
           <div class="group">
