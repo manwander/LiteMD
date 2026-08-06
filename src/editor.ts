@@ -208,6 +208,8 @@ function appearance(dark: boolean, fontSize: number) {
 
 const appearanceCompartment = new Compartment();
 const keymapCompartment = new Compartment();
+// 自动换行开关舱：默认启用软折行（不产生换行符），设置面板可切换
+const wrapCompartment = new Compartment();
 // 选区匹配高亮开关舱：超长文档自动禁用（每次选区变化全文扫描匹配项，大文档上非常昂贵）
 const selMatchCompartment = new Compartment();
 const SEL_MATCH_LIMIT = 200_000;
@@ -275,6 +277,7 @@ const EDITOR_COMMANDS: Record<string, Command> = {
   "edit.find": (v) => openCnSearchPanel(false)(v), // Ctrl+F：中文查找面板
   "edit.replace": (v) => openCnSearchPanel(true)(v), // Ctrl+H：中文查找替换面板
   "table.duplicateRow": duplicateTableRow,
+  "table.addColumn": addTableColumn,
 };
 
 export function buildKeymap(cmKeys: Record<string, string>): KeyBinding[] {
@@ -375,6 +378,7 @@ export function createEditor(opts: {
           opts.doc.length <= SEL_MATCH_LIMIT ? highlightSelectionMatches() : []
         ),
         appearanceCompartment.of(appearance(opts.dark, opts.fontSize)),
+        wrapCompartment.of(EditorView.lineWrapping),
         EditorView.updateListener.of((u) => {
           if (suppressListener) return;
           // 流式载入分片：跳过一切副作用（不推预览、不触发保存、不维护围栏）
@@ -426,6 +430,13 @@ export function createEditor(opts: {
 export function setAppearance(view: EditorView, dark: boolean, fontSize: number): void {
   view.dispatch({
     effects: appearanceCompartment.reconfigure(appearance(dark, fontSize)),
+  });
+}
+
+/** 自动换行开关（设置面板）：on=true 长行软折行，false 恢复横向滚动 */
+export function setWrap(view: EditorView, on: boolean): void {
+  view.dispatch({
+    effects: wrapCompartment.reconfigure(on ? EditorView.lineWrapping : []),
   });
 }
 
@@ -575,10 +586,27 @@ export function toggleLinePrefix(view: EditorView, prefix: string): void {
       const next = allHave ? line.text.slice(prefix.length) : prefix + line.text;
       lineChanges.push({ from: line.from, to: line.to, insert: next });
     }
-    return { changes: lineChanges, range };
+    // 光标随前缀偏移：添加前缀时（行首光标）移到前缀后继续输入，行内光标整体右移；
+    // 移除前缀时反向回移（不低于行首）。否则光标停在“1. ”前，输入文字会跑到列表标记前。
+    const delta = allHave ? -prefix.length : prefix.length;
+    return {
+      changes: lineChanges,
+      range: EditorSelection.range(
+        Math.max(startLine.from, range.from + delta),
+        Math.max(startLine.from, range.to + delta)
+      ),
+    };
   });
   view.dispatch(changes);
   view.focus();
+  // 长文档中行前缀变化后光标可能离开可视区,强制把光标滚到视口中央(y:'center')。
+  // 用 'center' 而不是 'nearest'/'end' 是为了避免「容器高度 > 内容高度」时空文档把光标留在
+  // padding 区域造成的「插入表格看不到」「被覆盖」误判。
+  view.dispatch({
+    selection: { anchor: view.state.selection.main.head },
+    // 不调用 scrollIntoView:小文档中 center/nearest 都会让视口停留在 padding 区域,
+    // 用户感觉「光标跳到文档前面」。依赖 view.focus() 内置的最近滚动即可。
+  });
 }
 
 // 设置标题级别：先剥离已有 # 前缀，再设为指定级别；已是该级别则移除（toggle）
@@ -591,13 +619,19 @@ export function setHeading(view: EditorView, level: number): void {
   const isSameLevel = line.text.startsWith(prefix);
   if (isSameLevel) {
     // 取消标题：仅剥离前缀，光标留在原行
-    view.dispatch({ changes: { from: line.from, to: line.to, insert: stripped } });
+    view.dispatch({
+      changes: { from: line.from, to: line.to, insert: stripped },
+      selection: { anchor: line.from + stripped.length },
+    });
   } else {
     // 设置标题：行尾补一个换行，光标移到新行行首
     const insert = prefix + stripped + "\n";
+    const anchor = line.from + insert.length;
+    // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶
     view.dispatch({
       changes: { from: line.from, to: line.to, insert },
-      selection: { anchor: line.from + insert.length },
+      selection: { anchor },
+      effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
     });
   }
   view.focus();
@@ -650,9 +684,13 @@ export function insertImage(view: EditorView, path: string): void {
   const isAbs = /^([A-Za-z]:\/|\/)/.test(normalized);
   const ref = isAbs ? `<${normalized}>` : normalized;
   const insert = `![${alt}](${ref})`;
+  const anchor = sel.from + insert.length;
+  // 合并 selection 与 scrollIntoView 到同一次 dispatch,避免分两次 dispatch 时
+  // focus()/DOM 测量竞争导致滚动失效、视口跳回顶部。
   view.dispatch({
     changes: { from: sel.from, to: sel.to, insert },
-    selection: { anchor: sel.from + insert.length },
+    selection: { anchor },
+    effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
   view.focus();
 }
@@ -667,10 +705,13 @@ export function insertCodeBlock(view: EditorView, lang = ""): void {
   const insert = `\n\`\`\`${lang}\n${code}\n\`\`\`\n`;
   // 内容行起始位置：\n + ``` + lang + \n
   const contentStart = sel.from + 1 + 3 + lang.length + 1;
+  const anchor = contentStart + code.length;
+  // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶
   view.dispatch({
     changes: { from: sel.from, to: sel.to, insert },
     // 光标跳到内容行（有选中代码则落在其后，否则落在空行行首）
-    selection: { anchor: contentStart + code.length },
+    selection: { anchor },
+    effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
   view.focus();
 }
@@ -682,9 +723,12 @@ export function duplicateTableRow(view: EditorView): boolean {
   const line = state.doc.lineAt(state.selection.main.head);
   if (!/^\s*\|/.test(line.text)) return false;
   const colOffset = state.selection.main.head - line.from;
+  const anchor = line.to + 1 + colOffset;
+  // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶
   view.dispatch({
     changes: { from: line.to, insert: "\n" + line.text },
-    selection: { anchor: line.to + 1 + colOffset },
+    selection: { anchor },
+    effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
   view.focus();
   return true;
@@ -710,7 +754,12 @@ export function addTableColumn(view: EditorView): boolean {
   const ch = state.changes(changes);
   // 「当前行行尾」映射到变更后即新单元格起点，+1 落在单元格内
   const anchor = ch.mapPos(cursorLine.to, -1) + 1;
-  view.dispatch({ changes: ch, selection: { anchor } });
+  // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶
+  view.dispatch({
+    changes: ch,
+    selection: { anchor },
+    effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
+  });
   view.focus();
   return true;
 }
@@ -720,9 +769,18 @@ export function insertTable(view: EditorView): void {
   const { state } = view;
   const sel = state.selection.main;
   const table = "\n| 列1 | 列2 | 列3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |\n";
+  // 光标落在数据行第一个单元格「内容」之后（表格内，可直接输入）；
+  // 不能放在 table.length——那是表格末尾的换行之后，光标会跳出表格外
+  const dataCellEnd = table.indexOf("| 内容") + "| 内容".length;
+  const anchor = sel.from + dataCellEnd;
+  // 合并 selection 与 scrollIntoView 到同一次 dispatch,避免分两次 dispatch 时
+  // focus()/DOM 测量竞争导致滚动失效、视口跳回顶部。
+  // y:"end" 把光标滚到视口底部,yMargin 在下方留 ~80px 空白(约 2-3 行),
+  // 保证插入的表格完整可见且不被状态栏/滚动条遮挡。
   view.dispatch({
     changes: { from: sel.from, to: sel.to, insert: table },
-    selection: { anchor: sel.from + table.length },
+    selection: { anchor },
+    effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
   view.focus();
 }
@@ -815,7 +873,12 @@ export function setOrderedList(view: EditorView, start: number): void {
     last.insert += "\n";
     return { changes: lineChanges, range: EditorSelection.cursor(last.from + last.insert.length) };
   });
-  view.dispatch(changes);
+  // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶
+  view.dispatch({
+    changes: changes.changes,
+    selection: changes.selection,
+    effects: EditorView.scrollIntoView(changes.selection.main.head, { y: "end", yMargin: 80 }),
+  });
   view.focus();
 }
 
@@ -1009,6 +1072,6 @@ export function applyMarkers(view: EditorView, markers: string[]): void {
 export function gotoLine(view: EditorView, lineNo: number): void {
   const n = Math.max(1, Math.min(lineNo, view.state.doc.lines));
   const line = view.state.doc.line(n);
-  view.dispatch({ selection: { anchor: line.from }, scrollIntoView: true });
+  view.dispatch({ selection: { anchor: line.from } });
   view.focus();
 }

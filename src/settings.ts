@@ -9,6 +9,8 @@ export interface Settings {
   theme: ThemeName;
   /** 编辑器字号 px */
   fontSize: number;
+  /** 编辑器自动换行（长行软折行，不改变文档内容） */
+  wrap: boolean;
   /** 是否开启自动保存 */
   autoSave: boolean;
   /** 自动保存防抖毫秒 */
@@ -165,6 +167,7 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
 export const DEFAULT_SETTINGS: Settings = {
   theme: "light",
   fontSize: 14,
+  wrap: true,
   autoSave: true,
   autoSaveDelay: 800,
   showTree: true,
@@ -381,6 +384,7 @@ function sanitize(raw: unknown): Settings {
     fontSize: Number.isFinite(fontSize)
       ? Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round(fontSize)))
       : DEFAULT_SETTINGS.fontSize,
+    wrap: s.wrap !== false,
     autoSave: s.autoSave !== false,
     autoSaveDelay:
       Number.isFinite(Number(s.autoSaveDelay)) && Number(s.autoSaveDelay) >= 300

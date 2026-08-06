@@ -406,6 +406,11 @@
     for (const node of nodeIndex.keys()) ro.observe(node);
     window.addEventListener("resize", onWindowResize);
     updateVisibleWindow();
+    // 首帧尺寸兜底（q14 根因之一）：flex 布局下组件挂载时 clientHeight 可能仍为 0，
+    // updateVisibleWindow 会算出空窗口 → 预览空白且无后续重算。下一帧 + 300ms 各重试一次，
+    // 覆盖「布局晚于挂载完成」的时序。
+    requestAnimationFrame(() => updateVisibleWindow());
+    setTimeout(() => updateVisibleWindow(), 300);
   });
 
   onDestroy(() => {

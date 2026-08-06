@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import type MarkdownIt from "markdown-it";
   import { convertFileSrc, Channel } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   // 模态组件动态加载：不占用主 chunk 启动解析成本，首次打开时才拉对应 chunk
   type SvelteCmp = any;
   let modalCmps: { SettingsModal?: SvelteCmp; FolderSearch?: SvelteCmp; PromptModal?: SvelteCmp; ConfirmModal?: SvelteCmp } = {};
@@ -20,9 +21,11 @@
   // 窗口级查找面板命令：焦点不在编辑器内容区时 Ctrl+F / Ctrl+H 也能打开（兜底）
   import { openSearchPanel as openSearchPanelCmd } from "./search-panel";
     // 预览编辑模式键盘增强（快捷键/智能 Enter 与源码编辑器对齐）
-    import { attachPreviewEditKeys } from "./preview-edit-keys";
+    import { attachPreviewEditKeys, insertImageAtCaret, insertTableAtCaret, scrollCaretIntoView } from "./preview-edit-keys";
   import { initHighlight, highlightCode, setOnLangLoaded } from "./highlight";
   import VirtualPreview from "./preview/VirtualPreview.svelte";
+  import StatusBar from "./StatusBar.svelte";
+  import FileTree from "./FileTree.svelte";
   import { resolveLowEnd, buildDegrade } from "./lowend";
   import { setDims, getDims, loadDims, saveDims } from "./image-dims";
   import type { EditRange } from "./preview/block-splitter";
@@ -30,6 +33,7 @@
     createEditor,
     setAppearance,
     setKeymap,
+    setWrap,
     setDoc,
     setDocStreaming,
     STREAM_THRESHOLD,
@@ -77,7 +81,8 @@
     importAssetBytes,
     importAssetRaw,
     listMdFiles,
-    cleanupOrphans,
+    listOrphanAssets,
+    cleanupOrphansWith,
     exportHtml,
     exportPdf,
     pickSavePdfFile,
@@ -197,7 +202,7 @@
     return mdLoading;
   }
 
-  let source = `# 欢迎使用 LiteMD
+  const WELCOME_TEXT = `# 欢迎使用 LiteMD
 
 - 左侧：文件目录（二级文件夹结构）
 - 中间：Markdown 编辑器（CodeMirror 6）
@@ -210,6 +215,10 @@ console.log("Hello LiteMD");
 \`\`\`
 `;
 
+  // 初始 source 不再默认渲染欢迎页，避免冷启动打开 .md 时「欢迎页一闪而过」（q15）。
+  // 启动参数中的待打开文件由 onMount 先 take_open_files 再创建编辑器，据此填充 source。
+  let source = "";
+
   // ---- 设置 ----
   let settings: Settings = { ...DEFAULT_SETTINGS, shortcuts: { ...DEFAULT_SHORTCUTS } };
   let configPath = "";
@@ -220,6 +229,12 @@ console.log("Hello LiteMD");
   let showPreview = true;
   let focusMode = false;
   let beforeFocus = { tree: true, preview: true };
+  // 大文档自动单栏（P1-7 矩阵行）：用户手动开过预览后不再自动折叠（本次会话尊重用户选择）
+  let paneUserOverride = false;
+  function togglePreviewPane() {
+    showPreview = !showPreview;
+    if (showPreview) paneUserOverride = true;
+  }
 
   let view: ReturnType<typeof createEditor> | undefined;
   let editorHost: HTMLDivElement;
@@ -244,6 +259,8 @@ console.log("Hello LiteMD");
     cursorPos: number | null; // 光标偏移（会话恢复/切换用）
     /** 延迟载入：>8MB 大文档不在会话恢复时全量读盘，激活时才走分片流式载入（P0） */
     deferred?: boolean;
+    /** 打开/载入失败：内容未与磁盘建立关联，禁止写盘，防止欢迎页/半载内容覆盖原文件（P0 数据安全） */
+    loadFailed?: boolean;
   }
   let tabs: TabState[] = [];
   let activeIdx = 0;
@@ -310,7 +327,7 @@ console.log("Hello LiteMD");
     try {
       const data = tabs.map((t) => {
         // 延迟载入标签（尚未读盘）与大文档只存指针，内容不进 localStorage
-        const big = !!t.deferred || t.content.length > SESSION_CONTENT_MAX;
+        const big = !!t.deferred || !!t.loadFailed || t.content.length > SESSION_CONTENT_MAX;
         return {
           path: t.path,
           // 大文档只存指针，内容不进 localStorage（重启后从磁盘读取）
@@ -394,13 +411,24 @@ console.log("Hello LiteMD");
     suppressSave = true;
     // 大文档（> STREAM_THRESHOLD）走分片流式载入：摊开解析、显示进度，
     // 期间遮罩保持；小文档直接 setDoc（一次性，无感知卡顿）。
+    // 注意：载入过程必须 try/catch 关闭遮罩，否则异常时遮罩永久卡死
     const big = !!view && tab.content.length > STREAM_THRESHOLD;
     if (big) { loadingBigDoc = true; streamProgress = 0; }
-    if (view) {
-      await setDocStreaming(view, tab.content, {
-        threshold: STREAM_THRESHOLD,
-        onProgress: (r) => { streamProgress = r; },
-      });
+    try {
+      if (view) {
+        await setDocStreaming(view, tab.content, {
+          threshold: STREAM_THRESHOLD,
+          onProgress: (r) => { streamProgress = r; },
+        });
+      }
+    } catch (e) {
+      loadingBigDoc = false;
+      streamProgress = 0;
+      suppressSave = false;
+      tab.loadFailed = true; // P0 数据安全：载入失败，编辑器内容与磁盘无关联，禁止写盘
+      lastSaved = null;
+      status = "载入失败：" + String(e);
+      return;
     }
     loadingBigDoc = false;
     streamProgress = 0;
@@ -417,16 +445,29 @@ console.log("Hello LiteMD");
     previewSource = "";
     scheduleStats(tab.content);
     scheduleOpenPreview(tab.content);
+    // 显式同步推 preview（q14 根因：打开/切换文件后预览面板空白。之前依赖
+    // scheduleOpenPreview 的 requestIdleCallback push 或 setDoc 副作用的 pushPreview，
+    // 两者都不可靠：idle 回调可能被推迟、token 失效、降级判定短路 → previewSource
+    // 停留在空串，VirtualPreview 永远空白。这里直接同步设 previewSource，响应式 rebuild 立即可见；
+    // scheduleOpenPreview 的 idle push 因 previewSource 非空自动跳过，不冲突。）
+    if (tab.content.length <= previewMaxBytes) {
+      previewStale = false;
+      previewSource = tab.content;
+    }
     // 预览编辑模式下：渲染新标签内容到可编辑预览容器（否则内容停留在上一个标签）
     if (previewEditMode && md && previewEditEl) {
       previewEditEl.innerHTML = md.render(tab.content);
     }
   }
   async function activateTab(idx: number) {
-    if (!view || !tabs[idx] || idx === activeIdx) return;
+    if (!view || !tabs[idx]) return;
     if (previewEditMode) flushPreviewEdit(); // 预览编辑未回写内容先同步进编辑器再切换
-    const cur = tabs[activeIdx];
-    if (cur) syncTabState(cur);
+    // 仅在真正切换标签时同步旧标签；重复激活/首次打开（idx===activeIdx）不执行
+    // syncTabState，否则会把编辑器残留内容（如欢迎页）写回刚读入的文件内容（P0 数据安全）
+    if (idx !== activeIdx) {
+      const cur = tabs[activeIdx];
+      if (cur) syncTabState(cur);
+    }
     activeIdx = idx;
     await applyTabState(tabs[idx]);
     status = "已切换到 " + basename(tabs[idx].path);
@@ -448,13 +489,12 @@ console.log("Hello LiteMD");
       await activateTab(tabs.length - 1); // → applyTabState → startDocStream
       return;
     }
-    // 大文档：读取期间（真实异步间隙，可先绘制遮罩）显示载入遮罩，FCP 与文档大小解耦
-    loadingBigDoc = true;
+    // 小文档（≤8MB）直接读取；读取为真实异步间隙，无需载入遮罩
+    // （遮罩仅用于大文档流式载入，由 startDocStream/applyTabState 统一管理关闭）
     let content: string;
     try {
       content = await readFile(np);
     } catch (e) {
-      loadingBigDoc = false;
       status = "打开失败：" + String(e);
       return;
     }
@@ -496,6 +536,8 @@ console.log("Hello LiteMD");
     } catch (e) {
       loadingBigDoc = false;
       streamProgress = 0;
+      tab.loadFailed = true; // P0 数据安全：读取失败，编辑器仍为欢迎页/旧内容，禁止写盘
+      lastSaved = null;
       status = "打开失败：" + String(e);
       return;
     }
@@ -586,6 +628,8 @@ console.log("Hello LiteMD");
         if (myToken !== docStreamToken) return;
         abortDocStream();
         tab.deferred = false;
+        tab.loadFailed = true; // P0 数据安全：流式中断，半载内容与磁盘无关联，禁止写盘
+        lastSaved = null;
         status = "载入中断：" + String(e);
       });
   }
@@ -596,6 +640,12 @@ console.log("Hello LiteMD");
     const idx = tabs.findIndex((t) => t.path === path);
     if (idx < 0) return;
     const tab = tabs[idx];
+    // P0 数据安全：从未成功载入的标签（deferred 载入中 / loadFailed 打开失败），
+    // 编辑器内容与磁盘无关联，禁止「保存并关闭」把欢迎页/半载内容写回原文件
+    if (tab.deferred || tab.loadFailed) {
+      doCloseTab(path);
+      return;
+    }
     if (idx === activeIdx) syncTabState(tab);
     if (!isDirtyTab(tab)) {
       doCloseTab(path);
@@ -1055,10 +1105,19 @@ console.log("Hello LiteMD");
     previewStale = content.length > previewMaxBytes;
     // 超阈值走降级模式：不切块不推送（20MB 首帧不被 ~636ms 切块阻塞），面板提示手动刷新
     if (previewStale) return;
+    // 大文档（>8MB）打开/切换时自动收起预览面板（该档预览已降级、手动刷新亦被禁用，
+    // 面板仅占宽度）；用户手动重开（Ctrl+\ / 工具栏）后本次会话不再自动折叠。
+    if (content.length > BIG_DOC_BYTES && showPreview && !paneUserOverride) {
+      showPreview = false;
+      status = "文档较大，已收起预览（可点击工具栏眼睛按钮重新开启）";
+    }
     const push = () => {
       if (token !== openPreviewToken) return; // 已被取消 / 更新
-      // 用户已开始打字：让防抖路径负责推送最新全文（首轮全量切块，安全回退）
-      if (docDirty) return;
+      // 用户已开始打字：让防抖路径（pushPreview）负责推送最新全文（首轮全量切块，安全回退）
+      // 关键修复：之前用 `if (docDirty) return` 会被打开文件副作用触发（setDoc → onEditorDocChange
+      // 同步设 docDirty=true），导致打开文件后预览一直空白，必须手动编辑一下才推（q14）。
+      // 改为更精确的判定：previewSource 已经非空（pushPreview 已推过最新 pullDoc）就让位。
+      if (previewSource !== "") return;
       previewSource = content;
       scheduleStats(content);
     };
@@ -1250,6 +1309,7 @@ console.log("Hello LiteMD");
 
     let unlistenClose: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
+    let unlistenOpenFiles: (() => void) | null = null;
     let unlistenMoved: (() => void) | null = null;
     let unlistenResized: (() => void) | null = null;
 
@@ -1262,6 +1322,21 @@ console.log("Hello LiteMD");
       showPreview = settings.showPreview;
       document.documentElement.dataset.theme = settings.theme;
 
+      // ---- 启动前先消费 Rust 端待打开文件，避免欢迎页先渲染再被替换（q15）----
+      // 冷启动：take_open_files 拿到 .md 关联 / 命令行参数；热启动（single-instance 插件
+      // 转发）由下方的 listen("open-files") 捕获。这里必须先 take_open_files 再创建编辑器，
+      // 否则编辑器初始 doc 会被设为欢迎页（默认 source），再被 openFileByPath 覆盖造成闪烁。
+      let initialPaths: string[] = [];
+      try {
+        initialPaths = await invoke<string[]>("take_open_files");
+      } catch (e) {
+        console.warn("[boot] take_open_files 失败:", e);
+      }
+      if (initialPaths.length === 0) {
+        // 无待打开文件：欢迎页作为初始内容（首次启动 / 普通启动）
+        source = WELCOME_TEXT;
+      }
+
       view = createEditor({
         parent: editorHost,
         doc: source,
@@ -1273,6 +1348,19 @@ console.log("Hello LiteMD");
         onQuickAction,
       });
       lastSaved = source;
+
+      // 热启动事件：第二个实例通过 single-instance 插件转发路径（open-files 事件）
+      listen<string[]>("open-files", (e) => {
+        for (const p of e.payload) void openFileByPath(p);
+      }).then((unlisten) => {
+        unlistenOpenFiles = unlisten;
+      }).catch(() => {});
+
+      // 打开启动参数中的文件（编辑器已创建，因为 applyTabState 需要 view）
+      if (initialPaths.length) {
+        status = `打开 ${initialPaths.length} 个文件…`;
+        for (const p of initialPaths) void openFileByPath(p);
+      }
 
       // 滚动同步：编辑器 → 预览（按比例单向，避免反馈循环）。
       // 注意：真正可滚动的是 VirtualPreview 内部容器（.preview-content 是 overflow:hidden），
@@ -1368,6 +1456,7 @@ console.log("Hello LiteMD");
       unlistenClose?.();
       unlistenDrop?.();
       unlistenMoved?.();
+      unlistenOpenFiles?.();
       unlistenResized?.();
       if (windowBusyTimer) clearTimeout(windowBusyTimer);
       if (memTimer) { clearInterval(memTimer); memTimer = null; }
@@ -1381,6 +1470,7 @@ console.log("Hello LiteMD");
   function onSettingsChange() {
     applyAppearance();
     if (view) setKeymap(view, cmKeysOf(settings.shortcuts));
+    if (view) setWrap(view, settings.wrap);
     persist();
   }
 
@@ -1535,14 +1625,19 @@ console.log("Hello LiteMD");
       filter: "img",
       replacement: (_content, node) => {
         const el = node as HTMLElement;
-        let src = el.getAttribute("src") || "";
-        // convertFileSrc 前缀还原：http://asset.localhost/<urlencoded 路径>
-        const prefix = "http://asset.localhost/";
-        if (src.startsWith(prefix)) {
-          try {
-            src = decodeURIComponent(src.slice(prefix.length));
-          } catch {
-            src = src.slice(prefix.length);
+        // 预览编辑内插入的图片带 data-md-src（原始 markdown 引用），优先还原；
+        // 渲染产生的图片只有 asset URL，走下方前缀还原
+        const mdRef = el.getAttribute("data-md-src");
+        let src = mdRef || el.getAttribute("src") || "";
+        if (!mdRef) {
+          // convertFileSrc 前缀还原：http://asset.localhost/<urlencoded 路径>
+          const prefix = "http://asset.localhost/";
+          if (src.startsWith(prefix)) {
+            try {
+              src = decodeURIComponent(src.slice(prefix.length));
+            } catch {
+              src = src.slice(prefix.length);
+            }
           }
         }
         const alt = (el.getAttribute("alt") || "").replace(/"/g, '&quot;');
@@ -1556,6 +1651,33 @@ console.log("Hello LiteMD");
     });
     // 硬换行：<br> → 「两个空格+换行」，对齐编辑器 Shift+Enter 软换行（同段内）
     t.addRule("litemd-br", { filter: "br", replacement: () => "  \n" });
+    // 链接：覆盖默认 inlineLink，对纯 fragment 锚点（GitHub 风格目录跳转 #%E7%AC%AC...）
+    // 做 decodeURIComponent 归一化，源码视图 / 回写都变成可读中文锚点，对齐其他编辑器
+    t.addRule("inlineLink", {
+      filter: (node) =>
+        node.nodeName === "A" &&
+        (node as Element).hasAttribute("href"),
+      replacement: (content, node) => {
+        const el = node as HTMLElement;
+        let href = el.getAttribute("href") || "";
+        // 仅对 fragment 锚点（href 以 # 开头、无 ?、无 / 段）解码——目录链接的典型形态
+        // 解码后再 escapeLinkDestination 等价处理：<>、()、空格用 <...> 包裹
+        if (href.charAt(0) === "#" && href.indexOf("?") === -1) {
+          try {
+            const dec = decodeURIComponent(href);
+            // 解码后必须「无 % 残留」才算有效编码（避免误改含字面 % 的锚点）
+            if (dec.indexOf("%") === -1) href = dec;
+          } catch {
+            /* 保留原值 */
+          }
+        }
+        const escaped = href.replace(/([<>()])/g, "\\$1");
+        const finalHref = escaped.indexOf(" ") >= 0 ? "<" + escaped + ">" : escaped;
+        const title = el.getAttribute("title");
+        const titlePart = title ? ` "${title.replace(/"/g, '\\"')}"` : "";
+        return `[${content}](${finalHref}${titlePart})`;
+      },
+    });
     td = t;
     return t;
   }
@@ -1584,8 +1706,20 @@ console.log("Hello LiteMD");
             openSearchPanelCmd(replace)(view);
           }
         },
-        onImage: () => { exitPreviewEdit(); void insertImg(); },
-        onImageFile: (f) => { exitPreviewEdit(); void insertPastedImage(f); },
+        // 图片插入在预览编辑内完成（不退出模式）：光标处插 <img>，turndown 还原 markdown 引用
+        onPickImage: async () => {
+          const p = await pickImageFile();
+          if (!p) return null;
+          const r = await resolveImageRef(p);
+          status = "图片已插入";
+          return { url: convertFileSrc(r.abs), ref: r.ref };
+        },
+        onImportImageFile: async (f) => {
+          const r = await assetFromImageFile(f);
+          if (!r) return null;
+          status = "图片已插入";
+          return { url: convertFileSrc(r.abs), ref: r.ref };
+        },
         setStatus: (msg) => { status = msg; },
       });
       previewEditEl.focus();
@@ -1604,6 +1738,11 @@ console.log("Hello LiteMD");
   function onPreviewEditInput() {
     if (previewEditTimer) clearTimeout(previewEditTimer);
     previewEditTimer = setTimeout(flushPreviewEdit, 800);
+    // 工具栏点击标题/列表/插入表格/插入图片等通过 previewExec 触发回写后,
+    // contenteditable 不会自动跟随光标。这里把光标滚入视口底部,
+    // 保证"插入内容后立即可见",满足最后一行显示需求。
+    // scrollCaretIntoView 自身有"已在可视区内则跳过"的判定,常规键入也安全。
+    if (previewEditEl) scrollCaretIntoView(previewEditEl);
   }
   function flushPreviewEdit() {
     if (previewEditTimer) {
@@ -1717,8 +1856,30 @@ console.log("Hello LiteMD");
 
   async function save() {
     if (previewEditMode) flushPreviewEdit(); // 预览编辑模式下先同步编辑器内容
+    // P0 数据安全：applyTabState 期间（currentPath 已设、source/lastSaved 尚未同步到新文档）
+    // 用户按 Ctrl+S 会被陈旧欢迎页/旧标签内容覆盖原文件。这里禁止写盘直到载入流程完成。
+    if (suppressSave) {
+      status = "正在切换文档，已暂存本次编辑（自动保存恢复后生效）";
+      return;
+    }
+    if (tabs[activeIdx]?.loadFailed) {
+      // P0 数据安全：该文件打开/载入失败，编辑器内容与磁盘无关联，禁止写盘覆盖原文件
+      status = "文件加载失败，已禁止保存（原文件未被修改）";
+      return;
+    }
     if (!currentPath) return saveAs();
+    // P0 数据安全：未建立保存基准（lastSaved=null）禁止写盘，对齐 queueAutoSave 的拦截
+    if (lastSaved === null) {
+      status = "保存基准未建立，已禁止保存（原文件未被修改）";
+      return;
+    }
     const text = pullDoc();
+    // P0 数据安全：编辑器内容与 lastSaved 完全一致时为 no-op，避免无谓的磁盘写入
+    if (text === lastSaved) {
+      docDirty = false;
+      updateTitle();
+      return;
+    }
     await writeFile(currentPath, text);
     source = text;
     lastSaved = text;
@@ -1735,6 +1896,10 @@ console.log("Hello LiteMD");
   }
 
   async function saveAs() {
+    if (suppressSave) {
+      status = "正在切换文档，已禁止另存为（自动保存恢复后生效）";
+      return;
+    }
     const p = await pickSaveFile();
     if (!p) return;
     const np = norm(p);
@@ -1840,6 +2005,10 @@ ${m.render(pullDoc())}
           return;
         }
         if (!currentPath || suppressSave) return;
+        const curTab = tabs[activeIdx];
+        // P0 数据安全：载入失败/从未建立保存基准（lastSaved=null）时禁止自动写盘，
+        // 防止欢迎页或半载内容覆盖原文件
+        if (curTab?.loadFailed || lastSaved === null) return;
         const text = pullDoc();
         if (text === lastSaved) return;
         try {
@@ -1859,16 +2028,240 @@ ${m.render(pullDoc())}
   }
 
   // ---------- 工具栏命令 ----------
-  const bold = () => view && wrapSelection(view, "**");
-  const italic = () => view && wrapSelection(view, "*");
-  const underline = () => view && wrapSelection(view, "__");
-  const strike = () => view && wrapSelection(view, "~~");
-  const h1 = () => view && toggleLinePrefix(view, "# ");
-  const ul = () => view && toggleLinePrefix(view, "- ");
-  const ol = () => view && toggleLinePrefix(view, "1. ");
-  const task = () => view && toggleLinePrefix(view, "- [ ] ");
-  const quote = () => view && toggleLinePrefix(view, "> ");
-  const link = () => view && insertLink(view);
+  /** 预览编辑模式下把格式命令转发到预览 DOM（选区校验后 execCommand），返回是否已处理；
+   * 选区不在预览编辑内时返回 false，由调用方回退到编辑器（CodeMirror）路径
+   *
+   * 列表 / 标题类命令后置规整：execCommand 把当前块转成 <li> / <h1~6> 后，
+   * Chrome 默认不一定把光标落在新建块的「末尾」——若光标落在块中间，
+   * 紧接的 Enter 会绕过「li 末尾 Enter / heading Enter」分支（q10 二次修复），
+   * 出现「列表 / 标题工具栏点击后按 Enter 不续行」。这里显式把光标放到
+   * 新建块的末尾：① 紧接输入文字直接进入新块；② 紧接按 Enter 必命中续行分支 */
+  function previewExec(cmd: string, arg?: string): boolean {
+    if (!previewEditMode || !previewEditEl) return false;
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount || !previewEditEl.contains(sel.anchorNode)) return false;
+    previewEditEl.focus();
+    // 必须在任何 DOM 修改之前记录状态(因为 execCommand 走完后光标位置会变化,
+    // 之后再查"是否在列表/标题内"已经不准确——这是历史上"工具栏点击不续行"的真正根因)
+    const wasInList = !!closestAInPreview("LI");
+    const origBlock = closestBlockInPreview(); // 标题/blockquote 兜底:execCommand 偶发失败时手动包装原块
+
+    // 标题 (H1~H6):彻底绕开 document.execCommand 的不稳定行为,直接 DOM 操作:
+    // 当前块替换为对应 heading,光标落在 heading 末尾,然后在 heading 后插入新段落作为续行。
+    // 这样既不依赖 Chrome/WebView2 的已弃用 execCommand,也能 100% 保证续行生效——
+    // 用户反复反馈"无法解决"的根因是这条路径。q15 已记。
+    if (cmd === "formatBlock" && /^<h[1-6]>$/i.test(arg || "")) {
+      const tag = (arg || "").slice(1, -1).toLowerCase();
+      const upper = tag.toUpperCase();
+      if (origBlock && origBlock.parentNode && origBlock.tagName !== upper) {
+        const h = document.createElement(upper);
+        while (origBlock.firstChild) h.appendChild(origBlock.firstChild);
+        if (!h.childNodes.length) h.appendChild(document.createTextNode(""));
+        origBlock.replaceWith(h);
+        const s2 = window.getSelection();
+        if (s2) {
+          const r = document.createRange();
+          r.selectNodeContents(h);
+          r.collapse(false);
+          s2.removeAllRanges();
+          s2.addRange(r);
+        }
+        appendContinuationInPreview(h);
+      } else if (origBlock && origBlock.tagName === upper) {
+        // 已是该级别：还原为 <p>(toggle)
+        const p = document.createElement("p");
+        while (origBlock.firstChild) p.appendChild(origBlock.firstChild);
+        if (!p.childNodes.length) p.appendChild(document.createTextNode(""));
+        origBlock.replaceWith(p);
+        const s2 = window.getSelection();
+        if (s2) {
+          const r = document.createRange();
+          r.selectNodeContents(p);
+          r.collapse(false);
+          s2.removeAllRanges();
+          s2.addRange(r);
+        }
+      }
+      onPreviewEditInput();
+      scrollCaretIntoView(previewEditEl);
+      return true;
+    }
+
+    // 引用:同上,绕开 execCommand
+    if (cmd === "formatBlock" && /^<blockquote>$/i.test(arg || "")) {
+      if (origBlock && origBlock.parentNode && origBlock.tagName !== "BLOCKQUOTE") {
+        const bq = document.createElement("blockquote");
+        while (origBlock.firstChild) bq.appendChild(origBlock.firstChild);
+        if (!bq.childNodes.length) bq.appendChild(document.createTextNode(""));
+        origBlock.replaceWith(bq);
+        const s2 = window.getSelection();
+        if (s2) {
+          const r = document.createRange();
+          r.selectNodeContents(bq);
+          r.collapse(false);
+          s2.removeAllRanges();
+          s2.addRange(r);
+        }
+        appendContinuationInPreview(bq);
+      } else if (origBlock && origBlock.tagName === "BLOCKQUOTE") {
+        // 还原引用:把引用内的子块提升为段落(不用 execCommand:对 blockquote>pre 等嵌套无效)
+        const bq = origBlock;
+        const frag = document.createDocumentFragment();
+        for (const child of Array.from(bq.children)) {
+          const cp = document.createElement("p");
+          while (child.firstChild) cp.appendChild(child.firstChild);
+          frag.appendChild(cp);
+        }
+        if (!bq.textContent?.trim()) frag.appendChild(document.createElement("p"));
+        bq.replaceWith(frag);
+      }
+      onPreviewEditInput();
+      scrollCaretIntoView(previewEditEl);
+      return true;
+    }
+
+    // 列表:彻底绕开 execCommand。Chrome 的 insertOrderedList/insertUnorderedList
+    // 在 contenteditable 中行为不稳定(切换 ul↔ol 时可能不创建新 li,或在 li 内
+    // 嵌套时选区错乱)——这是预览编辑模式"工具栏点击列表不续行"的真正根因。
+    // 直接 DOM 操作:从非列表块新建 li,或对已有 li 切换类型。完全可控。
+    if (cmd === "insertUnorderedList" || cmd === "insertOrderedList") {
+      const listTag = cmd === "insertUnorderedList" ? "UL" : "OL";
+      const inLi = !!closestAInPreview("LI");
+      if (!inLi) {
+        // 非列表块 → 包成 ul/ol > li,光标落在 li 末尾,然后插一个新 li 续行
+        const block = closestBlockInPreview();
+        const root = previewEditEl;
+        if (!root) return false;
+        const list = document.createElement(listTag);
+        const li = document.createElement("li");
+        if (block && block.parentNode) {
+          while (block.firstChild) li.appendChild(block.firstChild);
+          block.replaceWith(list);
+          list.appendChild(li);
+        } else {
+          li.appendChild(document.createTextNode(""));
+          list.appendChild(li);
+          root.appendChild(list);
+        }
+        placeCaretAtEnd(li);
+        appendContinuationInPreview(li);
+        onPreviewEditInput();
+        scrollCaretIntoView(previewEditEl);
+        return true;
+      } else {
+        // 已在 li 中:切换 ul↔ol 用 execCommand(行为稳定,因为只在已有 li 上做类型切换)
+        const ok = document.execCommand(cmd);
+        if (ok) {
+          onPreviewEditInput();
+          scrollCaretIntoView(previewEditEl);
+        }
+        return ok;
+      }
+    }
+
+    // 其他 (bold/italic/underline/strike/codeBlock/table 等) 走 execCommand
+    const ok = document.execCommand(cmd, false, arg);
+    if (ok) {
+      onPreviewEditInput();
+      // 同步立即滚动(不等 800ms 防抖)
+      scrollCaretIntoView(previewEditEl);
+    }
+    return ok;
+  }
+  /** 在 previewEditEl 内从当前选区向上找第一个匹配 tag 的元素 */
+  function closestAInPreview(tag: string): HTMLElement | null {
+    const root = previewEditEl;
+    if (!root) return null;
+    const node = window.getSelection()?.anchorNode ?? null;
+    let n: Node | null = node;
+    while (n && n !== root) {
+      if (n.nodeType === 1 && (n as Element).tagName === tag.toUpperCase()) return n as HTMLElement;
+      n = n.parentNode;
+    }
+    return null;
+  }
+  /** 在 previewEditEl 内从当前选区向上找第一个块级元素（p/h1~6/blockquote/pre/li 等） */
+  function closestBlockInPreview(): HTMLElement | null {
+    const root = previewEditEl;
+    if (!root) return null;
+    const BLOCKS = new Set(["P", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "PRE", "LI", "DIV"]);
+    const node = window.getSelection()?.anchorNode ?? null;
+    let n: Node | null = node;
+    while (n && n !== root) {
+      if (n.nodeType === 1 && BLOCKS.has((n as Element).tagName)) return n as HTMLElement;
+      n = n.parentNode;
+    }
+    return null;
+  }
+  /** 在当前块后插入「新的一行」（标题→新段落；列表项→新空 li）并跳光标过去 */
+  function appendContinuationInPreview(block: Element): void {
+    const root = previewEditEl;
+    if (!root) return;
+    let next: HTMLElement;
+    if (block.tagName === "LI") {
+      next = document.createElement("li");
+      next.appendChild(document.createElement("br"));
+    } else {
+      next = document.createElement("p");
+      // 不加 <br>:空 <p> 在 turndown 里输出空字符串,与源代码的 \n 对齐
+    }
+    // 确认 newNode 真在 root 内
+    if (!root.contains(block)) {
+      root.appendChild(next);
+    } else {
+      block.insertAdjacentElement("afterend", next);
+    }
+    // 立即设 selection 到新行开头
+    const sel = window.getSelection();
+    if (sel) {
+      const r = document.createRange();
+      r.setStart(next, 0);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+    // 强制 reflow + 滚动跟随:contenteditable 的滚动容器默认不跟随光标
+    next.offsetHeight;
+    requestAnimationFrame(() => {
+      scrollCaretIntoView(root);
+    });
+  }
+  /** 把光标放到 el 内最后一个可见内容之后（不创建 BR，避免破坏 tight li 结构） */
+  function placeCaretAtEnd(el: HTMLElement): void {
+    const sel = window.getSelection();
+    if (!sel) return;
+    const r = document.createRange();
+    // selectNodeContents + collapse(false) 落在最后一个子节点之后；
+    // 空块（如 <li><br></li>）会落在 <br> 之前，等价「块末尾」，Enter 必命中续行分支
+    r.selectNodeContents(el);
+    r.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  const bold = () => (previewExec("bold") || (view && wrapSelection(view, "**")));
+  const italic = () => (previewExec("italic") || (view && wrapSelection(view, "*")));
+  const underline = () => (previewExec("underline") || (view && wrapSelection(view, "__")));
+  const strike = () => (previewExec("strikeThrough") || (view && wrapSelection(view, "~~")));
+  const h1 = () => (previewExec("formatBlock", "<h1>") || (view && toggleLinePrefix(view, "# ")));
+  const ul = () => (previewExec("insertUnorderedList") || (view && toggleLinePrefix(view, "- ")));
+  const ol = () => (previewExec("insertOrderedList") || (view && toggleLinePrefix(view, "1. ")));
+  // 任务列表：预览编辑无原生 execCommand，退化为新列表项（内容不受影响）
+  const task = () => (previewExec("insertUnorderedList") || (view && toggleLinePrefix(view, "- [ ] ")));
+  const quote = () => (previewExec("formatBlock", "<blockquote>") || (view && toggleLinePrefix(view, "> ")));
+  const link = () => {
+    if (previewEditMode && previewEditEl) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && previewEditEl.contains(sel.anchorNode)) {
+        previewEditEl.focus();
+        const url = window.prompt("链接地址（URL）：", "https://");
+        if (!url) return;
+        document.execCommand("createLink", false, url);
+        onPreviewEditInput();
+        return;
+      }
+    }
+    view && insertLink(view);
+  };
 
   // ---------- 撤销 / 重做（工具栏按钮）----------
   const doUndo = () => view && undo(view);
@@ -1906,10 +2299,23 @@ ${m.render(pullDoc())}
   }
 
   function pickColor(hex: string) {
-    if (!view || !colorMenu) return;
-    const css = colorMenu.type === "fg" ? `color:${hex}` : `background-color:${hex}`;
+    if (!colorMenu) return;
+    const isFg = colorMenu.type === "fg";
+    if (previewEditMode && previewEditEl) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && previewEditEl.contains(sel.anchorNode)) {
+        previewEditEl.focus();
+        document.execCommand(isFg ? "foreColor" : "hiliteColor", false, hex);
+        onPreviewEditInput();
+        status = isFg ? "已设置字体颜色" : "已设置背景颜色";
+        colorMenu = null;
+        return;
+      }
+    }
+    if (!view) return;
+    const css = isFg ? `color:${hex}` : `background-color:${hex}`;
     wrapHtmlSpan(view, css);
-    status = colorMenu.type === "fg" ? "已设置字体颜色" : "已设置背景颜色";
+    status = isFg ? "已设置字体颜色" : "已设置背景颜色";
     colorMenu = null;
   }
 
@@ -1948,31 +2354,41 @@ ${m.render(pullDoc())}
   }
 
   async function insertImg() {
+    if (previewEditMode && previewEditEl) {
+      // 预览编辑模式：复用收编管线在光标处插入 <img>（不退出模式，与快捷键/粘贴/拖拽一致）
+      await insertImageAtCaret(previewEditEl, async () => {
+        const p = await pickImageFile();
+        if (!p) return null;
+        const r = await resolveImageRef(p);
+        status = "图片已插入";
+        return { url: convertFileSrc(r.abs), ref: r.ref };
+      }, onPreviewEditInput);
+      return;
+    }
     if (!view) return;
     const p = await pickImageFile();
     if (!p) return;
     await insertImageByPath(p);
   }
 
-  // 统一插图：当前笔记有目录则收编（可选压缩）用相对引用；否则用绝对路径
-  async function insertImageByPath(p: string) {
-    if (!view) return;
+  // 统一插图：当前笔记有目录则收编（可选压缩）用相对引用；否则用绝对路径。
+  // 返回 { ref: markdown 引用, abs: 磁盘绝对路径 }；预览编辑插图与编辑器插图共用
+  async function resolveImageRef(p: string): Promise<{ ref: string; abs: string }> {
     if (currentPath) {
       try {
-        const rel = await importAsset(p, dirname(currentPath), settings.assetsDir, settings.compressImages, settings.jpegQuality);
-        insertImage(view, rel);
-        status = "图片已收编 " + basename(rel);
-        return;
-      } catch (e) {
+        const ref = await importAsset(p, dirname(currentPath), settings.assetsDir, settings.compressImages, settings.jpegQuality);
+        return { ref, abs: dirname(currentPath) + "/" + ref };
+      } catch {
         // 收编失败回退绝对路径
-        insertImage(view, p);
-        status = "收编失败，已插入绝对路径：" + String(e);
-        return;
       }
     }
-    // 未保存笔记（无目录）：插入绝对路径
-    insertImage(view, p);
-    status = "已插入图片 " + basename(p);
+    return { ref: p, abs: p };
+  }
+  async function insertImageByPath(p: string) {
+    if (!view) return;
+    const r = await resolveImageRef(p);
+    insertImage(view, r.ref);
+    status = r.ref === p ? "已插入图片 " + basename(p) : "图片已收编 " + basename(r.ref);
   }
 
   // 字节数组转 base64（分块处理，避免大图调用栈溢出）
@@ -2001,11 +2417,11 @@ ${m.render(pullDoc())}
       return importAssetBytes(dirname(currentPath!), settings.assetsDir, ext, b64, compress, quality);
     }
   }
-  async function insertPastedImage(file: File) {
-    if (!view) return;
+  // 粘贴/拖拽图片收编：返回 { ref, abs }；未保存笔记返回 null（需要目录基准）
+  async function assetFromImageFile(file: File): Promise<{ ref: string; abs: string } | null> {
     if (!currentPath) {
-      status = "请先保存笔记，再粘贴图片";
-      return;
+      status = "请先保存笔记，再插入图片";
+      return null;
     }
     const t0 = performance.now();
     const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
@@ -2035,14 +2451,21 @@ ${m.render(pullDoc())}
         const buf = await file.arrayBuffer();
         rel = await sendAssetBytes(ext, new Uint8Array(buf), settings.compressImages, settings.jpegQuality);
       }
-      insertImage(view, rel);
-      status = "图片已收编 " + basename(rel);
+      if (typeof console !== "undefined") {
+        console.debug("[img] 主线程阻塞", (performance.now() - t0).toFixed(1), "ms");
+      }
+      return { ref: rel, abs: dirname(currentPath) + "/" + rel };
     } catch (e) {
-      status = "粘贴图片失败：" + String(e);
+      status = "图片收编失败：" + String(e);
+      return null;
     }
-    if (typeof console !== "undefined") {
-      console.debug("[img] 主线程阻塞", (performance.now() - t0).toFixed(1), "ms");
-    }
+  }
+  async function insertPastedImage(file: File) {
+    if (!view) return;
+    const r = await assetFromImageFile(file);
+    if (!r) return;
+    insertImage(view, r.ref);
+    status = "图片已收编 " + basename(r.ref);
   }
 
   // 窗口级粘贴监听：仅拦截含图片的剪贴板，文本粘贴照常交给 CodeMirror
@@ -2116,16 +2539,26 @@ ${m.render(pullDoc())}
 
     // ---- 清理未引用附件：递归扫描文件夹，删除每一处附件文件夹中未被任何 .md 引用的文件 ----
     let confirmCleanup = false;
+    let cleanupPreview: string[] = [];
     async function doCleanupAssets() {
       const dir = settings.lastFolder ?? (currentPath ? dirname(currentPath) : null);
       if (!dir) { status = "请先打开一篇笔记或一个文件夹"; return; }
-      confirmCleanup = true;
+      try {
+        cleanupPreview = await listOrphanAssets(dir, settings.assetsDir);
+        if (!cleanupPreview.length) { status = "没有发现未引用的附件"; return; }
+        confirmCleanup = true;
+      } catch (e) { status = "扫描未引用附件失败：" + String(e); }
+    }
+    function onCleanupCancel() {
+      confirmCleanup = false;
+      cleanupPreview = [];
     }
     async function onCleanupConfirm() {
       confirmCleanup = false;
       const dir = settings.lastFolder ?? (currentPath ? dirname(currentPath) : null)!;
       try {
-        const deleted = await cleanupOrphans(dir, settings.assetsDir);
+        const deleted = await cleanupOrphansWith(dir, settings.assetsDir, cleanupPreview);
+        cleanupPreview = [];
         status = deleted.length ? `已清理 ${deleted.length} 个未引用附件` : "没有发现未引用的附件";
       } catch (e) { status = "清理失败：" + String(e); }
     }
@@ -2172,12 +2605,27 @@ ${m.render(pullDoc())}
     // ---- 关闭流程（已迁移到脚本顶层）----
 
   function codeBlock() {
+    if (previewEditMode && previewEditEl) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && previewEditEl.contains(sel.anchorNode)) {
+        previewEditEl.focus();
+        if (document.execCommand("formatBlock", false, "<pre>")) onPreviewEditInput();
+        status = "已插入代码块";
+        return;
+      }
+    }
     if (!view) return;
     insertCodeBlock(view, "");
     status = "已插入代码块";
   }
 
   function table() {
+    // 预览编辑模式：直接在渲染区光标处插入表格，光标落在表格第一个单元格内（不退出模式）
+    if (previewEditMode && previewEditEl) {
+      insertTableAtCaret(previewEditEl, onPreviewEditInput);
+      status = "已插入表格";
+      return;
+    }
     if (!view) return;
     insertTable(view);
     status = "已插入表格";
@@ -2242,7 +2690,7 @@ ${m.render(pullDoc())}
     else if (hit("table.addColumn")) run(e, addColumn);
     else if (hit("insert.bullet")) run(e, unorderedList);
     else if (hit("format.quote")) run(e, quote);
-    else if (hit("view.togglePreview")) run(e, () => (showPreview = !showPreview));
+    else if (hit("view.togglePreview")) run(e, () => togglePreviewPane());
     else if (hit("view.focusMode")) run(e, toggleFocus);
     else if (hit("view.fontIncrease")) run(e, () => bumpFont(1));
     else if (hit("view.fontDecrease")) run(e, () => bumpFont(-1));
@@ -2281,7 +2729,7 @@ ${m.render(pullDoc())}
     }
     const cur = tabs[activeIdx];
     if (cur) syncTabState(cur);
-    const dirtyTabs = tabs.filter(isDirtyTab);
+    const dirtyTabs = tabs.filter((t) => isDirtyTab(t) && !t.loadFailed);
     if (dirtyTabs.length === 0) {
       doClose();
       return;
@@ -2292,9 +2740,19 @@ ${m.render(pullDoc())}
   }
   async function onCloseAllSave() {
     closeAllDialog = false;
+    // P0 数据安全：applyTabState 期间不能批量保存（编辑器里仍是旧标签/欢迎页内容）
+    if (suppressSave) {
+      status = "正在切换文档，已禁止批量保存（原文件未被修改）";
+      return;
+    }
     try {
       for (const tab of tabs) {
-        if (isDirtyTab(tab)) {
+        if (isDirtyTab(tab) && !tab.loadFailed) {
+          // P0 数据安全：缺保存基准的标签跳过，避免陈旧内容覆盖磁盘
+          if (!tab.savedContent) {
+            status = `已跳过 ${basename(tab.path)}（未建立保存基准）`;
+            continue;
+          }
           await writeFile(tab.path, tab.content);
           tab.savedContent = tab.content;
           tab.dirty = false;
@@ -2474,64 +2932,27 @@ ${m.render(pullDoc())}
 
   <div class="body">
     {#if showTree}
-      <aside class="sidebar" style="width:{sidebarWidth}px">
-        <div class="panel-head">
-          <span>文件</span>
-          <span style="flex:1" />
-          <button on:click={() => newFileIn(settings.lastFolder)} title="新建笔记（未打开文件夹时会先让你选文件夹）">📄+</button>
-          <button on:click={() => newFolderIn(settings.lastFolder)} title="新建文件夹（未打开文件夹时会先让你选文件夹）">📁+</button>
-          <button on:click={refreshTree} title="刷新目录">↻</button>
-          <button
-            on:click={() => (showHiddenManage = !showHiddenManage)}
-            class:on={showHiddenManage || settings.hiddenPaths.length > 0}
-            title="隐藏文件/文件夹管理（含取消隐藏）">隐</button>
-          <button on:click={() => (showTree = false)} title="折叠">‹</button>
-        </div>
-        {#if flatTree.length}
-          <ul bind:clientHeight={treeViewportH} on:scroll={onTreeScroll}>
-            {#if treeVirtual && treeRange.top > 0}
-              <li class="vsp" style="height:{treeRange.top}px" aria-hidden="true"></li>
-            {/if}
-            {#each flatTree.slice(treeRange.s, treeRange.e) as node (node.path)}
-              {#if node.kind === "folder"}
-                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-                <li
-                  class="folder"
-                  style="padding-left:{6 + node.depth * 18}px"
-                  on:click={() => toggleFolder(node.path)}
-                  on:contextmenu={(e) => openCtx(e, "folder", node.path, node.name)}
-                >
-                  <span class="fold">{node.expanded ? "▾" : "▸"}</span>
-                  <span class="fname">{node.name}</span>
-                  <span class="factions">
-                    <button class="mini" title="新建笔记" on:click|stopPropagation={() => newFileIn(node.path)}>📄</button>
-                    <button class="mini" title="新建文件夹" on:click|stopPropagation={() => newFolderIn(node.path)}>📁</button>
-                  </span>
-                </li>
-              {:else}
-                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-                <li
-                  class="file"
-                  style="padding-left:{6 + node.depth * 18}px"
-                  class:active={currentPath === norm(node.path)}
-                  on:click={() => openFileByPath(node.path)}
-                  on:contextmenu={(e) => openCtx(e, "file", node.path, node.name)}
-                >
-                  <span class="ficon">📄</span>
-                  <span class="fnm">{node.name}</span>
-                </li>
-              {/if}
-            {/each}
-            {#if treeVirtual && treeRange.bottom > 0}
-              <li class="vsp" style="height:{treeRange.bottom}px" aria-hidden="true"></li>
-            {/if}
-          </ul>
-        {:else}
-          <ul>
-            <li class="hint">打开文件夹后显示 .md 列表</li>
-          </ul>
-        {/if}
-      </aside>
+            <FileTree
+        flatTree={flatTree}
+        {sidebarWidth}
+        {currentPath}
+        {norm}
+        lastFolder={settings.lastFolder}
+        hiddenPaths={settings.hiddenPaths}
+        {treeRange}
+        {treeVirtual}
+        {treeViewportH}
+        {showHiddenManage}
+        on:scroll={(e) => onTreeScroll(e.detail)}
+        on:newfile={(e) => newFileIn(e.detail)}
+        on:newfolder={(e) => newFolderIn(e.detail)}
+        on:refresh={() => refreshTree()}
+        on:toggleHidden={() => (showHiddenManage = !showHiddenManage)}
+        on:collapse={() => (showTree = false)}
+        on:togglefolder={(e) => toggleFolder(e.detail)}
+        on:openfile={(e) => openFileByPath(e.detail)}
+        on:ctx={(e) => openCtx(e.detail.e, e.detail.kind, e.detail.path, e.detail.name)}
+      />
       <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="splitter" on:mousedown={(e) => startDrag("sidebar", e)} title="拖动调整宽度" />
     {/if}
@@ -2539,56 +2960,53 @@ ${m.render(pullDoc())}
     <main class="editor">
       {#if tabs.length > 0}
         <div class="tabbar" on:auxclick={onTabbarAuxClick}>
-          {#each tabs as tab, i (tab.path)}
-            <div
-              class="tab"
-              class:active={i === activeIdx}
-              data-path={tab.path}
-              on:click={() => activateTab(i)}
-              on:contextmenu|preventDefault={(e) => {
-                // 右键标签：显示操作菜单（关闭/关闭其他/关闭全部）
-                ctxMenu = { x: e.clientX, y: e.clientY, kind: "tab", path: tab.path, name: basename(tab.path) };
-              }}
-              title={tab.path}
-            >
-              <span class="tab-name">{basename(tab.path)}{#if isDirtyTab(tab)}<span class="tab-dot">●</span>{/if}</span>
-              <button
-                class="tab-close"
-                title="关闭标签"
-                on:click|stopPropagation={() => requestCloseTab(tab.path)}>✕</button>
-            </div>
-          {/each}
+          <div class="tab-scroll">
+            {#each tabs as tab, i (tab.path)}
+              <div
+                class="tab"
+                class:active={i === activeIdx}
+                data-path={tab.path}
+                on:click={() => activateTab(i)}
+                on:contextmenu|preventDefault={(e) => {
+                  // 右键标签：显示操作菜单（关闭/关闭其他/关闭全部）
+                  ctxMenu = { x: e.clientX, y: e.clientY, kind: "tab", path: tab.path, name: basename(tab.path) };
+                }}
+                title={tab.path}
+              >
+                <span class="tab-name">{basename(tab.path)}{#if isDirtyTab(tab)}<span class="tab-dot">●</span>{/if}</span>
+                <button
+                  class="tab-close"
+                  title="关闭标签"
+                  on:click|stopPropagation={() => requestCloseTab(tab.path)}>✕</button>
+              </div>
+            {/each}
+          </div>
+          <span style="flex:1" />
+          {#if !showTree}
+            <button class="tab-act" on:click={() => (showTree = true)} title="展开目录">›</button>
+          {/if}
+          <button
+            class="tab-act"
+            class:on={previewEditMode}
+            on:click={() => (previewEditMode ? exitPreviewEdit() : enterPreviewEdit())}
+            title="预览编辑模式：隐藏 markdown 编辑器，直接在渲染预览中编辑">✎</button>
+          <button class="tab-act" class:on={showPreview} on:click={togglePreviewPane} title="开关预览">
+            {#if showPreview}
+              <!-- 眼睛（预览开启） -->
+              <svg class="ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            {:else}
+              <!-- 眼睛（预览关闭，带斜杠） -->
+              <svg class="ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+                <line x1="1" y1="1" x2="23" y2="23" />
+              </svg>
+            {/if}
+          </button>
         </div>
       {/if}
-      <div class="panel-head">
-        {#if !showTree}
-          <button on:click={() => (showTree = true)} title="展开目录">›</button>
-        {/if}
-        <span class="filename">{currentPath ? basename(currentPath) : "未命名.md"}{#if dirty}<span class="dirty">●</span>{/if}</span>
-        {#if currentPath}
-          <button class="file-close" title="关闭当前文件" on:click={() => requestCloseTab(currentPath)}>✕</button>
-        {/if}
-        <span style="flex:1" />
-        <button
-          on:click={() => (previewEditMode ? exitPreviewEdit() : enterPreviewEdit())}
-          class:on={previewEditMode}
-          title="预览编辑模式：隐藏 markdown 编辑器，直接在渲染预览中编辑">✎ 预览编辑</button>
-        <button on:click={() => (showPreview = !showPreview)} class:on={showPreview} title="开关预览">
-          {#if showPreview}
-            <!-- 眼睛（预览开启） -->
-            <svg class="ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-          {:else}
-            <!-- 眼睛（预览关闭，带斜杠） -->
-            <svg class="ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
-              <line x1="1" y1="1" x2="23" y2="23" />
-            </svg>
-          {/if}
-        </button>
-      </div>
       {#if previewEditMode}
         <div
           class="preview-edit"
@@ -2650,15 +3068,16 @@ ${m.render(pullDoc())}
     {/if}
   </div>
 
-  <footer class="statusbar">
-    <span class="sb-path" title={currentPath ?? ""}>{currentPath ?? "未保存"}</span>
-    <span>{status}</span>
-    <span class="spacer" />
-    <span>行 {cursorLine} : 列 {cursorCol}</span>
-    <span>{stats.words} 字 · {stats.chars} 字符</span>
-    <span>{settings.autoSave ? "自动保存开" : "自动保存关"}</span>
-    <span>{settings.fontSize}px</span>
-  </footer>
+  <StatusBar
+    {currentPath}
+    {status}
+    {cursorLine}
+    {cursorCol}
+    words={stats.words}
+    chars={stats.chars}
+    autoSave={settings.autoSave}
+    fontSize={settings.fontSize}
+  />
 
   <!-- 行内快捷菜单（gutter 按钮弹出）-->
   {#if quickMenu}
@@ -2761,11 +3180,14 @@ ${m.render(pullDoc())}
   <svelte:component
     this={modalCmps.ConfirmModal}
     title="清理未引用附件"
-    message={`将递归扫描并删除每一处「${settings.assetsDir}/」下未被任何 .md 引用的附件。\n此操作不可撤销，确定继续？`}
-    confirmText="确定清理"
+    message={`将删除 ${cleanupPreview.length} 个未被任何 .md 引用的附件（前 20 项）：\n` +
+      cleanupPreview.slice(0, 20).join("\n") +
+      (cleanupPreview.length > 20 ? `\n…等共 ${cleanupPreview.length} 个` : "") +
+      `\n此操作不可撤销，确定继续？`}
+    confirmText={`确定清理 ${cleanupPreview.length} 个`}
     danger={true}
     on:confirm={onCleanupConfirm}
-    on:cancel={() => (confirmCleanup = false)}
+    on:cancel={onCleanupCancel}
   />
 {/if}
 

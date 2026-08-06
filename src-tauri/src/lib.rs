@@ -2,8 +2,9 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use serde::Serialize;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use regex::Regex;
 use printpdf::{Mm, PdfDocument};
@@ -385,16 +386,23 @@ fn move_path(src: String, dest_dir: String) -> Result<String, String> {
     }
     guard_not_into_self(&src, &dest_dir)?;
     let dest = resolve_dest(&src, &dest_dir)?;
-    // 同盘 rename 最快；跨盘符会失败，退回「复制 + 删除」
+    // 同盘 rename 最快；跨盘符会失败，退回「复制 + 删除」。
+    // 注意：copy 成功但 remove 失败会留下两份内容，必须把 dest 回滚并把错误抛给前端。
     match fs::rename(&src, &dest) {
         Ok(()) => Ok(dest.to_string_lossy().to_string()),
         Err(_) => {
             if src.is_dir() {
                 copy_dir_recursive(&src, &dest)?;
-                fs::remove_dir_all(&src).map_err(|e| e.to_string())?;
+                if let Err(e) = fs::remove_dir_all(&src) {
+                    let _ = fs::remove_dir_all(&dest); // 回滚 dest，避免源/目标同时存在
+                    return Err(format!("已复制到目标，但删除源失败：{}", e));
+                }
             } else {
                 fs::copy(&src, &dest).map_err(|e| e.to_string())?;
-                fs::remove_file(&src).map_err(|e| e.to_string())?;
+                if let Err(e) = fs::remove_file(&src) {
+                    let _ = fs::remove_file(&dest); // 回滚 dest
+                    return Err(format!("已复制到目标，但删除源失败：{}", e));
+                }
             }
             Ok(dest.to_string_lossy().to_string())
         }
@@ -861,21 +869,67 @@ fn collect_md_contents(dir: &std::path::Path, out: &mut Vec<String>) {
 // 返回被删文件相对 root 的路径列表。
 // 返回被删文件相对 root 的路径列表。
 // 异步：递归扫描+全文正则匹配，重 CPU
+/// 仅扫描并返回孤儿附件相对 root 的路径（不删除），供 UI 预览。
+/// 与 `cleanup_orphans_with` 共用同一份判定逻辑，确保列表与删除一致。
 #[tauri::command]
-async fn cleanup_orphans(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || cleanup_orphans_sync(note_dir, assets_name))
+async fn list_orphan_assets(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_orphans_sync(note_dir, assets_name))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn cleanup_orphans_sync(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
+/// 按给定的相对路径列表删除孤儿附件（来自 list_orphan_assets 预览）。
+/// 两步流程避免「一键清理」误删正在引用的文件：UI 先列、后确认、再删。
+#[tauri::command]
+async fn cleanup_orphans_with(note_dir: String, assets_name: String, rel_paths: Vec<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(&note_dir);
+        let mut deleted: Vec<String> = Vec::new();
+        for rel in rel_paths {
+            // 防越界：必须落在 root 下，且确实位于一处 assets_name 文件夹内
+            let candidate = root.join(&rel);
+            let parent_name = candidate.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+            if parent_name != Some(assets_name.as_str()) {
+                continue;
+            }
+            // canonicalize 防止 ../ 等逃逸
+            if let (Ok(c), Ok(r)) = (candidate.canonicalize(), root.canonicalize()) {
+                if !c.starts_with(&r) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            if candidate.is_file() {
+                if let Err(e) = fs::remove_file(&candidate) {
+                    eprintln!("[cleanup_orphans_with] 删除失败 {:?}: {}", candidate, e);
+                    continue;
+                }
+                deleted.push(rel);
+            }
+        }
+        Ok(deleted)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 保留旧接口以兼容旧前端：内部走「列 + 删」两步，等价于以前的直接删除语义。
+/// 新代码请改用 list_orphan_assets + cleanup_orphans_with。
+#[tauri::command]
+async fn cleanup_orphans(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
+    let candidates = list_orphan_assets(note_dir.clone(), assets_name.clone()).await?;
+    cleanup_orphans_with(note_dir, assets_name, candidates).await
+}
+
+fn scan_orphans_sync(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
     let root = PathBuf::from(&note_dir);
     if !root.is_dir() {
         return Ok(Vec::new());
     }
-    let mut deleted: Vec<String> = Vec::new();
-    cleanup_dir_recursive(&root, &root, &assets_name, &mut deleted);
-    Ok(deleted)
+    let mut orphans: Vec<String> = Vec::new();
+    cleanup_dir_recursive(&root, &root, &assets_name, &mut orphans);
+    Ok(orphans)
 }
 
 fn cleanup_dir_recursive(
@@ -953,16 +1007,34 @@ const PAGE_H_MM: f64 = 297.0;
 const MARGIN_MM: f64 = 20.0;
 const CONTENT_W_MM: f64 = PAGE_W_MM - MARGIN_MM * 2.0;
 
-/// 系统中文字体缓存（导出是低频操作，OnceLock 保证只查找/解析一次）
+/// 系统中文字体缓存（导出是低频操作，缓存保证只查找/解析一次）。
+///
+/// 实现权衡：Face<'_> 必须借用底层字节，所以为了让缓存返回 'static 引用，
+/// 底层数据用 `Box::leak` 永久驻留。单次进程生命周期只泄漏一份字体（10~30MB），
+/// 对于长时间运行的桌面编辑器可以接受；每次 `tauri dev` 重启进程也不会累积。
+///
+/// 用 `Mutex<Option<…>>` 而非 `OnceLock` 是为了测试可重置（`OnceLock::take` 在
+/// 1.86 才稳定，本项目 MSRV=1.77.2）。生产环境下锁只在首次加载时进入慢路径，
+/// 后续热路径是无竞争的 fast path。
 struct CjkFont {
     data: &'static [u8],
     face: otp::Face<'static>,
 }
 
-static FONT_CACHE: std::sync::OnceLock<Option<CjkFont>> = std::sync::OnceLock::new();
+static FONT_CACHE: std::sync::Mutex<Option<CjkFont>> = std::sync::Mutex::new(None);
 
 fn get_cjk_font() -> Option<&'static CjkFont> {
-    FONT_CACHE.get_or_init(|| {
+    // 双重检查：fast path 完全无锁（读 + 命中），slow path 拿锁再判断
+    if let Some(ref f) = *FONT_CACHE.lock().expect("FONT_CACHE poisoned") {
+        // 安全：Mutex 内的 Option<CjkFont> 持有 'static 借用，
+        // Mutex 自身是 'static 静态项，所以可以从指针取引用并扩展到 'static。
+        // 这里通过 *const 指针桥接避免借用检查器误判。
+        let ptr: *const CjkFont = f as *const CjkFont;
+        return Some(unsafe { &*ptr });
+    }
+    // 真正需要加载时再拿写锁：候选人路径遍历 + ttf-parser 解析，单进程只走一次
+    let mut guard = FONT_CACHE.lock().expect("FONT_CACHE poisoned");
+    if guard.is_none() {
         // 常见系统中文字体路径（TTF/TTC）；找不到时返回 None，PDF 导出报错提示
         let candidates = [
             r"C:\Windows\Fonts\msyh.ttc",     // 微软雅黑
@@ -976,16 +1048,30 @@ fn get_cjk_font() -> Option<&'static CjkFont> {
         ];
         for p in candidates {
             if let Ok(data) = fs::read(p) {
-                // 只泄漏一次（OnceLock 保证），换回 'static 生命周期供 Face 借用
+                // 只泄漏一次（Mutex 缓存保证），换回 'static 生命周期供 Face 借用
                 let data: &'static [u8] = Box::leak(data.into_boxed_slice());
                 if let Ok(face) = otp::Face::parse(data, 0) {
-                    return Some(CjkFont { data, face });
+                    *guard = Some(CjkFont { data, face });
+                    break;
                 }
             }
         }
-        None
-    })
-    .as_ref()
+        // 候选路径全部 miss 时 guard 仍为 None，下次调用会再重试（候选可能运行时安装）。
+        // 这里不缓存失败结果，让用户安装字体后立刻能生效。
+    }
+    let ptr: *const CjkFont = match guard.as_ref() {
+        Some(f) => f as *const CjkFont,
+        None => return None,
+    };
+    Some(unsafe { &*ptr })
+}
+
+/// 仅测试入口：清空字体缓存，便于在不同字体环境下验证重载路径。
+/// 注意：原先 Box::leak 的字节不会被回收（这是设计权衡），但缓存指针会被替换，
+/// 下次 `get_cjk_font` 会重新走加载流程。
+#[cfg(test)]
+pub(crate) fn reset_cjk_font_for_test() {
+    *FONT_CACHE.lock().expect("FONT_CACHE poisoned") = None;
 }
 
 /// 单个字符在指定字号下的宽度（pt）；无字形时按 0.5em 估算
@@ -1166,7 +1252,9 @@ fn export_pdf(path: String, markdown: String) -> Result<(), String> {
         }
     };
 
-    let mut ordered_n: u64 = 1;
+    // 有序列表计数器栈：每层 List(start) 入栈对应起始编号（0 表示无序/未指定），
+    // 每层 Item 出号后自增栈顶；TagEnd::List 出栈。修复嵌套有序列表沿用外层计数的问题。
+    let mut ordered_stack: Vec<u64> = Vec::new();
 
     for ev in events {
         match ev {
@@ -1189,13 +1277,20 @@ fn export_pdf(path: String, markdown: String) -> Result<(), String> {
                 }
                 Tag::List(start) => {
                     flush(&mut lt, &style, &mut buf, skip_depth);
-                    ordered_n = start.unwrap_or(0);
+                    // pulldown-cmark 在嵌套无序列表里也会触发 Tag::List(None)；
+                    // 这里统一入栈，0 表示「无序 / 未指定编号」，由 Item 分支判定。
+                    ordered_stack.push(start.unwrap_or(0));
                 }
                 Tag::Item => {
                     flush(&mut lt, &style, &mut buf, skip_depth);
-                    let prefix = if ordered_n > 0 {
-                        let p = format!("{}.", ordered_n);
-                        ordered_n += 1;
+                    // 当前层编号：栈顶 = 0（无序）或正整数（有序起点）
+                    let current = ordered_stack.last().copied().unwrap_or(0);
+                    let prefix = if current > 0 {
+                        let p = format!("{}.", current);
+                        // 自增栈顶；深层嵌套只动本层，不影响外层
+                        if let Some(top) = ordered_stack.last_mut() {
+                            *top += 1;
+                        }
                         p
                     } else {
                         "•".to_string()
@@ -1235,6 +1330,7 @@ fn export_pdf(path: String, markdown: String) -> Result<(), String> {
                 }
                 TagEnd::List(_) => {
                     flush(&mut lt, &style, &mut buf, skip_depth);
+                    ordered_stack.pop(); // 出栈：嵌套有序列表恢复外层计数
                 }
                 TagEnd::Image => {
                     if skip_depth > 0 {
@@ -1314,8 +1410,25 @@ fn settings_file_path(app: tauri::AppHandle) -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 启动参数中的 .md/.markdown 路径（文件关联 / 拖到图标打开，冷启动场景）。
+    // 消费链路：Rust 端暂存缓存 → 前端启动后 take_open_files 主动拉（唯一消费入口）。
+    // 热启动（已有实例在运行）由 single-instance 插件直接 emit "open-files" 事件——
+    // 主实例运行中 listen 必已注册，事件可靠；**不再写入缓存**，避免残留到下次启动
+    // 导致意外打开旧文件（q14 边界 bug）。
+    let open_args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(is_md_arg)
+        .collect();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(move |app, argv, _cwd| {
+            // 第二个实例启动：把其中的 md 路径转发给主实例
+            let paths: Vec<String> = argv.into_iter().skip(1).filter(is_md_arg).collect();
+            if !paths.is_empty() {
+                let _ = app.emit("open-files", paths);
+            }
+        }))
+        .manage(OpenFiles(Mutex::new(open_args)))
         .invoke_handler(tauri::generate_handler![
             read_file,
             write_file,
@@ -1340,12 +1453,33 @@ pub fn run() {
             search_in_folder,
             replace_in_folder,
             cleanup_orphans,
+            cleanup_orphans_with,
+            list_orphan_assets,
             export_html,
             export_pdf,
             load_settings,
             save_settings,
             settings_file_path,
+            take_open_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LiteMD");
 }
+
+/// 判断命令行参数是否为待打开的 Markdown 文档路径
+fn is_md_arg(a: &String) -> bool {
+    let l = a.to_lowercase();
+    l.ends_with(".md") || l.ends_with(".markdown")
+}
+
+/// 取缓存中的所有待打开文档路径（取后清空）。前端在 listen("open-files") 注册完成后
+/// 主动调用一次。**唯一消费入口**：历史上曾同时存在只读版 `take_open_args`，导致
+/// 任何前端回归（如两边都调）会让两次 std::mem::take 产生竞态，先到者取走路径、
+/// 后者拿到空数组导致文件打不开（q14）。已删除只读版本。
+#[tauri::command]
+fn take_open_files(state: tauri::State<'_, OpenFiles>) -> Vec<String> {
+    std::mem::take(&mut *state.0.lock().unwrap())
+}
+
+/// 启动参数暂存（仅冷启动路径使用；热启动路径走 emit 事件，不经过这里）
+struct OpenFiles(Mutex<Vec<String>>);

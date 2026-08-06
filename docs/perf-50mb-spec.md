@@ -926,3 +926,123 @@ performance.mark("open:start"); /* ... */ performance.measure("open:tti", "open:
 - **历史遗留 tsc 报错修复**：`src/commands/search-commands.ts` 的 `searchInCurrentFolder` 声明返回 `FolderMatch[]` 但实际返回 `FolderSearchResult`（TS2740）；改为声明 `Promise<FolderSearchResult>`（含 matches+truncated，语义更完整）。该封装无调用方（FolderSearch.svelte 直接调 fs.ts），零运行时风险。**至此 `tsc --noEmit` 退出码 0，仓库类型检查全绿**。
 - **基准复核**（`scripts/perf-bench.mjs`，无回归）：5MB 打字增量管线中位 9.85ms；20MB 冷缓存打开切块+哈希 ≈892ms（应用层 20MB 走降级，此为手动刷新一次性成本上界，符合设计预算）。
 
+### 10.14 大文档自动单栏 + 快捷键迁移（2026-08-04）
+- **>8MB 双栏默认单栏**（§10.6 低端矩阵行）：`scheduleOpenPreview` 打开/切换 >8MB 文档且预览面板开启时自动收起（该档预览已降级、手动刷新禁用，面板仅占宽度），状态栏提示；用户手动重开（Ctrl+\ / 工具栏眼睛按钮）后本次会话不再自动折叠（`paneUserOverride`），尊重用户选择。
+- **「docMemo 写盘后释放」矩阵行不实施**：勘察确认收益为零——`pullDoc` 后 `source`/`lastSaved`/`docMemo.text` 共享同一字符串引用（JS 不可变字符串），且每次击键 `onEditorDocChange` 已置空 `docMemo`，保存后无重复副本可释放。
+- **快捷键迁移**（用户实现，编译验证）：`settings.ts` 加载时若已保存的 `format.quote` 仍为旧默认 `Alt+R`，自动跟随新默认 `Alt+>`；用户自定义键位不受影响。
+
+### 10.15 用户反馈 9 问题修复（2026-08-04）
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| **① 40KB 文档拖入卡在加载遮罩** | `openTabByPath` 对小文档也无条件置 `loadingBigDoc=true`（注释说大文档但无大小判断）；`applyTabState` 中遮罩清理不在 try/catch 内，`setDocStreaming` 异常时遮罩永不关闭 | 小文档（≤8MB）读取不再显示遮罩（遮罩仅用于流式载入，由 startDocStream/applyTabState 统一管理）；`applyTabState` 载入包 try/catch，异常时关闭遮罩 + 状态栏提示 |
+| **② 预览编辑列表/标题回车不换行** | Enter 处理对普通块完全依赖浏览器原生；markdown-it 多行项渲染为 `<li><p>…</p></li>`，Chrome 回车只拆 p 不产生新列表项；h1~h6 末尾原生行为偶发失效 | `preview-edit-keys.ts`：光标在 li 末尾且 li 含首层 p 时手动插新空 li；标题内回车强制 `insertParagraph`（失败回退手动插 p）；新增 `caretAtEndOf` 辅助 |
+| **③ Alt+\ 无法添加列** | `addTableColumn` 已在 editor.ts 实现且工具栏可用，但 **EDITOR_COMMANDS 未注册** `table.addColumn` → `buildKeymap` 不生成快捷键；预览编辑模式也没有 | editor.ts 注册 `"table.addColumn": addTableColumn`；preview-edit-keys.ts 新增 DOM 列复制（光标列右侧为每行补 td/th，表头 th 其余 td，光标落新单元格） |
+| **④ 预览编辑插图退出模式且插到最上一行 / 拖拽图不显示** | `onImage/onImageFile` 回调一律 `exitPreviewEdit()` + 编辑器光标丢失插到顶部；预览编辑容器无 drop 处理（浏览器默认插入 fakepath 文本） | 预览编辑内直接插入（不退出模式）：`onPickImage`（选文件+收编）/`onImportImageFile`（粘贴/拖拽文件）返回 `{url: convertFileSrc(abs), ref: markdown引用}`，`insertImageAtCaret` 在当前光标插 `<img>`（src=asset URL 可显示，`data-md-src` 保留引用）；turndown image rule 优先还原 `data-md-src` 保持相对路径；新增 dragover/drop 监听 |
+| **⑤ 侧边栏“文件”文字** | 文件树面板标题冗余 | 删除 `<span>文件</span>` |
+| **⑥⑦ 无桌面快捷方式 / 右键打开 / 双击 md 打不开** | tauri.conf.json 无 `fileAssociations`（未注册 .md/.markdown 文件关联，右键“打开方式”与双击均无）；custom.nsh 无桌面快捷方式；无启动参数处理与单实例 | bundle 加 `fileAssociations`（md/markdown）；custom.nsh `NSIS_HOOK_POSTINSTALL` 建桌面快捷方式、`POSTUNINSTALL` 删除；Cargo 加 `tauri-plugin-single-instance`（热启动二次实例 argv 转 `open-files` 事件）；Rust `run()` 收集启动参数 md 路径，新增 `take_open_args` 命令（冷启动前端拉取）；前端 `listen("open-files")` + 启动时 `take_open_args` 打开 |
+| **⑧ 编辑区两个标签页管理** | tabbar（顶部多标签）与 panel-head（当前文件名+关闭按钮）重复承担标签管理 | 移除 panel-head 的文件名/关闭按钮，tabbar 为唯一标签管理点 |
+| **⑨ 没有自动换行** | 编辑器未启用 `EditorView.lineWrapping` | editor.ts 新增 `wrapCompartment`（默认开）+ `setWrap` 导出；settings 新增 `wrap`（默认 true，sanitize 兼容旧值）；SettingsModal 编辑器页加“自动换行”开关；`onSettingsChange` 响应 |
+
+**验证**：`tsc --noEmit` 0；`cargo check` 通过（仅历史遗留 2 warning，新增 single-instance 插件编译通过）；`vite build` 6.15s；fenwick 5940 / splitter 等价+增量全过。
+
+**打包**（2026-08-05）：NSIS + MSI 双包成功。`bundle\nsis\LiteMD_0.1.0_x64-setup.exe`（2.9MB）+ `bundle\msi\LiteMD_0.1.0_x64_en-US.msi`（3.9MB）。
+
+**MSI 失败修复**：Wix light.exe 报 LGHT0311——fileAssociations 的 `description`/`name` 含中文（"Markdown 文档"），而 MSI 数据库代码页 1252（en-US）不支持中文，NSIS（Unicode）不受影响。将两者改为英文（"Markdown Document"）后 light.exe 链接成功。**经验：tauri `fileAssociations` 的 name/description 在 Windows MSI 打包时必须是目标代码页可容纳的 ASCII 字符（NSIS 无此限制）。**
+
+### 10.16 用户反馈 q10 二次修复（2026-08-05）
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| **① 标签栏与编辑区之间留空** | tabbar 下方另有一行 36px 高的 panel-head 横条（左侧大片空白，仅右侧 3 个小按钮），是历史遗留的第二标签栏 | 删除整个 panel-head；3 个按钮（展开目录 › / 预览编辑 ✎ / 预览开关 👁）合并进 tabbar 右侧 `.tab-act` 固定按钮区（不参与横向滚动）；`.tabbar` 改 flex 布局，`.tab-scroll` 承载标签滚动区（`flex:1; overflow-x:auto`） |
+| **② 预览编辑添加列表/标题回车不换行（二次修复）** | q10 前 q9 修复只覆盖 loose 列表（`<li><p>…</p></li>`）；markdown-it 默认 tight 列表（`<li>text</li>` 无 p）走浏览器原生行为不稳定；且预览编辑模式下工具栏按钮操作的是隐藏 CodeMirror 而非预览 DOM，点击后列表/标题实际未生效 | `preview-edit-keys.ts`：li 末尾回车（caretAtEndOf）无条件手动插新 li（loose 用空 p、tight 用 `<br>`），不依赖浏览器原生；`App.svelte` 新增 `previewExec` 转发函数——预览编辑模式下选区校验后 `document.execCommand` 作用于预览 DOM 并触发回写（bold/italic/underline/strike/h1/ul/ol/task/quote/link/pickColor/codeBlock/insertImg 全部转发） |
+
+**验证**：`tsc --noEmit` 0；`vite build` 6.14s 成功；`cargo build release` 通过（仅历史遗留 2 warning）。
+**打包**（2026-08-05）：NSIS + MSI 双包成功（NSIS 2.94MB / MSI 3.98MB），MSI 未再报 LGHT0311。
+
+### 10.17 用户反馈 q11 二问题（2026-08-05）
+
+**① 目录链接显示乱码（非软件 bug，定性不修）**：桌面 `PVE 接入 Ceph…md` 目录链接 `[第一篇：环境准备](#%E7%AC%AC%E4%B8%80%E7%AF%87%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)` 的 href 为 GitHub 导出锚点格式（小写+去标点+中文 encodeURIComponent，无 `%EF%BC%9A` 全角冒号编码）——链接文本是中文，仅 href 是 URL 编码，属文件自身内容，非软件解码/渲染问题。markdown-it 渲染验证 `<a href="#%E7%AC%AC…">第一篇：环境准备</a>`：文本中文、href 原样不二次编码；预览显示正常。编辑器源码视图显示的即文件原文。另文件 LastWriteTime 晚于 q10 打包时间，为打包后写回。不修。
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| **② 点击工具栏无序/有序列表后光标无法自动跳到下一行** | `toggleLinePrefix`（editor.ts）`changeByRange` 返回 `range` 未映射：加前缀后光标停在 `1. ` **前**（行首），输入文字跑到列表标记前（实测变 `i1. it`），行首回车只在行首插空行 | 光标随前缀偏移：加前缀 `delta=+prefix.length`、移除 `delta=-prefix.length`，`range` 用 `EditorSelection.range(max(startLine.from, range.from+delta), max(startLine.from, range.to+delta))` 映射（对照 `setHeading` 的 selection 显式映射写法）；移除前缀时 clamp 不低于行首 |
+
+**验证**（dev server + 页面内动态 import 真实模块构造临时 CM 实例，因 browser-use 键盘通道失效改用纯状态驱动）：
+- `toggleLinePrefix(view, "1. ")` → 文档 `1. hello world`，光标 head=3（`1. ` 后）✓
+- 模拟输入 `it` → `1. ithello world`（文字在标记后）✓
+- `insertNewlineContinueMarkup`（Enter 续行命令）→ `1. it\n2. hello world`，光标在新行 `2. ` 后 ✓
+- `toggleLinePrefix(view, "- ")` → `- abc`，光标 head=2 ✓
+
+**打包**（2026-08-05）：`tsc --noEmit` 0；`vite build` 6.02s 成功；NSIS + MSI 双包重新生成。
+
+### 10.18 用户反馈 q12 二问题（2026-08-05）
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| **① 预览编辑工具栏列表 / 标题按钮后光标不自动跳到下一行** | q10 二次修复覆盖了 `onKeydown` 路径（Enter 命中「li 末尾 / heading」时手动插新 li / p），但**工具栏按钮的 `previewExec` 路径**只调 `document.execCommand`，Chrome 把当前块转成 `<li>` / `<h1~6>` 后光标不一定落在新块「末尾」——若落在块中间，紧接的 Enter 绕过续行分支；用户描述的「光标无法自动跳到下一行」即此场景 | `App.svelte previewExec`：对 `insertUnorderedList` / `insertOrderedList` / `formatBlock(h1~6/blockquote/pre)` 执行成功后，显式把光标放到当前块末尾（`placeCaretAtEnd`，落在最后一个 `<br>` 之前）；紧接的 Enter 必命中 q10 已覆盖的「块末尾」分支自动续行 |
+| **② 编辑框里目录链接显示为 `%E7%AC%AC...` URL 编码乱码** | q11 曾定性为「文件原文（GitHub 风格锚点）」不修，但用户反馈「其他编辑器显示正常」，应做归一化：turndown 默认 `inlineLink` 把 `href` 原样输出，未做 `decodeURIComponent` → `[第一篇：环境准备](#%E7%AC%AC%E4%B8%80%E7%AF%87%EF%BC%9A%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)` 这种 URL 编码形态被写回 | `App.svelte initTurndown` 覆盖 `inlineLink`：仅对以 `#` 开头且不含 `?` 的 fragment 锚点做 `decodeURIComponent`，要求解码后无 `%` 残留（避免误改字面 `%`），输出形态对齐其他编辑器 `[文字](#中文锚点)`。外链 / 路径锚点 / 字面 `%` 全部保留原值 |
+
+**验证**：
+- `tsc --noEmit` 0；`vite build` 5.81s 成功。
+- 单元验证 turndown anchor 规则（Node 端裸跑）：
+  - `[第一篇：环境准备](#%E7%AC%AC%E4%B8%80%E7%AF%87%EF%BC%9A%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87)` → `[第一篇：环境准备](#第一篇：环境准备)` ✓
+  - `[link](https://example.com/path%20with%20space)` → 原样保留 ✓
+  - `[link](/docs/page%20id)` → 原样保留 ✓
+  - `[link](#100%done)`（字面 %） → 原样保留 ✓
+- previewExec 后置规整在浏览器内执行；逻辑分析：紧贴 `<br>` 之前的光标满足 `caretAtEndOf`（空块直接返回 true、有文本时落在最后一个文本节点末尾），后续 Enter 命中 q10 二次修复的「块末尾」分支（li 新 li / heading 新 p / bq exitQuote / pre exitBlockAfter）。
+
+**打包**（2026-08-05）：`tsc --noEmit` 0；`vite build` 5.81s 成功。
+
+### 10.19 用户反馈 q13 P0 数据安全修复（2026-08-05）
+
+**症状**：打开本地 Markdown 文件时，编辑器残留的欢迎页 / 旧标签内容被作为 `pullDoc()` 文本写回刚打开的目标文件 → 用户的本地 .md 被覆盖为欢迎页，属于不可逆数据丢失。
+
+**根因**：`openTabByPath → activateTab → applyTabState` 在异步载入期间（line 404 `suppressSave = true`、line 412 `await setDocStreaming`、line 428 `suppressSave = false`、line 429-430 `source/lastSaved` 才同步），currentPath 已被设为新文件路径但编辑器 / source / lastSaved 仍是旧内容。
+- `queueAutoSave` 已有完整防线（`suppressSave` / `lastSaved === null` / `text === lastSaved`），但**手动 `save()` / `saveAs()` / `onCloseAllSave` 仅检查 `loadFailed`，未拦截 `suppressSave`**——若用户在异步载入窗口按 Ctrl+S / 点保存菜单 / 触发「全部保存并关闭」，写入的 text = `pullDoc()` 仍是欢迎页/旧标签内容，原文件被覆盖。
+- 手动 `save()` 还缺 `lastSaved === null` 兜底（与 autoSave 对齐）。
+
+**修复**（`src/App.svelte`）：
+- `save()`：开头增加 `if (suppressSave) { status = "正在切换文档，已暂存本次编辑"; return; }`；`lastSaved === null` 拦截；`text === lastSaved` 短路（no-op 即跳过写盘，避免无谓 IO）。
+- `saveAs()`：开头增加 `suppressSave` 拦截（理由同上）。
+- `onCloseAllSave`：开头增加 `suppressSave` 拦截；循环内对 `!tab.savedContent` 的标签跳过（无保存基准 = 不可信）并提示。
+
+**验证**：
+- `tsc --noEmit` 0；`vite build` 5.63s 成功。
+- 静态分析三条写盘入口：
+  - `save()`：suppressSave 拦截 → 异步载入窗口按 Ctrl+S 被阻止 ✓
+  - `saveAs()`：同上 ✓
+  - `onCloseAllSave`：suppressSave + savedContent 双检，缺基准的标签跳过 ✓
+- 与已有 `queueAutoSave` 三检（`suppressSave` / `lastSaved === null` / `text === lastSaved`）对齐，三条手动入口防线一致。
+
+**打包**（2026-08-05 22:28）：`tsc --noEmit` 0；`vite build` 5.73s 成功；`cargo build --release` 4m21s（仅历史遗留 2 个 warning：lib.rs:1129 `unused_mut`、lib.rs:1102 `dead_code` TableHead 变体）；`tauri build --ci` 双包成功：
+
+| 包类型 | 路径 | 大小 |
+|---|---|---|
+| NSIS | `src-tauri/target/release/bundle/nsis/LiteMD_0.1.0_x64-setup.exe` | 2,942,162 字节（2.81 MB） |
+| MSI | `src-tauri/target/release/bundle/msi/LiteMD_0.1.0_x64_en-US.msi` | 3,985,408 字节（3.80 MB） |
+
+MSI 与 q11 记录 3,985,408 字节完全一致（无 cargo 改动预期）；NSIS 与 q11 差 988 字节属打包时间戳/压缩元数据正常波动。
+
+## q13 发布说明（建议放在版本公告 / 用户通知）
+
+> **LiteMD 0.1.0 q13 修复版**（NSIS 2.81MB / MSI 3.80MB）
+> - **P0 数据安全**：修复「打开本地 Markdown 文件时编辑器残留的欢迎页/旧标签内容被自动保存覆盖原文件」的不可逆数据丢失漏洞（详见 10.19）。所有写盘入口（手动保存、另存为、批量保存并退出、自动保存）已统一加固：载入窗口期 `suppressSave` 拦截、缺保存基准 `lastSaved === null` 拦截、no-op `text === lastSaved` 短路。
+> - **预览编辑**：工具栏点击「无序号/有序列表/多级标题/引用/代码块」后光标自动落到块末尾，紧接按 Enter 必触发续行（详见 10.18）。
+> - **目录链接**：turndown 覆盖默认 inlineLink 规则，对纯 fragment 锚点（`#%E7%AC%AC...`）做 decodeURIComponent 归一化，对齐其他 markdown 编辑器显示（详见 10.18）。
+> - **重要提示**：如发现早先版本（q12 及更早）打开过的本地 .md 文件内容异常，请从备份恢复——本次修复仅关闭漏洞，不恢复已丢失数据。
+
+### 10.20 用户反馈 q14 三问题（2026-08-05）
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| **① 首次双击本地 .md 启动 LiteMD 不显示文件（第二次双击才正常）** | **真实根因（q14 再次修复）**：前端同时 `invoke("take_open_args")` 与 `listen(...).then(invoke("take_open_files"))`，Rust 端两个命令**都 `std::mem::take` 同一缓存**——先到者取走路径、后者拿空 → 文件打不开；且 `.setup()` 里 emit 在 WebView 加载前（无 listener）必丢；single-instance 转发的路径若写入缓存会被**残留到下次启动**导致意外打开旧文件 | **Rust**（`src-tauri/src/lib.rs`）：`take_open_args` 改为**只读 clone**（兼容旧前端，不消费）；`take_open_files` 为**唯一消费入口**（取后清空）；**删除 setup emit 与 on_page_load emit**（避免双路径/双打开）；single-instance **只 emit 不写缓存**（主实例运行中 listen 必已注册，事件可靠，无残留）。**前端**（`App.svelte`）：**删除 `invoke("take_open_args")` 兜底**，统一 listen 注册完成后调 `take_open_files`（唯一消费） |
+| **② 打开文件后预览面板不显示内容**（多次复现） | **真实根因（q14 再次修复）**：`applyTabState` 依赖 `scheduleOpenPreview` 的 `requestIdleCallback` push 或 `setDoc` 副作用的 `pushPreview` 更新 previewSource——两条都不可靠：idle 回调可能被推迟/被 `token` 失效/被降级判定短路，pushPreview 依赖 updateListener 副作用时序 → previewSource 停留在空串，VirtualPreview 永远空白；另 VirtualPreview 首次挂载时 `clientHeight` 可能为 0 → `updateVisibleWindow` 算出空窗口且无后续重算 | **App.svelte `applyTabState`**：完成后**显式同步设 `previewSource = tab.content`**（`tab.content.length <= previewMaxBytes` 时），VirtualPreview 响应式 rebuild 立即可见，不再依赖任何 timer/callback。**VirtualPreview.svelte `onMount`**：`updateVisibleWindow()` 后追加 `requestAnimationFrame` + `setTimeout(300ms)` 重试，覆盖「布局晚于挂载完成」clientHeight=0 的场景 |
+| **③ 预览编辑快捷键设置标题/无序/有序列表后无法跳到下一行** | **真实根因（q14 再次修复）**：q12/q14 之前只把光标放到块末尾，**用户仍需按 Enter 才续行**；需求是「设置后**自动**跳到新的一行」（对齐源码编辑器 `setOrderedList`：加标记后自动插入新行、光标直接进入下一项） | **preview-edit-keys.ts**：新增 `appendContinuationLine`（标题→后插空 `<p><br></p>`；列表项→后插空 `<li><br></li>`，光标落入）；`toggleBlock` 从普通块转标题时自动续行；新增 `insertListAndContinue`（`insertUnorderedList`/`insertOrderedList` 从非列表块新建列表项时自动续行，已在列表内 toggle 不续行）；Alt+Shift+1~9 有序列表同样处理；删除旧的 placeCaretAtEndOfBlock 逻辑。**App.svelte `previewExec`**（工具栏）：列表/标题命令同样自动续行，保持一致 |
+
+**验证**：
+- `tsc --noEmit` 0；`vite build` 6.05s 成功；`cargo check` 通过（仅历史遗留 2 warning）。
+- turndown 回写语义（Node 端裸跑）：
+  - `<h1>我的标题</h1><p>正文内容</p>` → `# 我的标题\n\n正文内容` ✓（标题后空行分隔正文）
+  - `<ul><li>第一项</li><li>第二项</li></ul>` → `- 第一项\n- 第二项` ✓（续行 li 正常回写）
+  - `<h1>我的标题</h1><p><br></p>`（设置后直接退出）→ `# 我的标题` ✓（空段丢弃，无数据丢失）
+- 竞态排查：前端仅剩 `take_open_files` 一个消费入口；Rust 端 `take_open_args` 只读、single-instance 只 emit 不写缓存，无重复打开、无残留。
+

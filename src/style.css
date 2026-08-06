@@ -822,23 +822,66 @@ button.on {
   flex: 1;
 }
 
-/* ===== 多标签栏 ===== */
+/* ===== 多标签栏（右侧承载展开目录/预览编辑/预览开关，不再单独占用一行） ===== */
 .tabbar {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   height: 34px;
   padding: 4px 8px 0;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* 标签滚动区：标签多时横向滚动，右侧操作按钮固定不参与滚动 */
+.tab-scroll {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  flex-shrink: 0;
   scrollbar-width: thin;
 }
 
-.tabbar::-webkit-scrollbar {
+.tab-scroll::-webkit-scrollbar {
   height: 4px;
+}
+
+/* 标签栏右侧操作按钮（展开目录 / 预览编辑 / 预览开关） */
+.tab-act {
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex-shrink: 0;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s, color 0.15s;
+}
+
+.tab-act:hover {
+  color: var(--text);
+  background: var(--pill);
+}
+
+.tab-act.on {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.tab-act .ico {
+  display: block;
 }
 
 .tab {
@@ -1015,6 +1058,12 @@ button.on {
   min-height: 0;
   overflow: auto;
   padding: 24px 28px;
+  /* 底部留白 24px（≈1 行）：光标在最后一行时滚动后落在 padding 区域，
+     视觉上「倒数第二行留白最后一行」。scrollCaretIntoView 的 margin=lineHeight
+     与此一致；scroll-padding-bottom 让浏览器原生 caret 滚动也留白，
+     避免「先到最后一行再跳」。*/
+  padding-bottom: 24px;
+  scroll-padding-bottom: 24px;
   font-size: 14px;
   line-height: 1.7;
   outline: none;
@@ -1212,6 +1261,23 @@ button.on {
 /* 预览编辑模式下 CodeMirror 隐藏、状态栏路径显示当前标签 */
 .editor-host:empty {
   display: none;
+}
+
+/* 编辑模式：去掉标题下划线。
+ * 截图显示 `# 3124234` 这一整行文字都带下划线——
+ * 根因是 CodeMirror markdown 包把 HeaderMark 标为 processingInstruction,
+ * 用户主题(深/浅切换)通过 cssText 给 heading 行应用 text-decoration。
+ * 这里对所有 cm-* 元素统一强制 text-decoration: none,
+ * 让标题只保留粗体/字号语义,不再有下划线视觉残留。*/
+.editor-host .cm-line,
+.editor-host .cm-content,
+.editor-host .cm-content *,
+.editor-host .cm-content span,
+.editor-host .cm-content [class*="tok-"],
+.editor-host .cm-content [class*="cm-"] {
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: 0 !important;
 }
 
 /* 大文档载入遮罩：打开 >8MB 文件期间覆盖编辑器区，FCP 与文档大小解耦 */

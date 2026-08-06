@@ -143,7 +143,24 @@ export const replaceInFolder = (
   caseSensitive: boolean
 ) => invoke<FolderReplaceResult>("replace_in_folder", { folder, query, replacement, caseSensitive });
 
-/** 清理附件目录中未被任何 .md 引用的文件（递归子目录），返回被删文件相对路径列表 */
+/**
+ * 仅扫描并返回孤儿附件相对路径（不删除），供 UI 预览。
+ * 与 cleanupOrphansWith 共用同一份判定逻辑，结果一致。
+ */
+export const listOrphanAssets = (noteDir: string, assetsName: string) =>
+  invoke<string[]>("list_orphan_assets", { noteDir, assetsName });
+
+/**
+ * 按给定相对路径列表删除孤儿附件（来自 listOrphanAssets 预览）。
+ * 两步流程：UI 先预览、后确认、再删除，避免误删正在引用的文件。
+ */
+export const cleanupOrphansWith = (
+  noteDir: string,
+  assetsName: string,
+  relPaths: string[]
+) => invoke<string[]>("cleanup_orphans_with", { noteDir, assetsName, relPaths });
+
+/** 旧接口保留兼容：内部走 list + cleanup 两步 */
 export const cleanupOrphans = (noteDir: string, assetsName: string) =>
   invoke<string[]>("cleanup_orphans", { noteDir, assetsName });
 

@@ -292,6 +292,13 @@
             </div>
             <div class="row">
               <span class="row-label">
+                自动换行
+                <small>长行自动软折行，不改变文档内容</small>
+              </span>
+              <input type="checkbox" bind:checked={settings.wrap} on:change={changed} />
+            </div>
+            <div class="row">
+              <span class="row-label">
                 启动时展开目录
                 <small>下次启动沿用当前布局</small>
               </span>
