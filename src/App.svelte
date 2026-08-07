@@ -269,6 +269,22 @@ console.log("Hello LiteMD");
   // 路径统一正斜杠（Rust 返回 \\，对话框/拖拽可能混用，避免同一文件因分隔符不同重复开标签）
   const norm = (p: string) => p.replace(/\\/g, "/");
 
+  // 打开路径防御归一化：去首尾引号、去 file:// 前缀、统一正斜杠。
+  // 文件关联启动 / 拖拽 / 命令行传入的路径可能带引号或 file:// 前缀，
+  // 直接传入 fs 会找不到文件 → 双击 md 打开失败、停在首页。
+  function normalizeOpenPath(p: string): string {
+    let s = p.trim();
+    if (s.length >= 2) {
+      const first = s[0];
+      const last = s[s.length - 1];
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+        s = s.slice(1, -1);
+      }
+    }
+    s = s.replace(/^file:\/\/\/?/i, "").replace(/^file:\//i, "");
+    return s.replace(/\\/g, "/");
+  }
+
   // 会话持久化：settings.openTabs 存路径顺序；localStorage 存内容/光标（未保存状态也恢复）
   const SESSION_KEY = "litemd-session-tabs";
   // 大文档体积闸门：超过 1MB 的内容不写入 localStorage（原本也会被配额静默拒绝，
@@ -1535,7 +1551,9 @@ console.log("Hello LiteMD");
   }
 
   async function openFileByPath(p: string) {
-    return openTabByPath(p);
+    // 防御：文件关联/拖拽/命令行可能带来引号或 file:// 前缀（Windows 注册表 "%1"、某些环境 URI 形式）
+    const np = normalizeOpenPath(p);
+    return openTabByPath(np);
   }
 
   async function openFolder() {
@@ -1681,20 +1699,34 @@ console.log("Hello LiteMD");
     td = t;
     return t;
   }
+  // 进入预览编辑的「进行中」守卫：enterPreviewEdit 是 async，previewEditMode 同步置位后
+  // 存在 await 间隙；若此期间再次触发切换，三元表达式会误判为「已开启」从而调用 exit 中止进入，
+  // 表现为「切换不灵 / 闪一下」。用该标志位阻断重入。
+  let enteringPreview = false;
+
   async function enterPreviewEdit() {
-    if (previewEditMode || !view) return;
-    const text = pullDoc();
-    source = text;
-    previewEditBefore = { preview: showPreview };
-    previewEditMode = true;
-    showPreview = false;
-    await tick();
-    const m = md ?? (await initMd());
-    if (previewEditEl) previewEditEl.innerHTML = m.render(text);
-    // contenteditable 新段落统一用 <p>（turndown 往返稳定）
-    document.execCommand("defaultParagraphSeparator", false, "p");
-    // 挂载键盘增强：快捷键/智能 Enter/缩进/图片粘贴（与源码编辑器对齐）
-    if (previewEditEl) {
+    if (previewEditMode || enteringPreview || !view) return;
+    enteringPreview = true;
+    try {
+      const text = pullDoc();
+      source = text;
+      previewEditBefore = { preview: showPreview };
+      previewEditMode = true;
+      showPreview = false;
+      await tick();
+      // 确保 contenteditable 已挂载（{if previewEditMode} 渲染后再 bind:this）
+      if (!previewEditEl) await tick();
+      if (!previewEditEl) {
+        // 容器仍未就绪：回滚，避免停留在「空白预览编辑」半成品态
+        previewEditMode = false;
+        showPreview = previewEditBefore.preview;
+        return;
+      }
+      const m = md ?? (await initMd());
+      previewEditEl.innerHTML = m.render(text);
+      // contenteditable 新段落统一用 <p>（turndown 往返稳定）
+      document.execCommand("defaultParagraphSeparator", false, "p");
+      // 挂载键盘增强：快捷键/智能 Enter/缩进/图片粘贴（与源码编辑器对齐）
       detachPreviewKeys?.();
       detachPreviewKeys = attachPreviewEditKeys(previewEditEl, {
         shortcuts: settings.shortcuts,
@@ -1723,8 +1755,21 @@ console.log("Hello LiteMD");
         setStatus: (msg) => { status = msg; },
       });
       previewEditEl.focus();
+      status = "预览编辑模式：直接编辑渲染结果，自动同步 markdown（再次点击退出）";
+    } catch (err) {
+      // 渲染/挂载失败：回滚到 markdown 编辑，避免空白或卡死
+      console.error("[preview-edit] 进入失败:", err);
+      previewEditMode = false;
+      showPreview = previewEditBefore.preview;
+      status = "进入预览编辑失败，已恢复原编辑";
+    } finally {
+      enteringPreview = false;
     }
-    status = "预览编辑模式：直接编辑渲染结果，自动同步 markdown（再次点击退出）";
+  }
+  function togglePreviewEdit() {
+    if (enteringPreview) return;
+    if (previewEditMode) exitPreviewEdit();
+    else void enterPreviewEdit();
   }
   function exitPreviewEdit() {
     if (!previewEditMode) return;
@@ -2645,6 +2690,15 @@ ${m.render(pullDoc())}
   // ---------- 应用级快捷键（文件 / 视图，键位来自设置）----------
   function onKeydown(e: KeyboardEvent) {
     if (showSettings) return; // 设置面板自己接管键盘
+    // 预览编辑模式下：全局快捷键基本交还给预览编辑自身的 keydown 处理，
+    // 这里只放行 Ctrl+S（保存，内部会先回写预览编辑内容），其余一律不拦截，
+    // 避免全局视图命令（Ctrl+\ 切换预览、Ctrl+= 字号等）与预览编辑模式冲突/误触发，
+    // 否则会出现「切换不灵 / 全选后像跳出预览编辑」的错觉。
+    if (previewEditMode) {
+      const isSave = matchAccel(e, settings.shortcuts["file.save"] ?? DEFAULT_SHORTCUTS["file.save"]);
+      if (isSave) { e.preventDefault(); save(); }
+      return;
+    }
     // Esc 退出格式刷（固定模式）
     if (e.key === "Escape" && painter) {
       painter = null;
@@ -2988,9 +3042,9 @@ ${m.render(pullDoc())}
           <button
             class="tab-act"
             class:on={previewEditMode}
-            on:click={() => (previewEditMode ? exitPreviewEdit() : enterPreviewEdit())}
+            on:click={togglePreviewEdit}
             title="预览编辑模式：隐藏 markdown 编辑器，直接在渲染预览中编辑">✎</button>
-          <button class="tab-act" class:on={showPreview} on:click={togglePreviewPane} title="开关预览">
+          <button class="tab-act" class:on={showPreview} on:click={togglePreviewPane} title="开关预览" disabled={previewEditMode}>
             {#if showPreview}
               <!-- 眼睛（预览开启） -->
               <svg class="ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

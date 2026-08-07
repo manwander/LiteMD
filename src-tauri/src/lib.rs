@@ -1423,8 +1423,22 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(move |app, argv, _cwd| {
             // 第二个实例启动：把其中的 md 路径转发给主实例
-            let paths: Vec<String> = argv.into_iter().skip(1).filter(is_md_arg).collect();
+            let paths: Vec<String> = argv
+                .into_iter()
+                .skip(1)
+                .map(|a| normalize_md_path(&a))
+                .filter(|p| {
+                    let l = p.to_lowercase();
+                    l.ends_with(".md") || l.ends_with(".markdown")
+                })
+                .collect();
             if !paths.is_empty() {
+                // 把已运行的主窗口提到前台（双击文件时用户期望看到它）
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
                 let _ = app.emit("open-files", paths);
             }
         }))
@@ -1466,9 +1480,33 @@ pub fn run() {
         .expect("error while running LiteMD");
 }
 
-/// 判断命令行参数是否为待打开的 Markdown 文档路径
+/// 归一化文件关联 / 命令行传入的路径：去首尾引号、去 file:// 前缀、trim。
+/// Windows 文件关联注册表命令（"$EXE" "%1"）会把含空格路径用引号包裹，
+/// 而某些环境下路径可能以 file:// 形式传入——这些都可能导致 ends_with(".md") 误判，
+/// 进而「双击 md 打开后停在首页」。统一归一化后再判定扩展名。
+fn normalize_md_path(a: &str) -> String {
+    let mut s = a.trim().to_string();
+    // 去首尾引号（"C:\a.md" 或 'C:\a.md'）
+    if s.len() >= 2 {
+        let first = s.chars().next().unwrap();
+        let last = s.chars().last().unwrap();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            s = s[1..s.len() - 1].to_string();
+        }
+    }
+    // 去 file:// / file:/// / file:/ 前缀
+    for prefix in ["file:///", "file://", "file:/"] {
+        if let Some(stripped) = s.strip_prefix(prefix) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+    s
+}
+
+/// 判断命令行参数是否为待打开的 Markdown 文档路径（已归一化）
 fn is_md_arg(a: &String) -> bool {
-    let l = a.to_lowercase();
+    let l = normalize_md_path(a).to_lowercase();
     l.ends_with(".md") || l.ends_with(".markdown")
 }
 
@@ -1478,7 +1516,14 @@ fn is_md_arg(a: &String) -> bool {
 /// 后者拿到空数组导致文件打不开（q14）。已删除只读版本。
 #[tauri::command]
 fn take_open_files(state: tauri::State<'_, OpenFiles>) -> Vec<String> {
-    std::mem::take(&mut *state.0.lock().unwrap())
+    let v = std::mem::take(&mut *state.0.lock().unwrap());
+    v.into_iter()
+        .map(|a| normalize_md_path(&a))
+        .filter(|p| {
+            let l = p.to_lowercase();
+            l.ends_with(".md") || l.ends_with(".markdown")
+        })
+        .collect()
 }
 
 /// 启动参数暂存（仅冷启动路径使用；热启动路径走 emit 事件，不经过这里）

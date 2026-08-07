@@ -72,6 +72,9 @@ function placeCaret(node: Node, atStart = true) {
 export function scrollCaretIntoView(root: HTMLElement): void {
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount) return;
+  // 选择 / 全选（非折叠选区）时不跟随滚动：避免拖蓝选择或 Ctrl+A 后
+  // 误把整篇文档的选区矩形当作「光标」去滚动，造成「跳出预览编辑」的错觉。
+  if (!sel.isCollapsed) return;
   const r = sel.getRangeAt(0);
   // 仅在 selection 在 root 内时才执行滚动，防止 selection 跳出 contenteditable 后错误滚到 root 顶部
   if (!root.contains(r.startContainer)) return;
@@ -700,6 +703,9 @@ export function attachPreviewEditKeys(root: HTMLElement, opts: PreviewEditKeyOpt
   // 避免光标先停在最后一行、输入时再跳到倒数第二行的「跳」感。
   // rAF 等一帧让浏览器更新 selection 后再测量。
   function onCursorMove() {
+    const sel = window.getSelection();
+    // 选择 / 全选（非折叠选区）时只放置了拖蓝、光标未定，不滚动跟焦，避免误跳。
+    if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return;
     requestAnimationFrame(() => scrollCaretIntoView(root));
   }
   root.addEventListener("click", onCursorMove);
