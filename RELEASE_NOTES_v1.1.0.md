@@ -1,8 +1,8 @@
-# LiteMD v1.0.1
+# LiteMD v1.1.0
 
-> 首个正式版本 · 2026-08-07（v1.0.0 发布前补丁：修复双击打开 / 模式切换 / 全选问题）
+> 轻量安装包版本 · 2026-08-07（相对于 v1.0.1：安装包不再内置 WebView2，体积回到约 3MB）
 
-超轻量 Markdown 编辑器，专注**大文档流畅编辑**与**低资源占用**。基于 Rust + Tauri 2 + Svelte 4 + CodeMirror 6。**安装包已内置 WebView2 运行时，双击即装，全程无需联网、无需任何额外步骤。**
+超轻量 Markdown 编辑器，专注**大文档流畅编辑**与**低资源占用**。基于 Rust + Tauri 2 + Svelte 4 + CodeMirror 6，安装包仅约 3MB。
 
 ---
 
@@ -52,14 +52,16 @@
 
 ## 📦 安装
 
-**Windows x64** 用户，下载下方任一安装包，**双击运行即可，无需任何额外安装**：
+**Windows x64** 用户，下载下方任一安装包，**双击运行即可安装**：
 
 | 文件 | 说明 | 大小 |
 |------|------|------|
-| `LiteMD_1.0.1_x64-setup.exe` | NSIS 安装程序（推荐） | 约 206 MB |
-| `LiteMD_1.0.1_x64_en-US.msi` | MSI 安装包 | 约 204 MB |
+| `LiteMD_1.1.0_x64-setup.exe` | NSIS 安装程序（推荐） | 约 3 MB |
+| `LiteMD_1.1.0_x64_en-US.msi` | MSI 安装包 | 约 4 MB |
 
-系统要求：Windows 10 / 11 x64。安装包已**内置 WebView2 运行时**，无需用户单独下载或安装，离线也能完成安装。
+系统要求：Windows 10 / 11 x64，需 **WebView2 运行时**。
+- Windows 10 20H2 及以上 / Windows 11 已内置 WebView2，直接安装即可；
+- 极少数未安装的老系统，安装程序会**自动联网检测并静默安装 WebView2**，无需用户手动操作。
 
 ---
 
@@ -67,7 +69,7 @@
 
 Rust · Tauri 2.x · Svelte 4 · Vite 5 · CodeMirror 6 · markdown-it · highlight.js
 
-应用本身轻量（无 Electron 臃肿依赖、内存/CPU 占用低）；为免去用户单独安装 WebView2 的麻烦，安装包已将 WebView2 运行时一并打包，故体积稍大但**开箱即用、离线可装**。
+应用本身轻量（无 Electron 臃肿依赖、内存/CPU 占用低），安装包仅数 MB，复用系统 WebView2 运行时。
 
 ---
 
