@@ -461,6 +461,70 @@ export function setDoc(view: EditorView, text: string): void {
   view.focus();
 }
 
+/**
+ * 外部增量写入（预览编辑回写专用）。
+ *
+ * 与 setDoc 的三点关键差异：
+ * 1. **不整篇替换**：只 replace [from, to)，撤销历史保持细粒度，不会退化成
+ *    「一次巨型 undo 抹掉整段编辑」（M-02）。
+ * 2. **不 view.focus()**：预览编辑模式下 CodeMirror 是隐藏的备份编辑器，
+ *    setDoc 的 focus() 会在防抖回写（800ms）时把焦点从 contenteditable 抢走，
+ *    表现为「打字停顿一下后光标丢失 / 输入中断」。
+ * 3. **保留选区**：不显式指定 selection，交给 CodeMirror 按变更自动映射，
+ *    退出预览编辑后光标落点合理，而非一律归零。
+ *
+ * 返回是否真的产生了变更。
+ */
+export function applyExternalEdit(
+  view: EditorView,
+  from: number,
+  to: number,
+  insert: string,
+): boolean {
+  const docLen = view.state.doc.length;
+  // 越界防御：调用方基准与真实文档不一致时，宁可不写也不要写坏文档
+  if (from < 0 || to > docLen || from > to) return false;
+  if (from === to && insert.length === 0) return false;
+  view.dispatch({ changes: { from, to, insert } });
+  markFenceDirty();
+  scheduleFenceRebuild(() => view.state.doc as unknown as FenceDoc);
+  return true;
+}
+
+/**
+ * 计算两段文本的最小差异区间（公共前缀 + 公共后缀之外的部分）。
+ * 用于把「整篇重写」压缩成一次局部 replace。
+ * 返回 null 表示两段文本完全相同。
+ *
+ * 注意：以 UTF-16 code unit 比较后，会把边界回退到不切断代理对
+ * （emoji 等）的位置，避免产生半个字符的替换。
+ */
+export function diffRange(
+  oldText: string,
+  newText: string,
+): { from: number; to: number; insert: string } | null {
+  if (oldText === newText) return null;
+  const oldLen = oldText.length;
+  const newLen = newText.length;
+  let s = 0;
+  const maxS = Math.min(oldLen, newLen);
+  while (s < maxS && oldText.charCodeAt(s) === newText.charCodeAt(s)) s++;
+  // 停在代理对中间（前一个是高代理）→ 回退 1 保证边界对齐
+  if (s > 0) {
+    const prev = oldText.charCodeAt(s - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) s--;
+  }
+  let e = 0;
+  const maxE = Math.min(oldLen - s, newLen - s);
+  while (e < maxE && oldText.charCodeAt(oldLen - 1 - e) === newText.charCodeAt(newLen - 1 - e)) e++;
+  // 尾部停在代理对中间（当前是低代理）→ 回退 1
+  if (e > 0 && e < maxE) {
+    const cur = oldText.charCodeAt(oldLen - e);
+    if (cur >= 0xdc00 && cur <= 0xdfff) e--;
+  }
+  return { from: s, to: oldLen - e, insert: newText.slice(s, newLen - e) };
+}
+
 // 分片流式载入（P1-4 前端实现）：大文档按块插入并让出主线程，
 // 避免一次性 EditorState.create 对整个 50MB 做同步解析造成的硬冻结。
 // 小文档（<= threshold）直接回退 setDoc。
@@ -562,7 +626,7 @@ export function wrapSelection(view: EditorView, marker: string, onSkip?: () => v
     };
   });
   view.dispatch(changes);
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 行前缀切换：列表 / 引用 / 标题（支持多行选区，再次点击取消）
@@ -598,7 +662,7 @@ export function toggleLinePrefix(view: EditorView, prefix: string): void {
     };
   });
   view.dispatch(changes);
-  view.focus();
+    requestAnimationFrame(() => view.focus());
   // 长文档中行前缀变化后光标可能离开可视区,强制把光标滚到视口中央(y:'center')。
   // 用 'center' 而不是 'nearest'/'end' 是为了避免「容器高度 > 内容高度」时空文档把光标留在
   // padding 区域造成的「插入表格看不到」「被覆盖」误判。
@@ -619,9 +683,14 @@ export function setHeading(view: EditorView, level: number): void {
   const isSameLevel = line.text.startsWith(prefix);
   if (isSameLevel) {
     // 取消标题：仅剥离前缀，光标留在原行
+    const anchor2 = line.from + stripped.length;
     view.dispatch({
       changes: { from: line.from, to: line.to, insert: stripped },
-      selection: { anchor: line.from + stripped.length },
+      selection: { anchor: anchor2 },
+    });
+    // 长文档里取消标题后光标可能出视口,主动滚一下
+    view.dispatch({
+      effects: EditorView.scrollIntoView(anchor2, { y: "end", yMargin: 80 }),
     });
   } else {
     // 设置标题：行尾补一个换行，光标移到新行行首
@@ -634,7 +703,7 @@ export function setHeading(view: EditorView, level: number): void {
       effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
     });
   }
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 转为正文：剥离标题前缀（任何级别）
@@ -652,7 +721,7 @@ export function toParagraph(view: EditorView): void {
 // 在光标处插入文本
 export function insertText(view: EditorView, text: string): void {
   view.dispatch(view.state.replaceSelection(text));
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 插入链接：选中文本作为链接文字
@@ -667,7 +736,7 @@ export function insertLink(view: EditorView, onSkip?: () => void): void {
     changes: { from: sel.from, to: sel.to, insert },
     selection: { anchor: sel.from + text.length + 3, head: sel.from + text.length + 3 + 8 },
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 插入图片：![描述](路径)；选中文本作为描述，光标定位到路径处。
@@ -692,7 +761,7 @@ export function insertImage(view: EditorView, path: string): void {
     selection: { anchor },
     effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 插入代码块：```lang\n代码\n```；选中文本作为初始代码，光标落在内容行
@@ -713,7 +782,7 @@ export function insertCodeBlock(view: EditorView, lang = ""): void {
     selection: { anchor },
     effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 复制表格行：当前行为表格行（以 | 开头）时，复制一份到下方并定位到新行同列；
@@ -730,7 +799,7 @@ export function duplicateTableRow(view: EditorView): boolean {
     selection: { anchor },
     effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
   return true;
 }
 
@@ -760,7 +829,7 @@ export function addTableColumn(view: EditorView): boolean {
     selection: { anchor },
     effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
   return true;
 }
 
@@ -782,7 +851,7 @@ export function insertTable(view: EditorView): void {
     selection: { anchor },
     effects: EditorView.scrollIntoView(anchor, { y: "end", yMargin: 80 }),
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // ---------------- 颜色：HTML 内联样式 ----------------
@@ -798,7 +867,7 @@ export function wrapHtmlSpan(view: EditorView, css: string): void {
     };
   });
   view.dispatch(changes);
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // ---------------- 表格列对齐 ----------------
@@ -842,7 +911,7 @@ export function setTableColumnAlign(view: EditorView, align: "left" | "center" |
   const next = setSepCell(sepLine.text, col, align);
   if (next == null) return false;
   view.dispatch({ changes: { from: sepLine.from, to: sepLine.to, insert: next } });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
   return true;
 }
 
@@ -859,19 +928,46 @@ export function setOrderedList(view: EditorView, start: number): void {
       if (!/^\s*\d+\.\s/.test(state.doc.line(i).text)) { allOrdered = false; break; }
     }
     let n = start;
+    const prefixLengths: { old: number; newLen: number }[] = [];
     for (let i = startLine.number; i <= endLine.number; i++) {
       const line = state.doc.line(i);
-      const stripped = line.text.replace(/^\s*\d+\.\s+/, "");
+      const m = line.text.match(/^(\s*\d+\.\s+)?/);
+      const oldPrefixLen = m && m[0] ? m[0].length : 0;
+      const stripped = line.text.slice(oldPrefixLen);
       const next = allOrdered ? stripped : `${n}. ${stripped}`;
+      prefixLengths.push({ old: oldPrefixLen, newLen: allOrdered ? 0 : `${n}. `.length });
       if (!allOrdered) n++;
       lineChanges.push({ from: line.from, to: line.to, insert: next });
     }
-    // 取消有序列表时保持光标不动
-    if (allOrdered) return { changes: lineChanges, range };
-    // 设置有序列表后，光标自动移到下一行，便于继续输入下一项
+    const cs = state.changes(lineChanges);
+    if (allOrdered) {
+      // 关闭有序列表时文档缩短，必须用 range.map 避免选区越界。
+      return { changes: lineChanges, range: range.map(cs) };
+    }
+    // 创建/重编号有序列表时，若直接依赖 CodeMirror 的 range.map，
+    // 折叠光标位于被整行替换的区间内会被映射到插入文本起点，
+    // 导致光标跳到行首（序号前）。这里按「正文内容相对列偏移」手动重算选区。
     const last = lineChanges[lineChanges.length - 1];
     last.insert += "\n";
-    return { changes: lineChanges, range: EditorSelection.cursor(last.from + last.insert.length) };
+    const mapEndpoint = (pos: number) => {
+      const line = state.doc.lineAt(pos);
+      if (line.number < startLine.number || line.number > endLine.number) {
+        return cs.mapPos(pos, 1);
+      }
+      const idx = line.number - startLine.number;
+      const { old, newLen } = prefixLengths[idx];
+      const contentCol = Math.max(0, pos - line.from - old);
+      let newPos = line.from + newLen + contentCol;
+      // 光标原本就在最后一行末尾时，让它落过追加的换行，便于继续输入下一项
+      if (line.number === endLine.number && pos >= endLine.to) {
+        newPos += 1;
+      }
+      return newPos;
+    };
+    return {
+      changes: lineChanges,
+      range: EditorSelection.range(mapEndpoint(range.anchor), mapEndpoint(range.head), range.goalColumn, range.bidiLevel, range.assoc),
+    };
   });
   // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶
   view.dispatch({
@@ -879,12 +975,12 @@ export function setOrderedList(view: EditorView, start: number): void {
     selection: changes.selection,
     effects: EditorView.scrollIntoView(changes.selection.main.head, { y: "end", yMargin: 80 }),
   });
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // 有序列表自动重编号：对含 lineNo 的有序列表块，首项保留原号、后续递增重排。
 // 仅在编号确实不连续时才派发修改；只改行内文字、不增删行，行号保持稳定。
-function renumberBlock(view: EditorView, lineNo: number): boolean {
+export function renumberBlock(view: EditorView, lineNo: number): boolean {
   const { state } = view;
   if (lineNo < 1 || lineNo > state.doc.lines) return false;
   let start = lineNo;
@@ -974,7 +1070,7 @@ export function softBreak(view: EditorView): void {
   } else {
     view.dispatch(state.replaceSelection(/^\s*\|/.test(line.text) ? "<br>" : "\n"));
   }
-  view.focus();
+    requestAnimationFrame(() => view.focus());
 }
 
 // Enter 智能换行：表格内跳到表格块后、代码块内跳到闭合 ``` 后、引用块内跳到新的一行（跳出引用），
@@ -1009,7 +1105,7 @@ export function smartEnter(view: EditorView): boolean {
     if (closeLine > 0) {
       const pos = state.doc.line(closeLine).to;
       view.dispatch({ changes: { from: pos, insert: "\n\n" }, selection: { anchor: pos + 2 } });
-      view.focus();
+            requestAnimationFrame(() => view.focus());
       return true;
     }
   }

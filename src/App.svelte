@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import type MarkdownIt from "markdown-it";
-  import { convertFileSrc, Channel } from "@tauri-apps/api/core";
+  import { convertFileSrc, Channel, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   // 模态组件动态加载：不占用主 chunk 启动解析成本，首次打开时才拉对应 chunk
   type SvelteCmp = any;
@@ -23,9 +23,13 @@
     // 预览编辑模式键盘增强（快捷键/智能 Enter 与源码编辑器对齐）
     import { attachPreviewEditKeys, insertImageAtCaret, insertTableAtCaret, scrollCaretIntoView } from "./preview-edit-keys";
   import { initHighlight, highlightCode, setOnLangLoaded } from "./highlight";
+  // 安全边界：所有 HTML 注入（预览 / 预览编辑 / 导出）必须经此清洗，见 sanitize.ts 注释
+  import { safeRender, sanitizeHtml } from "./sanitize";
   import VirtualPreview from "./preview/VirtualPreview.svelte";
   import StatusBar from "./StatusBar.svelte";
+  import Toast from "./Toast.svelte";
   import FileTree from "./FileTree.svelte";
+  import { renameTabPathDedup } from "./tabs";
   import { resolveLowEnd, buildDegrade } from "./lowend";
   import { setDims, getDims, loadDims, saveDims } from "./image-dims";
   import type { EditRange } from "./preview/block-splitter";
@@ -35,6 +39,8 @@
     setKeymap,
     setWrap,
     setDoc,
+    applyExternalEdit,
+    diffRange,
     setDocStreaming,
     STREAM_THRESHOLD,
     wrapSelection,
@@ -68,12 +74,6 @@
     streamFileRest,
     type ReadHead,
     pickOpenFolder,
-    readMdTree,
-    createFile,
-    createDir,
-    deletePath,
-    movePath,
-    copyPath,
     writeFile,
     pickSaveFile,
     pickImageFile,
@@ -83,15 +83,29 @@
     listMdFiles,
     listOrphanAssets,
     cleanupOrphansWith,
+    readMdTree,
+    renamePath,
     exportHtml,
     exportPdf,
+    exportBundledMarkdown,
+    pickSaveBundledFile,
     pickSavePdfFile,
     settingsFilePath,
+    logFrontend,
+    pathExists,
   } from "./fs";
-  import type { FolderNode } from "./fs";
+  import { createTreeStore } from "./filetree/store";
+  import { loadFolderNode, refreshTree } from "./filetree/ops";
+  import {
+    rewriteAttachmentRefs,
+    resolveAttachmentDir,
+    attachmentDirName,
+  } from "./attachment";
+  import { logOp, logInfo, logError, logWarn } from "./logger";
   import {
     loadSettings,
     persistSettings,
+    saveSettings,
     initSettingsBridge,
     matchAccel,
     displayAccel,
@@ -244,10 +258,17 @@ console.log("Hello LiteMD");
 
   // ---- 文件状态 ----
   let currentPath: string | null = null;
-  let tree: FolderNode[] = [];
-  let collapsed = new Set<string>(); // 已折叠的文件夹路径（默认全部展开）
+  // ---- 文件树：独立模块（store + ops + locate + watcher），逻辑见 src/filetree/ ----
+  const treeStore = createTreeStore();
+  let treeRef: FileTree | null = null;
   let status = "就绪";
   let menuOpen = false;
+  // 全局致命错误兜底：未捕获异常时显示友好错误页，避免白屏（item 4）
+  let fatalError: { msg: string; stack: string } | null = null;
+  function copyFatalLog() {
+    const text = fatalError ? `${fatalError.msg}\n${fatalError.stack}` : "";
+    void navigator.clipboard?.writeText(text).catch(() => {});
+  }
 
   // ---- 多标签管理 ----
   // 每个标签持有自己的完整状态；编辑器视图始终承载「激活标签」的文档，切换时整体交换。
@@ -267,7 +288,8 @@ console.log("Hello LiteMD");
   const activeTab = () => tabs[activeIdx] ?? null;
 
   // 路径统一正斜杠（Rust 返回 \\，对话框/拖拽可能混用，避免同一文件因分隔符不同重复开标签）
-  const norm = (p: string) => p.replace(/\\/g, "/");
+  // 路径内部统一正斜杠，并去掉末尾的斜杠（避免 nodeMap 里 "D:/22" 与 "D:/22/" 变成两个 key，导致新建后刷新不到父目录）
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
 
   // 打开路径防御归一化：去首尾引号、去 file:// 前缀、统一正斜杠。
   // 文件关联启动 / 拖拽 / 命令行传入的路径可能带引号或 file:// 前缀，
@@ -306,7 +328,7 @@ console.log("Hello LiteMD");
   let lastDimsPath: string | null = null;
   $: if (currentPath && currentPath !== lastDimsPath) {
     lastDimsPath = currentPath;
-    void loadDims(dirname(currentPath), settings.assetsDir);
+    void loadDims(dirname(currentPath), currentAttachmentName());
   }
   // 大文档阈值：>8MB 打开期间显示载入遮罩，解耦 FCP 与文档大小
   const BIG_DOC_BYTES = 8 << 20;
@@ -319,6 +341,8 @@ console.log("Hello LiteMD");
   let windowBusyTimer: ReturnType<typeof setTimeout> | null = null;
   // 内存压力自愈状态（P0）：memReliefEnabled 粘性开启视口外 img 卸载
   let memReliefEnabled = false;
+  // 连续低于阈值的采样次数（迟滞计数，避免在阈值附近抖动），见内存自愈定时器
+  let memReliefLowSamples = 0;
   let memTimer: ReturnType<typeof setInterval> | null = null;
   let perfObservers: PerformanceObserver[] = [];
   function markWindowBusy() {
@@ -336,9 +360,8 @@ console.log("Hello LiteMD");
   }
   function saveSession() {
     settings.openTabs = tabs.map((t) => t.path);
-    if (settings.lastFile !== (tabs[activeIdx]?.path ?? settings.lastFile)) {
-      // lastFile 保持首个标签语义
-    }
+    const activePath = tabs[activeIdx]?.path;
+    if (activePath) settings.lastFile = activePath;
     persist();
     try {
       const data = tabs.map((t) => {
@@ -472,7 +495,7 @@ console.log("Hello LiteMD");
     }
     // 预览编辑模式下：渲染新标签内容到可编辑预览容器（否则内容停留在上一个标签）
     if (previewEditMode && md && previewEditEl) {
-      previewEditEl.innerHTML = md.render(tab.content);
+      previewEditEl.innerHTML = safeRender(md, tab.content); // C-01：清洗后注入
     }
   }
   async function activateTab(idx: number) {
@@ -697,6 +720,7 @@ console.log("Hello LiteMD");
     }
   }
   function doCloseTab(path: string) {
+    logOp("关闭标签: " + path);
     const idx = tabs.findIndex((t) => t.path === path);
     if (idx < 0) return;
     if (tabs[idx] === docStreamTab) abortDocStream(); // 关闭正在流式载入的标签才中止流
@@ -740,30 +764,11 @@ console.log("Hello LiteMD");
     status = "已关闭 " + basename(wasPath);
   }
 
-  // ---- 隐藏文件/文件夹（文件树不显示，可管理取消）----
-  const isHiddenPath = (p: string) => {
-    const np = norm(p);
-    return settings.hiddenPaths.some((h) => {
-      const nh = norm(h).replace(/\/+$/, "");
-      return np === nh || np.startsWith(nh + "/");
-    });
-  };
-  let showHiddenManage = false;
-  function ctxHide() {
-    const c = ctxMenu;
-    ctxMenu = null;
-    if (!c) return;
-    const np = norm(c.path);
-    if (!settings.hiddenPaths.some((h) => norm(h) === np)) {
-      settings.hiddenPaths = [...settings.hiddenPaths, np];
-    }
+  let showShortcutGuide = false;
+  function closeShortcutGuide() {
+    showShortcutGuide = false;
+    settings.shortcutGuideShown = true;
     persist();
-    status = `已隐藏 ${c.name}（可在隐藏管理中恢复）`;
-  }
-  function unhidePath(p: string) {
-    settings.hiddenPaths = settings.hiddenPaths.filter((h) => norm(h) !== norm(p));
-    persist();
-    status = "已取消隐藏 " + basename(p);
   }
   
     // ---- 格式刷 / 调色板 / 跨文件搜索 / 确认对话框 状态 ----
@@ -832,32 +837,69 @@ console.log("Hello LiteMD");
       confirmState = null;
     }
 
-    // ---- 文件树右键菜单（删除 / 移动 / 复制 / 隐藏；标签右键：关闭）----
-    let ctxMenu: { x: number; y: number; kind: "file" | "folder" | "tab"; path: string; name: string } | null = null;
+    // ---- 标签右键：关闭当前 / 关闭其他 / 关闭全部（文件树右键菜单在 FileTree 内部）----
+    let ctxMenu: { x: number; y: number; path: string; name: string } | null = null;
 
-    function openCtx(e: MouseEvent, kind: "file" | "folder", path: string, name: string) {
-      e.preventDefault();
-      ctxMenu = { x: e.clientX, y: e.clientY, kind, path, name };
-    }
     function closeCtx() {
       ctxMenu = null;
     }
 
-    // 右键菜单中需要读取当前节点路径的快捷动作（模板表达式不支持 TS 断言，故用函数包装）
-    function ctxNewFile() {
-      const p = ctxMenu?.path;
-      closeCtx();
-      if (p) newFileIn(p);
+    // 树内重命名/移动后：更新已打开标签的路径（供 FileTree handlers.onTabRenamed 使用）
+    function updateTabPath(oldPath: string, newPath: string) {
+      const np = norm(newPath);
+      const { tabs: nextTabs, activeIdx: nextActive } = renameTabPathDedup(tabs, oldPath, newPath, activeIdx);
+      tabs = nextTabs;
+      // 仅当被改名的标签成为激活标签时，同步当前路径与最近文件（避免覆盖其它激活标签）
+      if (nextActive >= 0 && tabs[nextActive] && norm(tabs[nextActive].path) === np) {
+        currentPath = np;
+        settings.lastFile = np;
+      }
+      activeIdx = nextActive;
+      saveSession();
+      updateTitle();
+      // 附件文件夹联动：重命名 / 移动 .md 时一并处理其 {filename}_attachment（异步，不阻塞 UI）
+      if (/\.md$/i.test(newPath)) void linkAttachmentOnRename(oldPath, newPath);
     }
-    function ctxNewFolder() {
-      const p = ctxMenu?.path;
-      closeCtx();
-      if (p) newFolderIn(p);
-    }
-    function ctxOpen() {
-      const p = ctxMenu?.path;
-      closeCtx();
-      if (p) openFileByPath(p);
+
+    // 重命名 / 移动 .md 时，对附件目录做同样操作：
+    //  - 重命名 → 同步改名「旧名_attachment」为「新名_attachment」，并改写文档内引用
+    //  - 移动 → 把附件目录一起移到目标目录（目录名不变，相对引用仍有效，无需改写）
+    async function linkAttachmentOnRename(mdOld: string, mdNew: string) {
+      const oldAtt = resolveAttachmentDir(mdOld, settings);
+      const newAtt = resolveAttachmentDir(mdNew, settings);
+      if (oldAtt === newAtt) return; // shared 模式下附件目录与文档名无关，无需联动
+      const oldName = basename(oldAtt);
+      const newName = basename(newAtt);
+      // 1) 移动 / 重命名磁盘上的附件目录（若存在）
+      try {
+        if (await pathExists(oldAtt)) {
+          await renamePath(oldAtt, newAtt);
+        }
+      } catch (e) {
+        logError("附件文件夹联动失败：" + String(e));
+      }
+      // 2) 仅目录名变化（重命名场景）才改写文档内引用；纯移动目录名不变，相对引用仍有效
+      if (oldName !== newName) {
+        try {
+          const text = await readFile(mdNew);
+          const res = rewriteAttachmentRefs(text, dirname(mdNew), [oldAtt], oldName, newName);
+          if (res.count > 0) {
+            await writeFile(mdNew, res.text);
+            // 当前打开的文档：同步编辑器内容，避免预览里图裂
+            if (currentPath && norm(currentPath) === norm(mdNew)) {
+              suppressSave = true;
+              setDoc(view, res.text);
+              source = res.text;
+              lastSaved = res.text;
+              docDirty = false;
+              suppressSave = false;
+              updateTitle();
+            }
+          }
+        } catch (e) {
+          logError("改写附件引用失败：" + String(e));
+        }
+      }
     }
 
     // ---- 标签右键：关闭当前 / 关闭其他 / 关闭全部 ----
@@ -878,87 +920,6 @@ console.log("Hello LiteMD");
       ctxMenu = null;
       for (const t of [...tabs]) requestCloseTab(t.path);
     }
-
-    async function ctxCopy() {
-      const c = ctxMenu;
-      ctxMenu = null;
-      if (!c) return;
-      const dest = await pickOpenFolder();
-      if (!dest) {
-        status = "已取消复制";
-        return;
-      }
-      try {
-        await copyPath(c.path, dest);
-        status = `已复制 ${c.name} 到 ${dest}`;
-        await refreshTree();
-      } catch (e) {
-        status = "复制失败：" + String(e);
-      }
-    }
-
-    async function ctxMove() {
-      const c = ctxMenu;
-      ctxMenu = null;
-      if (!c) return;
-      const dest = await pickOpenFolder();
-      if (!dest) {
-        status = "已取消移动";
-        return;
-      }
-      try {
-        const newPath = await movePath(c.path, dest);
-        const np = norm(newPath);
-        // 若移动的是已打开的标签，更新路径，让后续保存落到新位置
-        const tabIdx = tabs.findIndex((t) => t.path === norm(c.path));
-        if (tabIdx >= 0) {
-          tabs = tabs.map((t, i) => (i === tabIdx ? { ...t, path: np } : t));
-          if (tabIdx === activeIdx) {
-            currentPath = np;
-            settings.lastFile = np;
-          }
-          saveSession();
-          updateTitle();
-        }
-        status = `已移动 ${c.name} 到 ${dest}`;
-        await refreshTree();
-      } catch (e) {
-        status = "移动失败：" + String(e);
-      }
-    }
-
-    async function ctxDelete() {
-      const c = ctxMenu;
-      ctxMenu = null;
-      if (!c) return;
-      const ok = await askConfirm({
-        title: "删除确认",
-        message:
-          c.kind === "folder"
-            ? `确定要删除文件夹「${c.name}」及其全部内容吗？此操作不可撤销。`
-            : `确定要删除文件「${c.name}」吗？此操作不可撤销。`,
-        confirmText: "删除",
-        danger: true,
-      });
-      if (!ok) return;
-      try {
-        await deletePath(c.path);
-        // 若删除的是已打开的标签，直接关闭对应标签（文件已不存在，无需确认）
-        const tabIdx = tabs.findIndex((t) => t.path === norm(c.path));
-        if (tabIdx >= 0) {
-          if (saveTimer) {
-            clearTimeout(saveTimer);
-            saveTimer = null;
-          }
-          doCloseTab(tabs[tabIdx].path);
-        }
-        status = `已删除 ${c.name}`;
-        await refreshTree();
-      } catch (e) {
-        status = "删除失败：" + String(e);
-      }
-    }
-
     // ---- 分栏拖动（侧边栏宽度 / 预览宽度）----
     let sidebarWidth = 240;
     let previewWidth = 440;
@@ -1190,6 +1151,16 @@ console.log("Hello LiteMD");
   // 高亮语言包就绪 / 版本变化时，用当前文档重刷一次预览（source 未变也要重渲染）
   $: if (hlReady || hlVersion > 0) schedulePreview();
 
+  // UX-1：预览被自动降级/禁用时的状态栏说明。
+  // 两级：超过 previewMaxBytes → 实时预览暂停（仍可手动刷新）；
+  //       超过 manualRefreshMax → 手动刷新也禁用（全量切块会造成数百 ms 长任务）。
+  $: previewDisabledNotice =
+    docLength > manualRefreshMax
+      ? `预览已禁用（文档 ${(docLength / (1 << 20)).toFixed(1)}MB > ${manualRefreshMax >> 20}MB）`
+      : previewStale && docLength > previewMaxBytes
+        ? "实时预览已暂停（文档较大），可点刷新按钮更新"
+        : "";
+
   // ---- 字数 / 字符统计（CJK 按字计，拉丁按词计）----
   // 单遍循环替代三次全文正则；并移出渲染关键路径，预览更新后空闲时再算
   function computeStats(text: string) {
@@ -1244,13 +1215,72 @@ console.log("Hello LiteMD");
   // 未保存状态变化时同步标题（dirty 翻转才触发，非每次击键）
   $: if (dirty !== undefined) updateTitle();
 
-  function applyAppearance() {
-    document.documentElement.dataset.theme = settings.theme;
-    if (view) setAppearance(view, settings.theme === "dark", settings.fontSize);
+  // 解析最终主题：auto 时跟随系统配色（prefers-color-scheme）
+  function resolvedTheme(): "light" | "dark" {
+    if (settings.theme === "auto") {
+      return typeof window !== "undefined" &&
+        window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
+    }
+    return settings.theme;
   }
+
+  function applyAppearance() {
+    const dark = resolvedTheme() === "dark";
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    if (view) setAppearance(view, dark, settings.fontSize);
+  }
+  // 主题变更（标题栏切换 / 设置面板选择）即时重渲染；auto 下依赖下方 matchMedia 监听
+  $: if (view && settings.theme !== undefined) applyAppearance();
 
   onMount(() => {
     let disposed = false;
+
+    // 轻量崩溃日志：仅记录未捕获异常，供排障回传（平时无日志、不影响体验）
+    if (typeof window !== "undefined") {
+      const sendLog = (msg: string) => { try { void logFrontend(msg); } catch { /* ignore */ } };
+      window.addEventListener("error", (e: any) => {
+        sendLog(`ERROR ${e.message} @ ${e.filename}:${e.lineno} :: ${e.error && e.error.stack ? e.error.stack : ""}`);
+        // 仅对未在被 try/catch 兜住的运行时错误展示错误页（避免正常流程的轻微报错刷屏）
+        if (!fatalError) fatalError = { msg: e.message || "未知错误", stack: e.error?.stack || "" };
+      });
+      window.addEventListener("unhandledrejection", (e: any) => {
+        sendLog(`UNHANDLED_REJECTION ${e.reason && e.reason.stack ? e.reason.stack : String(e.reason)}`);
+        if (!fatalError)
+          fatalError = {
+            msg: String(e.reason?.message || e.reason || "未处理的异步异常"),
+            stack: e.reason?.stack || String(e.reason),
+          };
+      });
+
+      // 自动主题：跟随系统配色（仅当 theme=auto 时响应系统切换）
+      try {
+        const mq = window.matchMedia("(prefers-color-scheme: dark)");
+        const onScheme = () => {
+          if (settings.theme === "auto") applyAppearance();
+        };
+        if (mq.addEventListener) mq.addEventListener("change", onScheme);
+        else if ((mq as any).addListener) (mq as any).addListener(onScheme);
+      } catch {
+        /* 旧浏览器无 matchMedia，忽略 */
+      }
+    }
+
+    // 窗口显示（幂等）：visible:false 时窗口靠前端主动 show。
+    // 任何路径漏掉调用都会让用户看到「应用启动了但没界面」，故统一收口 + 超时兜底。
+    let windowShown = false;
+    const showWindowOnce = async () => {
+      if (windowShown) return;
+      windowShown = true;
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().show();
+      } catch { /* browser dev mode */ }
+    };
+    // 硬超时保险：初始化若卡死（await 永久 pending，catch 救不了），4s 后强制显示窗口
+    const showFailsafe = setTimeout(() => { void showWindowOnce(); }, 4000);
 
     // 初始化 Tauri 窗口 API
     import("@tauri-apps/api/window").then((mod) => {
@@ -1283,6 +1313,9 @@ console.log("Hello LiteMD");
     });
 
     // 粘贴图片：窗口级拦截（仅当剪贴板含图片时生效）
+    // m-05：先 remove 再 add，保证幂等。HMR 或异常路径下 onMount 可能重入，
+    // 重复监听会让同一张图被插入两次。onPaste 是稳定函数引用，remove 必然命中。
+    window.removeEventListener("paste", onPaste);
     window.addEventListener("paste", onPaste);
 
     // ---- 内存压力自愈（P0）：渲染进程堆超限时分级释放缓存，守住 ≤200MB 预算 ----
@@ -1293,11 +1326,29 @@ console.log("Hello LiteMD");
       const usedMB = m.usedJSHeapSize / (1 << 20);
       const limitMB = lowEndMode ? 120 : 180;
       if (usedMB > limitMB && !memReliefEnabled) {
-        memReliefEnabled = true;           // 开启视口外 img 卸载（回收解码位图，粘性不回退）
+        memReliefEnabled = true;           // 开启视口外 img 卸载（回收解码位图）
+        memReliefLowSamples = 0;
         previewRef?.clearCache();          // 预览块 HTML 缓存
         docMemo = null;                    // 文档字符串副本（下次消费者重新 toString）
         previewRef?.pauseIdlePrerender();
         console.warn(`[mem] 堆压力 ${usedMB.toFixed(0)}MB > ${limitMB}MB，已释放缓存`);
+        status = `内存偏高（${usedMB.toFixed(0)}MB），已临时降低预览质量以保持流畅`;
+      } else if (memReliefEnabled) {
+        // UX-2：自愈可逆。旧实现「粘性不回退」，关掉大文档后低端设备也要重开应用
+        // 才能恢复预渲染。改为带迟滞的自动退出：连续 3 次采样（约 15s）低于
+        // 阈值的 70% 才恢复，避免在阈值附近反复开关引起抖动。
+        if (usedMB < limitMB * 0.7) {
+          memReliefLowSamples++;
+          if (memReliefLowSamples >= 3) {
+            memReliefEnabled = false;
+            memReliefLowSamples = 0;
+            previewRef?.resumeIdlePrerender();
+            console.info(`[mem] 堆回落至 ${usedMB.toFixed(0)}MB，已恢复正常预览质量`);
+            status = "内存已回落，预览质量恢复正常";
+          }
+        } else {
+          memReliefLowSamples = 0;
+        }
       }
     }, 5000);
 
@@ -1328,29 +1379,134 @@ console.log("Hello LiteMD");
     let unlistenOpenFiles: (() => void) | null = null;
     let unlistenMoved: (() => void) | null = null;
     let unlistenResized: (() => void) | null = null;
+    let bootReady = false;
+    let pendingOpenFiles: string[] = [];
 
     (async () => {
       settings = await loadSettings();
+      // 双保险：确保数组字段永不为 undefined/null，避免渲染时 .some/.filter 越界崩溃
+      settings.hiddenPaths = settings.hiddenPaths ?? [];
+      settings.roots = settings.roots ?? [];
+      settings.openTabs = settings.openTabs ?? [];
       if (disposed) return;
 
       appliedFontSize = settings.fontSize; // 预测式缩放手感的基准字号（P1-3）
       showTree = settings.showTree;
       showPreview = settings.showPreview;
-      document.documentElement.dataset.theme = settings.theme;
+      applyAppearance();
+      logInfo("LiteMD 启动");
+
+      // 首次启动显示快捷键示意图
+      if (!settings.shortcutGuideShown) {
+        showShortcutGuide = true;
+      }
+
+      // 热启动事件监听：提前注册（在 take_open_files 之前），避免初始化期间
+      // single-instance 插件转发的 open-files 事件因监听器尚未注册而丢失。
+      // 若初始化未完成（bootReady=false），路径暂存到队列，初始化后统一处理。
+      listen<string[]>("open-files", (e) => {
+        const payload = e.payload || [];
+        if (!bootReady) {
+          pendingOpenFiles.push(...payload);
+          return;
+        }
+        if (payload.length > 0 && view && tabs.length === 0) {
+          setDoc(view, "");
+          source = "";
+          lastSaved = null;
+        }
+        for (const p of payload) openFileByPathSafe(p);
+      }).then((unlisten) => {
+        unlistenOpenFiles = unlisten;
+      }).catch(() => {});
 
       // ---- 启动前先消费 Rust 端待打开文件，避免欢迎页先渲染再被替换（q15）----
       // 冷启动：take_open_files 拿到 .md 关联 / 命令行参数；热启动（single-instance 插件
       // 转发）由下方的 listen("open-files") 捕获。这里必须先 take_open_files 再创建编辑器，
       // 否则编辑器初始 doc 会被设为欢迎页（默认 source），再被 openFileByPath 覆盖造成闪烁。
+      //
+      // v1.4.0 强化：take_open_files 是**只读不删**（lib.rs），ack_open_files 才清空缓存；
+      // 这里如果首次返回空（HMR、Slow webview、Vite 慢启动等 race 场景）则重试 4 次，
+      // 总等待 ≤400ms，可覆盖所有已知 race。拿到路径后尽快 ack，避免下次启动残留。
       let initialPaths: string[] = [];
-      try {
-        initialPaths = await invoke<string[]>("take_open_files");
-      } catch (e) {
-        console.warn("[boot] take_open_files 失败:", e);
+      // 冷启动重试加固：WebView2 冷启动较慢时，首次 invoke 可能尚未就绪而返回空，
+      // 延长至 6 次 / 80ms（≈480ms）覆盖慢启动 race，避免 take_open_files 偶发空导致
+      // 「双击 .md 却没打开 / 停在首页」的回归（q14 边界）。
+      for (let attempt = 0; attempt < 6 && initialPaths.length === 0; attempt++) {
+        try {
+          initialPaths = await invoke<string[]>("take_open_files");
+        } catch (e) {
+          console.warn(`[boot] take_open_files 失败 (attempt ${attempt}):`, e);
+        }
+        if (initialPaths.length === 0 && attempt < 5) {
+          await new Promise((r) => setTimeout(r, 80));
+        }
       }
-      if (initialPaths.length === 0) {
-        // 无待打开文件：欢迎页作为初始内容（首次启动 / 普通启动）
-        source = WELCOME_TEXT;
+      console.info("[boot] initialPaths:", JSON.stringify(initialPaths));
+      // 拿到路径即 ack 清空缓存（即使后续 openFileByPath 失败也不影响本次启动）
+      if (initialPaths.length > 0) {
+        invoke("ack_open_files").catch((e) => console.warn("[boot] ack_open_files 失败:", e));
+      }
+
+      // ---------- 预计算会话恢复数据（先收集内容，再统一设置 source → 避免闪烁）----------
+      // 常规启动（initialPaths.length===0）：先算会话恢复的 restored[]，
+      // 把第一个标签内容作为 createEditor 的 doc，后续 applyTabState 写回同内容，
+      // 让用户看不到欢迎页或旧文档在闪。
+      const openPathsForRestore: string[] =
+        initialPaths.length === 0 && settings.openTabs.length
+          ? settings.openTabs
+          : initialPaths.length === 0 && settings.lastFile
+            ? [settings.lastFile]
+            : [];
+      const sessionTabs = initialPaths.length === 0 ? loadSession() : [];
+      type RestoredItem = {
+        path: string; content: string | null; savedContent: string;
+        dirty: boolean; cursorPos: number | null; deferred?: boolean;
+      };
+      const restoredEarly: RestoredItem[] = [];
+      for (const p of openPathsForRestore) {
+        const np = norm(p);
+        if (restoredEarly.some((r) => r.path === np)) continue;
+        const s = sessionTabs.find((st: any) => st.path === np);
+        let content: string | null = s ? s.content : null;
+        let savedContent = s ? s.saved : "";
+        let dirty = s ? s.dirty : false;
+        if (content === "") content = null;
+        if (content === null) {
+          try {
+            let sz = 0;
+            try { sz = await fileSize(np); } catch { sz = 0; }
+            if (sz > BIG_DOC_BYTES) {
+              restoredEarly.push({ path: np, content: "", savedContent: "", dirty: false, cursorPos: s ? s.cursor : null, deferred: true });
+              continue;
+            }
+            content = await readFile(np);
+            savedContent = content;
+            dirty = false;
+          } catch (e) {
+            console.warn("[session] 恢复标签失败:", np, e);
+            continue;
+          }
+        }
+        restoredEarly.push({ path: np, content, savedContent: savedContent || content, dirty, cursorPos: s ? s.cursor : null });
+      }
+
+      // 设置编辑器初始 doc：
+      // - 冷启动带文件：预读第一个待打开文件内容（同 v1.4.2）
+      // - 常规启动有会话：用 restoredEarly[0].content，避免欢迎页一闪
+      // - 都没有（首次启动/无会话）：空字符串，后序完成后再填欢迎页
+      if (initialPaths.length > 0) {
+        const first = normalizeOpenPath(initialPaths[0]);
+        try {
+          let sz = 0;
+          try { sz = await fileSize(first); } catch { sz = 0; }
+          if (sz <= BIG_DOC_BYTES) {
+            const c = await readFile(first);
+            if (c) source = c;
+          }
+        } catch { /* openFileByPath 兜底 */ }
+      } else if (restoredEarly.length > 0 && restoredEarly[0].content && !restoredEarly[0].deferred) {
+        source = restoredEarly[0].content;
       }
 
       view = createEditor({
@@ -1365,22 +1521,13 @@ console.log("Hello LiteMD");
       });
       lastSaved = source;
 
-      // 热启动事件：第二个实例通过 single-instance 插件转发路径（open-files 事件）
-      listen<string[]>("open-files", (e) => {
-        for (const p of e.payload) void openFileByPath(p);
-      }).then((unlisten) => {
-        unlistenOpenFiles = unlisten;
-      }).catch(() => {});
-
       // 打开启动参数中的文件（编辑器已创建，因为 applyTabState 需要 view）
       if (initialPaths.length) {
         status = `打开 ${initialPaths.length} 个文件…`;
-        for (const p of initialPaths) void openFileByPath(p);
+        for (const p of initialPaths) await openFileByPath(p);
       }
 
       // 滚动同步：编辑器 → 预览（按比例单向，避免反馈循环）。
-      // 注意：真正可滚动的是 VirtualPreview 内部容器（.preview-content 是 overflow:hidden），
-      // 所以通过组件实例的 scrollToRatio 转发；监听用 rAF 节流 + passive，关闭预览时零开销。
       let syncPending = false;
       view.scrollDOM.addEventListener("scroll", () => {
         if (!showPreview || syncPending) return;
@@ -1395,79 +1542,111 @@ console.log("Hello LiteMD");
         });
       }, { passive: true });
 
-      // 恢复上次的目录与全部标签（会话恢复：路径来自 settings.openTabs，内容/光标来自 localStorage；
-      // 无会话数据时回退读磁盘，兼容旧版 lastFile 单文件）
-      const treePromise = settings.lastFolder
-        ? readMdTree(settings.lastFolder).catch(() => {
-            settings.lastFolder = null;
-            return [] as FolderNode[];
-          })
-        : Promise.resolve([] as FolderNode[]);
+      // 恢复多根工作区（懒加载文件树：只列举根层，逐层展开，避免整树递归卡死/崩溃）
       const hlPromise = initHighlight();
-      const mdPromise = initMd().catch(() => null); // 解析器就绪前预览保持空，就绪后自动重建
-
-      const [loadedTree] = await Promise.all([treePromise, hlPromise, mdPromise]);
+      const mdPromise = initMd().catch(() => null);
+      await Promise.all([hlPromise, mdPromise]);
       if (disposed) return;
-      tree = loadedTree;
-
-      // 标签列表：优先 settings.openTabs；旧版本无 openTabs 时用 lastFile 兜底
-      const openPaths = settings.openTabs.length
-        ? settings.openTabs
-        : settings.lastFile
-          ? [settings.lastFile]
-          : [];
-      const sessionTabs = loadSession();
-      const restored: TabState[] = [];
-      for (const p of openPaths) {
-        const np = norm(p);
-        // 旧设置可能残留重复路径：已恢复过的直接跳过（保留前面的标签）
-        if (restored.some((r) => r.path === np)) continue;
-        const s = sessionTabs.find((st) => st.path === np);
-        let content: string | null = s ? s.content : null;
-        let savedContent = s ? s.saved : "";
-        let dirty = s ? s.dirty : false;
-        // 大文档指针/旧版空内容：按无缓存处理，回退读磁盘
-        if (content === "") content = null;
-        if (content === null) {
-          // 无会话缓存：大文件（>8MB）创建延迟标签（激活时分片流式载入，冷启动不阻塞）；
-          // 小文件直接读磁盘（失败的文件自动跳过）
-          try {
-            let sz = 0;
-            try { sz = await fileSize(np); } catch { sz = 0; }
-            if (sz > BIG_DOC_BYTES) {
-              restored.push({ path: np, content: "", savedContent: "", dirty: false, cursorPos: s ? s.cursor : null, deferred: true });
-              continue;
+      {
+        const seeded: string[] =
+          settings.roots && settings.roots.length
+            ? settings.roots.slice()
+            : settings.lastFolder
+            ? [settings.lastFolder]
+            : [];
+        // 恢复文件树偏好：折叠集合 / 排序 / 附件可见性
+        treeStore.setCollapsed(new Set(settings.treeCollapsed));
+        treeStore.setSort(settings.treeSort);
+        treeStore.setShowNonMd(settings.showNonMd);
+        // 根路径统一归一化（settings.roots 可能为旧版反斜杠格式，避免与正斜杠路径重复添加）
+        const normedRoots = seeded.map((r) => norm(r));
+        treeStore.setRoots(normedRoots);
+        // 根目录逐层懒加载；单个根失败不阻塞启动（错误在树节点上内联提示）
+        // 加载完成后自动移除已不存在的根目录（用户手动删除后重启的场景）
+        Promise.all(normedRoots.map((r) => loadFolderNode(treeStore, r, false)))
+          .then(() => {
+            const s = treeStore.get();
+            const deadRoots = normedRoots.filter((rp) => {
+              const node = s.nodeMap.get(rp);
+              const ls = s.loadState.get(rp);
+              return node && !node.loaded && ls?.error;
+            });
+            if (deadRoots.length) {
+              console.warn("[startup] 移除已不存在的根目录:", deadRoots);
+              treeStore.setRoots(s.rootPaths.filter((p) => !deadRoots.includes(p)));
+              onTreeRootsChanged(treeStore.get().rootPaths, null);
             }
-            content = await readFile(np);
-            savedContent = content;
-            dirty = false;
-          } catch {
-            continue;
-          }
-        }
-        restored.push({
-          path: np,
-          content,
-          savedContent: savedContent || content,
-          dirty,
-          cursorPos: s ? s.cursor : null,
-        });
+          })
+          .catch(() => {});
       }
-      if (restored.length > 0) {
-        tabs = restored;
-        activeIdx = 0;
-        applyTabState(restored[0]);
-        settings.lastFile = restored[0].path;
-        status = `已恢复 ${restored.length} 个标签`;
-        saveSession();
+
+      // 关键修复：若本次启动是通过文件关联 / 命令行显式打开了文件（initialPaths 非空），
+      // 则【不】恢复上次会话标签——initialPaths 的文件已在上方 openFileByPath 中打开并加入 tabs。
+      if (initialPaths.length === 0) {
+        try {
+          if (restoredEarly.length > 0) {
+            // restoredEarly 已预算并把第一个内容写进了编辑器，直接写入 tabs 并 apply 同一内容，
+            // setDoc 用同文本不会有视觉闪烁。
+            tabs = restoredEarly as unknown as TabState[];
+            activeIdx = 0;
+            applyTabState(restoredEarly[0] as unknown as TabState);
+            settings.lastFile = restoredEarly[0].path;
+            status = `已恢复 ${restoredEarly.length} 个标签`;
+            saveSession();
+          } else if (tabs.length === 0 && (!source || source === "")) {
+            // 首次启动 / 无任何会话数据：最后才注入欢迎页，避免短暂出现后被替换
+            source = WELCOME_TEXT;
+            setDoc(view, source);
+            lastSaved = source;
+          }
+        } catch (e) {
+          // 恢复失败绝不让应用崩溃：回退到欢迎页，保证窗口可用，并记录错误便于定位
+          console.error("[restore] failed:", e);
+          try { if (view) setDoc(view, WELCOME_TEXT); } catch {}
+          source = WELCOME_TEXT;
+          lastSaved = source;
+        }
       }
 
       configPath = await settingsFilePath();
       if (!disposed) hlReady = true;
-    })();
+
+      // 初始化完成：处理暂存的热启动事件（初始化期间 single-instance 转发的文件路径）
+      bootReady = true;
+      if (pendingOpenFiles.length > 0) {
+        // 过滤掉已在 initialPaths 中处理过的文件，避免重复打开
+        const newFiles = pendingOpenFiles.filter((p) => {
+          const np = norm(p);
+          return !initialPaths.some((ip) => norm(ip) === np);
+        });
+        // 只有当 initialPaths 为空且有新文件需要打开时，才清除会话恢复的标签
+        if (initialPaths.length === 0 && newFiles.length > 0 && tabs.length > 0) {
+          // 检查新文件是否已在恢复的标签中
+          const alreadyOpen = newFiles.some((p) => tabs.some((t) => t.path === norm(p)));
+          if (!alreadyOpen) {
+            tabs = [];
+            activeIdx = 0;
+            if (view) { setDoc(view, ""); source = ""; lastSaved = null; }
+          }
+        }
+        for (const p of newFiles) openFileByPathSafe(p);
+        pendingOpenFiles = [];
+      }
+
+      // 窗口可见：初始化完成后才显示，避免欢迎页/空白一闪而过（visible:false in tauri.conf.json）
+      clearTimeout(showFailsafe);
+      if (!disposed) await showWindowOnce();
+    })().catch((e) => {
+      // 初始化失败也必须显示窗口，否则用户会看到应用「启动了但没界面」
+      console.error("[boot] 初始化失败:", e);
+      clearTimeout(showFailsafe);
+      bootReady = true;
+      void showWindowOnce();
+    });
 
     return () => {
       disposed = true;
+      clearTimeout(showFailsafe);
       view?.destroy();
       unlistenClose?.();
       unlistenDrop?.();
@@ -1487,6 +1666,7 @@ console.log("Hello LiteMD");
     applyAppearance();
     if (view) setKeymap(view, cmKeysOf(settings.shortcuts));
     if (view) setWrap(view, settings.wrap);
+    logOp("修改设置");
     persist();
   }
 
@@ -1550,77 +1730,70 @@ console.log("Hello LiteMD");
     await openFileByPath(p);
   }
 
+  // ISSUE-011 修复：互斥锁串行化文件打开，防止并发调用导致标签重复/状态混乱
+  let openingLock: Promise<void> = Promise.resolve();
   async function openFileByPath(p: string) {
     // 防御：文件关联/拖拽/命令行可能带来引号或 file:// 前缀（Windows 注册表 "%1"、某些环境 URI 形式）
     const np = normalizeOpenPath(p);
-    return openTabByPath(np);
+    logOp("打开文件: " + np);
+    const prev = openingLock;
+    let release!: () => void;
+    openingLock = new Promise<void>((r) => { release = r; });
+    try {
+      await prev;
+      await openTabByPath(np);
+    } catch (e) {
+      throw e;
+    } finally {
+      release();
+    }
   }
 
+  // ISSUE-006 修复：带错误反馈的 fire-and-forget 包装
+  function openFileByPathSafe(p: string) {
+    openFileByPath(p).catch((e) => {
+      status = "打开失败：" + String(e);
+    });
+  }
+
+  // 打开/添加文件夹为根（快捷键 Ctrl+Shift+O / 设置面板「选择目录」）
   async function openFolder() {
     const folder = await pickOpenFolder();
     if (!folder) return;
-    await loadFolder(folder);
+    logOp("打开文件夹: " + folder);
+    await loadFolderIntoTree(folder);
   }
-
-  async function loadFolder(folder: string) {
-    tree = await readMdTree(folder);
-    settings.lastFolder = folder;
+  // 加入工作区根并懒加载该层；同步持久化 settings.roots/lastFolder
+  async function loadFolderIntoTree(folder: string) {
+    const np = norm(folder);
+    if (!treeStore.get().rootPaths.includes(np)) treeStore.addRoot(np);
+    // 总是 force 重加载：清掉历史 error，避免首次 listDir 偶发失败残留「无法访问」后无法重试
+    await loadFolderNode(treeStore, np, treeStore.get().showHidden, true);
+    onTreeRootsChanged(treeStore.get().rootPaths, np);
+    status = "已加载目录 " + basename(np);
+  }
+  // FileTree handlers.onRootsChanged：根列表/默认目录变化 → 持久化
+  function onTreeRootsChanged(roots: string[], lastFolder: string | null) {
+    settings.roots = roots;
+    if (lastFolder) settings.lastFolder = lastFolder;
     persist();
-    status = tree.length === 0 ? "该文件夹下未找到 .md" : "已加载目录 " + basename(folder);
   }
-
-  async function refreshTree() {
-    if (!settings.lastFolder) {
-      status = "尚未打开文件夹";
-      return;
-    }
-    try {
-      tree = await readMdTree(settings.lastFolder);
-      status = "目录已刷新";
-    } catch {
-      status = "刷新失败：目录不可读";
-    }
+  // FileTree handlers.setTreePrefs：折叠集合/排序/附件可见性 → 持久化
+  // 关键：仅在值真正变化时才 persist()，避免 FileTree 的 $: state.collapsed 响应式
+  // 与 persist → settings 更新 → 重新渲染 → 再次触发 $: 形成无限循环
+  // （每次循环都调用 resolveLowEnd → detectLowEnd → getGpuRenderer → 创建 WebGL 上下文 → 耗尽）
+  function onTreePrefsChange(prefs: { collapsed: string[]; sort: string; showNonMd: boolean }) {
+    const newSort = prefs.sort as "name" | "mtime" | "size" | "type";
+    const changed =
+      JSON.stringify(settings.treeCollapsed ?? []) !== JSON.stringify(prefs.collapsed) ||
+      settings.treeSort !== newSort ||
+      settings.showNonMd !== prefs.showNonMd;
+    if (!changed) return;
+    settings.treeCollapsed = prefs.collapsed;
+    settings.treeSort = newSort;
+    settings.showNonMd = prefs.showNonMd;
+    persist();
   }
-
-  // ---- 文件树扁平化（递归树 → 带深度的平铺列表，供模板渲染）----
-  interface FlatNode {
-    kind: "folder" | "file";
-    name: string;
-    path: string;
-    depth: number;
-    expanded: boolean;
-  }
-
-  function flattenTree(nodes: FolderNode[], collapsedSet: Set<string>, hiddenPaths: string[], depth = 0): FlatNode[] {
-    const out: FlatNode[] = [];
-    // 隐藏判断：路径本身或其祖先被隐藏（隐藏文件夹时其下内容整体不展示）
-    const isHidden = (p: string) => {
-      const np = norm(p);
-      return hiddenPaths.some((h) => {
-        const nh = norm(h).replace(/\/+$/, "");
-        return np === nh || np.startsWith(nh + "/");
-      });
-    };
-    for (const folder of nodes) {
-      // 隐藏的文件夹（含子项）整体不展示
-      if (isHidden(folder.path)) continue;
-      const expanded = !collapsedSet.has(folder.path);
-      out.push({ kind: "folder", name: folder.name, path: folder.path, depth, expanded });
-      if (expanded) {
-        for (const file of folder.files) {
-          if (isHidden(file.path)) continue;
-          out.push({ kind: "file", name: file.name, path: file.path, depth: depth + 1, expanded: false });
-        }
-        out.push(...flattenTree(folder.children, collapsedSet, depth + 1));
-      }
-    }
-    return out;
-  }
-
-  let flatTree: FlatNode[] = [];
-  // 显式依赖 settings.hiddenPaths：隐藏/取消隐藏后文件树立即重算（内存过滤，无磁盘 IO）
-  $: flatTree = flattenTree(tree, collapsed, settings.hiddenPaths);
-
   // ---- 预览编辑模式：隐藏 markdown 编辑器，全屏显示可编辑的渲染预览 ----
   // contenteditable 渲染 HTML；编辑后防抖用 turndown 转回 markdown 写回 CodeMirror。
   let previewEditMode = false;
@@ -1723,7 +1896,7 @@ console.log("Hello LiteMD");
         return;
       }
       const m = md ?? (await initMd());
-      previewEditEl.innerHTML = m.render(text);
+      previewEditEl.innerHTML = safeRender(m, text); // C-01：清洗后注入
       // contenteditable 新段落统一用 <p>（turndown 往返稳定）
       document.execCommand("defaultParagraphSeparator", false, "p");
       // 挂载键盘增强：快捷键/智能 Enter/缩进/图片粘贴（与源码编辑器对齐）
@@ -1795,108 +1968,40 @@ console.log("Hello LiteMD");
       previewEditTimer = null;
     }
     if (!previewEditEl || !view) return;
-    const text = initTurndown().turndown(previewEditEl.innerHTML);
+    let text: string;
+    try {
+      // M-04：contenteditable 内容可能被粘贴进任意 HTML（含 <script>），
+      // 先清洗再 turndown，杜绝恶意 HTML 经由「编辑→保存」落盘持久化。
+      text = initTurndown().turndown(sanitizeHtml(previewEditEl.innerHTML));
+    } catch (err) {
+      // turndown 对畸形 DOM 可能抛错；此时保持编辑器原内容不动，避免清空文档
+      console.error("[preview-edit] HTML→markdown 转换失败:", err);
+      status = "预览编辑内容转换失败，已保留原文档内容";
+      return;
+    }
+    // M-02 ①：内容无变化直接跳过。
+    // 旧实现每次退出预览编辑都整篇 setDoc，即使一个字没改也会产生一条
+    // 巨型 undo 记录并把 docDirty 置脏，导致「只是看了一眼就被标记为已修改」。
+    const baseline = view.state.doc.length === source.length ? source : view.state.doc.toString();
+    const d = diffRange(baseline, text);
+    if (!d) return;
+    // M-02 ②：只替换差异区间，撤销历史保持细粒度、光标由 CM 自动映射；
+    // applyExternalEdit 不调用 focus()，避免防抖回写抢走 contenteditable 焦点。
     suppressSave = true;
-    setDoc(view, text);
+    const changed = applyExternalEdit(view, d.from, d.to, d.insert);
     suppressSave = false;
+    if (!changed) {
+      // 基准失配（越界）→ 退回整篇替换兜底，保证内容不丢
+      suppressSave = true;
+      setDoc(view, text);
+      suppressSave = false;
+    }
     source = text;
     docDirty = true; // 预览编辑视为文档变更（自动保存/会话持久化照常）
     queueAutoSave();
     queueSessionSave();
     scheduleStats(text);
     updateTitle();
-  }
-  // ---- 文件树虚拟化：行数超过阈值后只渲染可视区域（固定行高估算 + 上下占位），
-  //      数千文件目录折叠/展开不再全量调和 DOM。小目录维持原样渲染。 ----
-  const TREE_ROW_H = 27;
-  const TREE_VIRTUAL_THRESHOLD = 500;
-  let treeScrollTop = 0;
-  let treeViewportH = 600;
-  $: treeVirtual = flatTree.length > TREE_VIRTUAL_THRESHOLD;
-  $: treeRange = (() => {
-    if (!treeVirtual) return { s: 0, e: flatTree.length, top: 0, bottom: 0 };
-    const s = Math.max(0, Math.floor(treeScrollTop / TREE_ROW_H) - 10);
-    const e = Math.min(flatTree.length, Math.ceil((treeScrollTop + treeViewportH) / TREE_ROW_H) + 10);
-    return { s, e, top: s * TREE_ROW_H, bottom: (flatTree.length - e) * TREE_ROW_H };
-  })();
-  function onTreeScroll(e: Event) {
-    treeScrollTop = (e.currentTarget as HTMLElement).scrollTop;
-  }
-
-  function toggleFolder(path: string) {
-    const next = new Set(collapsed);
-    if (next.has(path)) next.delete(path);
-    else next.add(path);
-    collapsed = next;
-  }
-
-  // ---- 新建文件 / 文件夹（落盘到默认目录并刷新树）----
-  // 若尚未打开文件夹，先弹出选择框让用户选一个，选好后继续新建
-  async function ensureFolder(): Promise<string | null> {
-    if (settings.lastFolder) return settings.lastFolder;
-    const folder = await pickOpenFolder();
-    if (!folder) return null;
-    await loadFolder(folder);
-    return folder;
-  }
-
-  // 新建文件/文件夹后让其在树中可见：
-  // 若位于当前打开文件夹内，仅刷新树；否则把树根切换到新路径。
-  async function revealCreated(usedPath: string) {
-    const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-    const root = settings.lastFolder ? norm(settings.lastFolder) : "";
-    const used = norm(usedPath);
-    if (root && (used === root || used.startsWith(root + "/"))) {
-      await refreshTree();
-    } else {
-      await loadFolder(usedPath);
-    }
-  }
-
-  async function newFileIn(dir: string | null) {
-    const target0 = dir ?? (await ensureFolder());
-    if (!target0) {
-      status = "未选择文件夹，已取消新建";
-      return;
-    }
-    const res = await askPrompt({ title: "新建笔记", label: "笔记名", value: "未命名.md", path: target0 });
-    if (!res || !res.name.trim()) return;
-    const target = res.path.trim() || target0;
-    const fname = /\.md$/i.test(res.name.trim()) ? res.name.trim() : res.name.trim() + ".md";
-    try {
-      await createFile(`${target}/${fname}`);
-      status = "已新建 " + fname;
-      await revealCreated(target);
-      // 新建后直接打开为标签（默认目录即 lastFolder）
-      await openTabByPath(`${target}/${fname}`);
-    } catch (e) {
-      status = "新建失败：" + String(e);
-    }
-  }
-
-  async function newFolderIn(dir: string | null) {
-    const target0 = dir ?? (await ensureFolder());
-    if (!target0) {
-      status = "未选择文件夹，已取消新建";
-      return;
-    }
-    const res = await askPrompt({ title: "新建文件夹", label: "文件夹名", value: "新建文件夹", path: target0 });
-    if (!res || !res.name.trim()) return;
-    const target = res.path.trim() || target0;
-    const fname = res.name.trim();
-    try {
-      await createDir(`${target}/${fname}`);
-      status = "已新建文件夹 " + fname;
-      // 展开父文件夹，让新建的文件夹可见
-      if (collapsed.has(target)) {
-        const next = new Set(collapsed);
-        next.delete(target);
-        collapsed = next;
-      }
-      await revealCreated(target);
-    } catch (e) {
-      status = "新建失败：" + String(e);
-    }
   }
 
   async function save() {
@@ -1910,6 +2015,7 @@ console.log("Hello LiteMD");
     if (tabs[activeIdx]?.loadFailed) {
       // P0 数据安全：该文件打开/载入失败，编辑器内容与磁盘无关联，禁止写盘覆盖原文件
       status = "文件加载失败，已禁止保存（原文件未被修改）";
+      logError("保存被拦截：文件加载失败 " + (currentPath ?? ""));
       return;
     }
     if (!currentPath) return saveAs();
@@ -1936,6 +2042,7 @@ console.log("Hello LiteMD");
       tab.dirty = false;
     }
     status = "已保存 " + basename(currentPath);
+    logOp("保存文件: " + currentPath);
     updateTitle();
     saveSession();
   }
@@ -1964,6 +2071,7 @@ console.log("Hello LiteMD");
       settings.lastFile = np;
       saveSession();
       status = "已保存 " + basename(np);
+      logOp("另存为文件: " + np);
       updateTitle();
       return;
     }
@@ -2002,6 +2110,7 @@ console.log("Hello LiteMD");
     const finalPath = /\.pdf$/i.test(p) ? p : p + ".pdf";
     await exportPdf(finalPath, pullDoc());
     status = "已导出 " + basename(finalPath);
+    logOp("导出PDF: " + finalPath);
   }
 
   async function exportHtmlDoc() {
@@ -2028,11 +2137,28 @@ console.log("Hello LiteMD");
 </style>
 </head>
 <body>
-${m.render(pullDoc())}
+${safeRender(m, pullDoc())}
 </body>
 </html>`;
     await exportHtml(p, full);
     status = "已导出 " + basename(p);
+    logOp("导出HTML: " + p);
+  }
+
+  async function exportBundledMd() {
+    if (!currentPath) {
+      status = "请先保存文件再导出";
+      return;
+    }
+    const baseDir = currentPath.replace(/[\\/][^\\/]+$/, "") || currentPath;
+    const savePath = await pickSaveBundledFile(currentPath);
+    if (!savePath) return; // 用户取消
+    const res = await exportBundledMarkdown(savePath, pullDoc(), baseDir);
+    let msg = `已导出自包含 Markdown（内嵌 ${res.embedded} 张图片）`;
+    if (res.failed > 0) msg += `，${res.failed} 张读取失败已保留原路径`;
+    if (res.skipped > 0) msg += `，${res.skipped} 张为外链/已内嵌跳过`;
+    status = msg;
+    logOp("导出自包含MD: " + savePath);
   }
 
   // ---------- 自动保存 ----------
@@ -2102,7 +2228,18 @@ ${m.render(pullDoc())}
         const h = document.createElement(upper);
         while (origBlock.firstChild) h.appendChild(origBlock.firstChild);
         if (!h.childNodes.length) h.appendChild(document.createTextNode(""));
-        origBlock.replaceWith(h);
+        if (origBlock.tagName === "LI") {
+          // 列表项内设置标题:标题插到列表之后并移除该 LI,
+          // 避免 <h1> 嵌套进 <ul> 产生无效 HTML
+          const parentList = origBlock.parentElement;
+          origBlock.remove();
+          if (parentList) parentList.insertAdjacentElement("afterend", h);
+          else previewEditEl.appendChild(h);
+          // 清理可能变空的 UL/OL
+          if (parentList && !parentList.childNodes.length) parentList.remove();
+        } else {
+          origBlock.replaceWith(h);
+        }
         const s2 = window.getSelection();
         if (s2) {
           const r = document.createRange();
@@ -2128,7 +2265,8 @@ ${m.render(pullDoc())}
         }
       }
       onPreviewEditInput();
-      scrollCaretIntoView(previewEditEl);
+      // 同步 scrollCaretIntoView 可能在 DOM layout 之前执行;用 rAF 推迟一帧
+      requestAnimationFrame(() => scrollCaretIntoView(previewEditEl!));
       return true;
     }
 
@@ -2161,7 +2299,8 @@ ${m.render(pullDoc())}
         bq.replaceWith(frag);
       }
       onPreviewEditInput();
-      scrollCaretIntoView(previewEditEl);
+      // 同步 scrollCaretIntoView 可能在 DOM layout 之前执行;用 rAF 推迟一帧
+      requestAnimationFrame(() => scrollCaretIntoView(previewEditEl!));
       return true;
     }
 
@@ -2191,14 +2330,16 @@ ${m.render(pullDoc())}
         placeCaretAtEnd(li);
         appendContinuationInPreview(li);
         onPreviewEditInput();
-        scrollCaretIntoView(previewEditEl);
+        // 同步 scrollCaretIntoView 可能在 DOM layout 之前执行;用 rAF 推迟一帧
+        requestAnimationFrame(() => scrollCaretIntoView(previewEditEl!));
         return true;
       } else {
         // 已在 li 中:切换 ul↔ol 用 execCommand(行为稳定,因为只在已有 li 上做类型切换)
         const ok = document.execCommand(cmd);
         if (ok) {
           onPreviewEditInput();
-          scrollCaretIntoView(previewEditEl);
+          // 同步 scrollCaretIntoView 可能在 DOM layout 之前执行;用 rAF 推迟一帧
+          requestAnimationFrame(() => scrollCaretIntoView(previewEditEl!));
         }
         return ok;
       }
@@ -2209,7 +2350,8 @@ ${m.render(pullDoc())}
     if (ok) {
       onPreviewEditInput();
       // 同步立即滚动(不等 800ms 防抖)
-      scrollCaretIntoView(previewEditEl);
+      // 同步 scrollCaretIntoView 可能在 DOM layout 之前执行;用 rAF 推迟一帧
+      requestAnimationFrame(() => scrollCaretIntoView(previewEditEl!));
     }
     return ok;
   }
@@ -2248,7 +2390,9 @@ ${m.render(pullDoc())}
       next.appendChild(document.createElement("br"));
     } else {
       next = document.createElement("p");
-      // 不加 <br>:空 <p> 在 turndown 里输出空字符串,与源代码的 \n 对齐
+      // 加 <br> 占位:turndown 输出空 <p> 会丢失源代码中的空行,
+      // 用 <br> 让 turndown 输出空字符串 + 但渲染时空段仍可见
+      next.appendChild(document.createElement("br"));
     }
     // 确认 newNode 真在 root 内
     if (!root.contains(block)) {
@@ -2383,6 +2527,74 @@ ${m.render(pullDoc())}
   }
 
   // ---------- 跨文件查找替换 ----------
+  // ---- M-03：文件夹批量替换与已打开标签的一致性 ----
+  //
+  // 根因：replace_in_folder 直接改磁盘，前端不感知。若被替换的文件正好开着，
+  // 编辑器里的 content/lastSaved 仍是替换前的旧内容 —— 随后任何一次自动保存
+  // 都会把「旧内容」写回磁盘，静默吞掉刚刚的批量替换结果。
+  //
+  // 两道防线：
+  //  ① 替换前：folder 内存在未保存标签就直接拦下（脏内容无法自动合并，
+  //     强行刷新等于丢用户编辑），要求先保存。
+  //  ② 替换后：把 folder 内所有干净标签的内容从磁盘重新拉一次，
+  //     基准（savedContent）一并更新，当前活动标签立即重载到编辑器。
+
+  /** 路径 p 是否位于 folder 之内（大小写不敏感，避免 Windows 盘符/大小写差异漏判） */
+  function isInsideFolder(p: string, folder: string): boolean {
+    const f = norm(folder).toLowerCase().replace(/\/+$/, "");
+    const pp = norm(p).toLowerCase();
+    return pp === f || pp.startsWith(f + "/");
+  }
+
+  /** 返回 folder 内所有「有未保存修改」的标签文件名，供替换前拦截提示 */
+  function dirtyFilesInFolder(folder: string): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < tabs.length; i++) {
+      const t = tabs[i];
+      if (!isInsideFolder(t.path, folder)) continue;
+      // 活动标签的脏状态以编辑器实时状态为准（tab.dirty 只在切换/防抖时同步）
+      const dirty = i === activeIdx ? docDirty || (lastSaved !== null && source !== lastSaved) : t.dirty;
+      if (dirty) out.push(basename(t.path));
+    }
+    return out;
+  }
+
+  /** 批量替换完成：重新拉取 folder 内已打开文件的磁盘内容，消除状态失配 */
+  async function onFolderReplaced(e: CustomEvent<{ folder: string }>) {
+    const folder = e.detail?.folder;
+    if (!folder) return;
+    let refreshed = 0;
+    let activeNeedsReload = false;
+    for (let i = 0; i < tabs.length; i++) {
+      const t = tabs[i];
+      if (!isInsideFolder(t.path, folder)) continue;
+      if (t.deferred) continue; // 尚未载入的延迟标签，下次打开时自然读到新内容
+      try {
+        const fresh = await readFile(t.path);
+        const before = i === activeIdx ? source : t.content;
+        if (fresh === before) continue;
+        t.content = fresh;
+        t.savedContent = fresh;
+        t.dirty = false;
+        t.loadFailed = false;
+        refreshed++;
+        if (i === activeIdx) activeNeedsReload = true;
+      } catch {
+        // 单个文件读失败不影响其余标签（可能被外部移动/占用）
+      }
+    }
+    if (!refreshed) return;
+    tabs = tabs;
+    if (activeNeedsReload && tabs[activeIdx]) {
+      // 重载活动标签：applyTabState 内部已用 suppressSave 包裹，不会触发回写
+      await applyTabState(tabs[activeIdx]);
+      docDirty = false;
+    }
+    updateTitle();
+    saveSession();
+    status = `批量替换完成，已同步 ${refreshed} 个已打开文件`;
+  }
+
   function openFolderSearch() {
     if (!settings.lastFolder) {
       status = "请先打开文件夹再使用文件夹内查找";
@@ -2418,11 +2630,35 @@ ${m.render(pullDoc())}
 
   // 统一插图：当前笔记有目录则收编（可选压缩）用相对引用；否则用绝对路径。
   // 返回 { ref: markdown 引用, abs: 磁盘绝对路径 }；预览编辑插图与编辑器插图共用
+  /**
+   * m-08：解析笔记目录基准。
+   * currentPath 在 applyTabState 切换的瞬时空窗期可能为 null，此时旧实现直接回退
+   * 绝对路径，导致图片以 `C:\...` 形式写进 markdown（换机器/移动笔记即失效）。
+   * 这里补一层兜底：优先当前标签，其次活动标签记录的路径，最后才放弃收编。
+   */
+  function noteBaseDir(): string | null {
+    if (currentPath) return dirname(currentPath);
+    const t = tabs[activeIdx];
+    if (t?.path) return dirname(t.path);
+    return null;
+  }
+  /** 当前正在编辑的 .md 路径（优先 currentPath，其次活动标签） */
+  function currentMdPath(): string | null {
+    if (currentPath) return currentPath;
+    const t = tabs[activeIdx];
+    return t?.path ?? null;
+  }
+  /** 当前 .md 对应的附件目录【名】（如 测试_attachment），用于插图/尺寸索引 */
+  function currentAttachmentName(): string {
+    const mp = currentMdPath();
+    return mp ? attachmentDirName(mp, settings) : settings.assetsDir;
+  }
   async function resolveImageRef(p: string): Promise<{ ref: string; abs: string }> {
-    if (currentPath) {
+    const base = noteBaseDir();
+    if (base) {
       try {
-        const ref = await importAsset(p, dirname(currentPath), settings.assetsDir, settings.compressImages, settings.jpegQuality);
-        return { ref, abs: dirname(currentPath) + "/" + ref };
+        const ref = await importAsset(p, base, currentAttachmentName(), settings.compressImages, settings.jpegQuality);
+        return { ref, abs: base + "/" + ref };
       } catch {
         // 收编失败回退绝对路径
       }
@@ -2433,17 +2669,28 @@ ${m.render(pullDoc())}
     if (!view) return;
     const r = await resolveImageRef(p);
     insertImage(view, r.ref);
-    status = r.ref === p ? "已插入图片 " + basename(p) : "图片已收编 " + basename(r.ref);
+    if (r.ref === p && !noteBaseDir()) {
+      // 明确告知：未保存的笔记无法收编附件，引用为绝对路径，移动笔记后会失效
+      status = "已插入图片（绝对路径）：请先保存笔记再插入以自动收编为相对路径";
+    } else {
+      status = r.ref === p ? "已插入图片 " + basename(p) : "图片已收编 " + basename(r.ref);
+    }
   }
 
   // 字节数组转 base64（分块处理，避免大图调用栈溢出）
+  // m-03：原实现用 fromCharCode(...subarray) 展开参数，虽已按 0x8000 分块，
+  // 但「单次调用实参个数」受引擎栈帧限制，各版本 WebView2 阈值不一致。
+  // 改为逐字节拼接后按块 flush：无参数展开、无栈风险，吞吐差异可忽略。
   function uint8ToBase64(bytes: Uint8Array): string {
-    let bin = "";
+    const parts: string[] = [];
     const chunk = 0x8000;
     for (let i = 0; i < bytes.length; i += chunk) {
-      bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      const end = Math.min(i + chunk, bytes.length);
+      let bin = "";
+      for (let j = i; j < end; j++) bin += String.fromCharCode(bytes[j]);
+      parts.push(bin);
     }
-    return btoa(bin);
+    return btoa(parts.join(""));
   }
 
   // 粘贴图片：读取剪贴板图片，收编并插入相对引用（仅已保存笔记可用）
@@ -2455,16 +2702,21 @@ ${m.render(pullDoc())}
     compress: boolean,
     quality: number
   ): Promise<string> {
+    const attName = currentAttachmentName();
     try {
-      return await importAssetRaw(dirname(currentPath!), settings.assetsDir, ext, bytes, compress, quality);
+      return await importAssetRaw(dirname(currentPath!), attName, ext, bytes, compress, quality);
     } catch {
       const b64 = uint8ToBase64(bytes);
-      return importAssetBytes(dirname(currentPath!), settings.assetsDir, ext, b64, compress, quality);
+      return importAssetBytes(dirname(currentPath!), attName, ext, b64, compress, quality);
     }
   }
   // 粘贴/拖拽图片收编：返回 { ref, abs }；未保存笔记返回 null（需要目录基准）
   async function assetFromImageFile(file: File): Promise<{ ref: string; abs: string } | null> {
-    if (!currentPath) {
+    // m-08：开头就把基准目录快照下来。函数体内有多个 await（Worker 转码 / IPC 传输），
+    // 期间用户可能切换标签使 currentPath 变化，若继续读 currentPath 会把图片
+    // 收编到「另一篇笔记」的附件目录，产生跨笔记的坏引用。
+    const base = noteBaseDir();
+    if (!base) {
       status = "请先保存笔记，再插入图片";
       return null;
     }
@@ -2488,8 +2740,8 @@ ${m.render(pullDoc())}
         // raw IPC 直传数百 KB 字节，免 base64 编码（失败自动回退 base64）
         rel = await sendAssetBytes(res.format, res.bytes, false, settings.jpegQuality);
         // 记录并 best-effort 落盘图片尺寸，供预览渲染规则注入 width/height 预留空间（P1-5）
-        setDims(dirname(currentPath), rel, res.width, res.height);
-        void saveDims(dirname(currentPath), settings.assetsDir);
+        setDims(base, rel, res.width, res.height);
+        void saveDims(base, currentAttachmentName());
       } else {
         // 回退：旧 WebView / 无 Worker 环境；raw IPC 直传原图字节，
         // 免主线程 uint8ToBase64（10MB 图约 200~280ms 同步阻塞）
@@ -2499,7 +2751,7 @@ ${m.render(pullDoc())}
       if (typeof console !== "undefined") {
         console.debug("[img] 主线程阻塞", (performance.now() - t0).toFixed(1), "ms");
       }
-      return { ref: rel, abs: dirname(currentPath) + "/" + rel };
+      return { ref: rel, abs: base + "/" + rel };
     } catch (e) {
       status = "图片收编失败：" + String(e);
       return null;
@@ -2532,7 +2784,9 @@ ${m.render(pullDoc())}
   }
 
   // 迁移单篇内容：把绝对路径图片收编到该笔记目录下的附件文件夹，改写为相对引用
-  async function migrateNoteContent(text: string, dir: string): Promise<{ text: string; count: number; failed: number }> {
+  async function migrateNoteContent(text: string, mdPath: string): Promise<{ text: string; count: number; failed: number }> {
+    const dir = dirname(mdPath);
+    const attName = attachmentDirName(mdPath, settings);
     const imgRe = /!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)\)/g;
     const jobs: { full: string; alt: string; src: string }[] = [];
     let m: RegExpExecArray | null;
@@ -2549,7 +2803,7 @@ ${m.render(pullDoc())}
     let failed = 0;
     for (const job of jobs) {
       try {
-        const rel = await importAsset(job.src, dir, settings.assetsDir, settings.compressImages, settings.jpegQuality);
+        const rel = await importAsset(job.src, dir, attName, settings.compressImages, settings.jpegQuality);
         next = next.replace(job.full, `![${job.alt}](${rel})`);
         count++;
       } catch {
@@ -2565,7 +2819,7 @@ ${m.render(pullDoc())}
       status = "请先打开并保存一篇笔记再迁移";
       return;
     }
-    const res = await migrateNoteContent(source, dirname(currentPath));
+    const res = await migrateNoteContent(source, currentPath);
     if (res.count === 0 && res.failed === 0) {
       status = "没有需要迁移的绝对路径图片";
       return;
@@ -2625,7 +2879,7 @@ ${m.render(pullDoc())}
         for (const f of files) {
           try {
             const content = await readFile(f);
-            const res = await migrateNoteContent(content, dirname(f));
+            const res = await migrateNoteContent(content, f);
             totalFailed += res.failed;
             if (res.count > 0) {
               await writeFile(f, res.text);
@@ -2732,7 +2986,7 @@ ${m.render(pullDoc())}
       return;
     }
 
-    if (hit("file.new")) run(e, () => newFileIn(settings.lastFolder));
+    if (hit("file.new")) run(e, () => treeRef?.requestNewFile());
     else if (hit("file.open")) run(e, openFile);
     else if (hit("file.openFolder")) run(e, openFolder);
     else if (hit("file.save")) run(e, save);
@@ -2768,9 +3022,31 @@ ${m.render(pullDoc())}
   }
 
   // ---- 关闭流程（未保存确认）----
+  async function saveAllBeforeExit(): Promise<void> {
+    logInfo("正在保存所有文件...");
+    // 关键修复：关闭前同步保存会话 + 设置，避免「正常启动打开过 A.md 关闭后下次启动
+    // 会话丢失」的回归。persist() 有 300ms debounce，Alt+F4 会在 debounce 没到时间
+    // 就关窗口，导致 settings.openTabs / lastFile 没写盘。
+    const cur = tabs[activeIdx];
+    if (cur && !cur.deferred && !cur.loadFailed) syncTabState(cur);
+    saveSession();
+    try {
+      await saveSettings(settings);
+    } catch {
+      // Tauri save 失败：至少把设置写 localStorage 兜底（下次 Tauri 读失败时回退）
+      try { localStorage.setItem("litemd.settings", JSON.stringify(settings)); } catch { /* ignore */ }
+    }
+  }
   function doClose() {
-    if (tauriWindow) (tauriWindow as any).destroy().catch(() => window.close());
-    else window.close();
+    logInfo("LiteMD 关闭");
+    // saveAllBeforeExit 是异步 IPC（settings.json 写盘），需要先启动写操作
+    // 再销毁窗口。destroy() 在 Windows 上很快，所以 Promise 不 await。
+    // 如果 destroy() 已经执行完但 save 还没落地，就靠 localStorage 兜底。
+    void saveAllBeforeExit();
+    setTimeout(() => {
+      if (tauriWindow) (tauriWindow as any).destroy().catch(() => window.close());
+      else window.close();
+    }, 80);
   }
 
   // 窗口关闭：任一标签未保存 → 三按钮对话框（保存全部并退出 / 直接退出 / 取消）
@@ -2900,6 +3176,9 @@ ${m.render(pullDoc())}
           <div on:click={() => { menuOpen = false; exportHtmlDoc(); }}>
             导出 HTML <span>{accel("file.export")}</span>
           </div>
+          <div on:click={() => { menuOpen = false; exportBundledMd(); }}>
+            导出自包含 MD（图片内嵌）<span>单文件</span>
+          </div>
           <div class="sep-line" />
           <div on:click={() => { menuOpen = false; openFolderSearch(); }}>
             文件夹内查找替换 <span>Ctrl + Shift + F</span>
@@ -2912,7 +3191,7 @@ ${m.render(pullDoc())}
             批量迁移文件夹图片 <span>递归</span>
           </div>
           <div on:click={() => { menuOpen = false; doCleanupAssets(); }}>
-            清理未引用附件 <span>{settings.assetsDir}/</span>
+            清理未引用附件 <span>{settings.attachmentMode === "shared" ? settings.assetsDir + "/" : "按文档目录"}</span>
           </div>
           <div class="sep-line" />
           <div on:click={() => { menuOpen = false; showSettings = true; }}>
@@ -2986,26 +3265,34 @@ ${m.render(pullDoc())}
 
   <div class="body">
     {#if showTree}
-            <FileTree
-        flatTree={flatTree}
+      <FileTree
+        bind:this={treeRef}
+        store={treeStore}
         {sidebarWidth}
         {currentPath}
-        {norm}
-        lastFolder={settings.lastFolder}
+        defaultDir={settings.lastFolder}
         hiddenPaths={settings.hiddenPaths}
-        {treeRange}
-        {treeVirtual}
-        {treeViewportH}
-        {showHiddenManage}
-        on:scroll={(e) => onTreeScroll(e.detail)}
-        on:newfile={(e) => newFileIn(e.detail)}
-        on:newfolder={(e) => newFolderIn(e.detail)}
-        on:refresh={() => refreshTree()}
-        on:toggleHidden={() => (showHiddenManage = !showHiddenManage)}
+        hideAttachments={settings.hideAttachments}
+        assetsDir={settings.assetsDir}
+        attachmentMode={settings.attachmentMode}
+        attachmentTemplate={settings.attachmentTemplate}
+        handlers={{
+          openFile: openFileByPathSafe,
+          setStatus: (m) => (status = m),
+          confirm: askConfirm,
+          prompt: askPrompt,
+          pickFolder: () => pickOpenFolder(),
+          onTabRenamed: updateTabPath,
+          onTabRemoved: (p) => requestCloseTab(p),
+          setHiddenPaths: (paths) => {
+            settings.hiddenPaths = paths;
+            persist();
+          },
+          setTreePrefs: onTreePrefsChange,
+          onRootsChanged: onTreeRootsChanged,
+          checkPathExists: (p) => pathExists(p),
+        }}
         on:collapse={() => (showTree = false)}
-        on:togglefolder={(e) => toggleFolder(e.detail)}
-        on:openfile={(e) => openFileByPath(e.detail)}
-        on:ctx={(e) => openCtx(e.detail.e, e.detail.kind, e.detail.path, e.detail.name)}
       />
       <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="splitter" on:mousedown={(e) => startDrag("sidebar", e)} title="拖动调整宽度" />
@@ -3023,7 +3310,7 @@ ${m.render(pullDoc())}
                 on:click={() => activateTab(i)}
                 on:contextmenu|preventDefault={(e) => {
                   // 右键标签：显示操作菜单（关闭/关闭其他/关闭全部）
-                  ctxMenu = { x: e.clientX, y: e.clientY, kind: "tab", path: tab.path, name: basename(tab.path) };
+                  ctxMenu = { x: e.clientX, y: e.clientY, path: tab.path, name: basename(tab.path) };
                 }}
                 title={tab.path}
               >
@@ -3131,6 +3418,7 @@ ${m.render(pullDoc())}
     chars={stats.chars}
     autoSave={settings.autoSave}
     fontSize={settings.fontSize}
+    previewNotice={previewDisabledNotice}
   />
 
   <!-- 行内快捷菜单（gutter 按钮弹出）-->
@@ -3164,6 +3452,24 @@ ${m.render(pullDoc())}
     <!-- svelte-ignore a11y-no-static-element-interactions -->
     <div class="rh {cls}" on:mousedown={() => winResize(dir)} />
   {/each}
+
+  <!-- 全局操作反馈 Toast（成功/失败/提示，自动消失） -->
+  <Toast />
+
+  <!-- 全局致命错误兜底：避免未捕获异常导致白屏 -->
+  {#if fatalError}
+    <div class="fatal-overlay" role="alertdialog" aria-modal="true">
+      <div class="fatal-card">
+        <div class="fatal-title">😵 出错了</div>
+        <div class="fatal-msg">{fatalError.msg}</div>
+        <pre class="fatal-stack">{fatalError.stack}</pre>
+        <div class="fatal-actions">
+          <button on:click={copyFatalLog}>复制错误信息</button>
+          <button class="primary" on:click={() => location.reload()}>重启应用</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 {#if showSettings && modalCmps.SettingsModal}
@@ -3175,7 +3481,7 @@ ${m.render(pullDoc())}
     on:close={() => (showSettings = false)}
     on:pickFolder={async () => {
       const f = await pickOpenFolder();
-      if (f) await loadFolder(f);
+      if (f) await loadFolderIntoTree(f);
     }}
     on:export={() => {
       showSettings = false;
@@ -3188,8 +3494,10 @@ ${m.render(pullDoc())}
   <svelte:component
     this={modalCmps.FolderSearch}
     folder={settings.lastFolder}
+    dirtyFilesIn={dirtyFilesInFolder}
     on:close={() => (showFolderSearch = false)}
     on:open={gotoSearchResult}
+    on:replaced={onFolderReplaced}
   />
 {/if}
 
@@ -3284,51 +3592,74 @@ ${m.render(pullDoc())}
       on:contextmenu|preventDefault|stopPropagation
     >
       <div class="ctx-title" title={ctxMenu.path}>{ctxMenu.name}</div>
-      {#if ctxMenu.kind === "tab"}
-        <button class="ctx-item" on:click={ctxCloseTab}>✕ 关闭标签</button>
-        <button class="ctx-item" on:click={ctxCloseOthers}>✕ 关闭其他标签</button>
-        <button class="ctx-item" on:click={ctxCloseAll}>✕ 关闭全部标签</button>
-      {:else if ctxMenu.kind === "folder"}
-        <button class="ctx-item" on:click={ctxNewFile}>📄 新建笔记</button>
-        <button class="ctx-item" on:click={ctxNewFolder}>📁 新建文件夹</button>
-        <div class="ctx-sep" />
-      {:else}
-        <button class="ctx-item" on:click={ctxOpen}>📂 打开</button>
-        <div class="ctx-sep" />
-      {/if}
-      <button class="ctx-item" on:click={ctxCopy}>📋 复制到…</button>
-      <button class="ctx-item" on:click={ctxMove}>➡ 移动到…</button>
-      <div class="ctx-sep" />
-      <button class="ctx-item" on:click={ctxHide}>🙈 隐藏</button>
-      <div class="ctx-sep" />
-      <button class="ctx-item danger" on:click={ctxDelete}>🗑 删除</button>
+      <button class="ctx-item" on:click={ctxCloseTab}>✕ 关闭标签</button>
+      <button class="ctx-item" on:click={ctxCloseOthers}>✕ 关闭其他标签</button>
+      <button class="ctx-item" on:click={ctxCloseAll}>✕ 关闭全部标签</button>
     </div>
   </div>
 {/if}
 
-<!-- 隐藏文件/文件夹管理弹窗 -->
-{#if showHiddenManage}
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <div class="hm-mask" on:click={() => (showHiddenManage = false)}>
+<!-- 快捷键示意图（首次启动） -->
+{#if showShortcutGuide}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="kg-mask" on:click={closeShortcutGuide}>
     <!-- svelte-ignore a11y-click-events-have-key-events -->
-    <div class="hm-pop" on:click|stopPropagation>
-      <div class="hm-title">隐藏文件 / 文件夹管理</div>
-      {#if settings.hiddenPaths.length === 0}
-        <div class="hm-empty">暂无隐藏项。
-在文件树中右键文件或文件夹，选择「🙈 隐藏」即可隐藏。</div>
-      {:else}
-        <div class="hm-list">
-          {#each settings.hiddenPaths as hp}
-            <div class="hm-row">
-              <span class="hm-path" title={hp}>{hp}</span>
-              <button class="hm-unhide" on:click={() => unhidePath(hp)}>取消隐藏</button>
-            </div>
-          {/each}
+    <div class="kg-dialog" on:click|stopPropagation>
+      <button class="kg-close" on:click={closeShortcutGuide} title="关闭">✕</button>
+      <div class="kg-title">LiteMD 快捷键指南</div>
+      <div class="kb-wrap">
+        <div class="kb-section">
+          <div class="kb-section-title">文件</div>
+          <div class="kb-rows">
+            <kbd>Ctrl</kbd>+<kbd>N</kbd> <span>新建笔记</span>
+            <kbd>Ctrl</kbd>+<kbd>O</kbd> <span>打开文件</span>
+            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> <span>打开文件夹</span>
+            <kbd>Ctrl</kbd>+<kbd>S</kbd> <span>保存</span>
+            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> <span>另存为</span>
+            <kbd>Ctrl</kbd>+<kbd>E</kbd> <span>导出 PDF</span>
+          </div>
         </div>
-      {/if}
-      <div class="hm-actions">
-        <button class="cm-btn hm-close" on:click={() => (showHiddenManage = false)}>关闭</button>
+        <div class="kb-section">
+          <div class="kb-section-title">编辑</div>
+          <div class="kb-rows">
+            <kbd>Ctrl</kbd>+<kbd>Z</kbd> <span>撤销</span>
+            <kbd>Ctrl</kbd>+<kbd>Y</kbd> <span>重做</span>
+            <kbd>Ctrl</kbd>+<kbd>F</kbd> <span>查找</span>
+            <kbd>Ctrl</kbd>+<kbd>H</kbd> <span>替换</span>
+          </div>
+        </div>
+        <div class="kb-section">
+          <div class="kb-section-title">格式</div>
+          <div class="kb-rows">
+            <kbd>Alt</kbd>+<kbd>B</kbd> <span>加粗</span>
+            <kbd>Ctrl</kbd>+<kbd>I</kbd> <span>斜体</span>
+            <kbd>Ctrl</kbd>+<kbd>U</kbd> <span>下划线</span>
+            <kbd>Ctrl</kbd>+<kbd>K</kbd> <span>插入链接</span>
+            <kbd>Alt</kbd>+<kbd>1</kbd>~<kbd>5</kbd> <span>一~五级标题</span>
+            <kbd>Alt</kbd>+<kbd>&gt;</kbd> <span>引用</span>
+          </div>
+        </div>
+        <div class="kb-section">
+          <div class="kb-section-title">插入</div>
+          <div class="kb-rows">
+            <kbd>Alt</kbd>+<kbd>Q</kbd> <span>插入图片</span>
+            <kbd>Alt</kbd>+<kbd>W</kbd> <span>代码块</span>
+            <kbd>Alt</kbd>+<kbd>E</kbd> <span>插入表格</span>
+            <kbd>Alt</kbd>+<kbd>`</kbd> <span>无序列表</span>
+          </div>
+        </div>
+        <div class="kb-section">
+          <div class="kb-section-title">视图</div>
+          <div class="kb-rows">
+            <kbd>Ctrl</kbd>+<kbd>\</kbd> <span>切换预览/分屏</span>
+            <kbd>F11</kbd> <span>专注模式</span>
+            <kbd>Ctrl</kbd>+<kbd>=</kbd> <span>增大字号</span>
+            <kbd>Ctrl</kbd>+<kbd>-</kbd> <span>减小字号</span>
+          </div>
+        </div>
       </div>
+      <div class="kb-hint">可在 设置 → 快捷键 中自定义键位</div>
     </div>
   </div>
 {/if}
+

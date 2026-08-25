@@ -112,8 +112,8 @@ export function scrollCaretIntoView(root: HTMLElement): void {
     }
     const maxScroll = Math.max(0, root.scrollHeight - root.clientHeight);
     target = Math.max(0, Math.min(target, maxScroll));
-    // clamp 到合法区间后赋值；只有变化量 > 1px 才真正设置（避免反复触发 reflow）
-    if (Math.abs(target - root.scrollTop) > 1) {
+    // clamp 到合法区间后赋值；变化量 > 0.5px 才真正设置（高 DPI 屏仍能触发小距离滚动）
+    if (Math.abs(target - root.scrollTop) > 0.5) {
       root.scrollTop = target;
     }
   } catch {
@@ -428,10 +428,14 @@ export function attachPreviewEditKeys(root: HTMLElement, opts: PreviewEditKeyOpt
       let h: Element | null = /^H[1-6]$/.test(tag)
         ? closestUp(getSelNode(), root, (el) => /^H[1-6]$/.test(el.tagName))
         : null;
-      if (/^H[1-6]$/.test(tag) && !h && block && block.parentNode &&
-          block.tagName.toLowerCase() !== tag) {
+      if (/^H[1-6]$/.test(tag) && !h && block && block.parentNode) {
+        // 兜底:execCommand 把 block 改过了(tagName 可能仍是 P 或变成别的),
+        // 不能直接用 block.firstChild(可能已被 execCommand 清空/变形)。
+        // 安全做法:克隆原 block 的 innerHTML 到新 h,避免内容丢失
         h = document.createElement(tag);
-        while (block.firstChild) h.appendChild(block.firstChild);
+        const innerHTML = (block as HTMLElement).innerHTML;
+        h.innerHTML = innerHTML;
+        // 兜底空内容:占一个空文本节点,确保光标可见
         if (!h.childNodes.length) h.appendChild(document.createTextNode(""));
         block.replaceWith(h);
         const sel = window.getSelection();

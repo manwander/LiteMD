@@ -1,6 +1,6 @@
 [package]
 name = "litemd"
-version = "1.1.0"
+version = "2.0.0"
 description = "LiteMD - 超轻量 Markdown 编辑器"
 authors = ["LiteMD"]
 edition = "2021"
@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
+tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
@@ -29,6 +29,10 @@ pulldown-cmark = "0.12"
 printpdf = "0.6"
 # 测量文本宽度做换行（printpdf 同款字体解析器）
 owned_ttf_parser = "0.21"
+# 删除走系统回收站（可恢复）。默认永久删除属不可逆数据风险，见 delete_path 注释
+trash = "5"
+# 目录监视：外部增删改自动刷新文件树（FEAT-2）；失败时前端回退「窗口激活时刷新」
+notify = "6"
 
 [profile.release]
 panic = "abort"

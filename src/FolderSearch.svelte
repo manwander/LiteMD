@@ -6,10 +6,17 @@
   import ConfirmModal from "./ConfirmModal.svelte";
 
   export let folder: string;
+  /**
+   * 由父级注入：返回 folder 内「有未保存修改」的文件名列表。
+   * M-03 防线①——脏标签存在时禁止批量替换，否则替换后无论刷新与否都会丢数据。
+   */
+  export let dirtyFilesIn: (folder: string) => string[] = () => [];
 
   const dispatch = createEventDispatcher<{
     close: void;
     open: { path: string; line: number };
+    /** 批量替换成功，通知父级重新同步已打开标签（M-03 防线②） */
+    replaced: { folder: string };
   }>();
 
   let query = "";
@@ -57,6 +64,17 @@
       message = "请输入查找内容";
       return;
     }
+    // M-03 防线①：folder 内有未保存的标签时禁止替换。
+    // 替换会直接改磁盘，而内存里的脏内容既不能被覆盖（丢用户编辑）
+    // 也不能覆盖磁盘（吞掉替换结果），唯一安全解是让用户先保存。
+    const dirty = dirtyFilesIn(folder);
+    if (dirty.length) {
+      const shown = dirty.slice(0, 5).join("、");
+      message = `有 ${dirty.length} 个已打开文件未保存（${shown}${
+        dirty.length > 5 ? " 等" : ""
+      }），请先保存（Ctrl+S）后再批量替换`;
+      return;
+    }
     confirmReplace = true;
   }
 
@@ -67,6 +85,8 @@
     try {
       const res = await replaceInFolder(folder, query, replacement, caseSensitive);
       message = `已替换 ${res.count} 处（${res.filesChanged} 个文件）`;
+      // M-03 防线②：磁盘已变，通知父级重新拉取已打开标签的内容
+      if (res.filesChanged > 0) dispatch("replaced", { folder });
       await doSearch(); // 替换后刷新结果
     } catch (e) {
       message = "替换失败：" + String(e);

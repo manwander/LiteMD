@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    LiteMD icon — refined bold "M" with setext H1 underline (===).
+    M has a proper bottom valley (V tip at 512,588, 60px above baseline 648).
+    Constructed as two filled pentagons (left/right halves) meeting at V_tip.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#16B894"/>
+      <stop offset="1" stop-color="#0B5E4A"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.28" cy="0.16" r="0.85">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="clip">
+      <rect x="0" y="0" width="1024" height="1024" rx="225" ry="225"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#clip)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#sheen)"/>
+  </g>
+
+  <g fill="#ffffff">
+    <!-- Left half: left vertical + left V-wedge, V tip at (512,588) -->
+    <polygon points="252,288 380,288 512,588 380,648 252,648"/>
+    <!-- Right half (mirror) -->
+    <polygon points="772,288 644,288 512,588 644,648 772,648"/>
+  </g>
+
+  <!-- Setext H1 underline (===) -->
+  <rect x="282" y="703" width="460" height="34" rx="17" ry="17" fill="#ffffff"/>
+</svg>

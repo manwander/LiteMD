@@ -335,6 +335,13 @@
     stopIdlePrerender();
   }
 
+  // 对外：内存压力解除后主动恢复预渲染（UX-2）。
+  // pauseIdlePrerender 依赖「下一次滚动」重新排队，用户若不滚动就一直停在降级态；
+  // 内存自愈退出时显式调用这里立即重建队列，无需等待用户操作。
+  export function resumeIdlePrerender() {
+    buildIdleQueue();
+  }
+
   // 内存压力自愈（P0）：外部检测到堆超限时清空块 HTML 缓存；已挂载块的实测高度
   // （realHeights）不受影响，滚动条不跳变；后续渲染按需重建并入 LRU。
   export function clearCache() {

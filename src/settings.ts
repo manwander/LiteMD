@@ -2,7 +2,7 @@
 // 纯数据模块（无 Tauri 依赖）：持久化经由 ./settings-store.ts 桥接。
 import type { SettingsBridge } from "./settings-store";
 
-export type ThemeName = "light" | "dark";
+export type ThemeName = "light" | "dark" | "auto";
 
 export interface Settings {
   /** 主题 */
@@ -21,12 +21,28 @@ export interface Settings {
   showPreview: boolean;
   /** 上次打开的文件夹（重启后自动恢复目录树） */
   lastFolder: string | null;
+  /** 多根工作区：文件树根目录列表（懒加载）；为空时回退到 lastFolder 作为唯一根 */
+  roots: string[];
   /** 上次打开的文件（重启后自动恢复内容） */
   lastFile: string | null;
   /** 会话恢复：上次打开的所有标签路径（保持关闭时顺序，第一个为激活标签） */
   openTabs: string[];
   /** 隐藏的文件/文件夹路径（文件树不显示，可管理取消隐藏） */
   hiddenPaths: string[];
+  /** 文件树排序方式（name/mtime/size/type，文件夹恒在前） */
+  treeSort: "name" | "mtime" | "size" | "type";
+  /** 已折叠的文件夹路径（相对各根的绝对路径；上限 500 条，超出丢最旧） */
+  treeCollapsed: string[];
+  /** 文件树是否显示非 .md 附件/资源文件 */
+  showNonMd: boolean;
+  /** 文件树是否隐藏附件文件夹（perDocument 模式为 `<文档名>_attachment`，shared 模式为 assetsDir；磁盘仍保留） */
+  hideAttachments: boolean;
+  /** 附件组织模式：perDocument=每篇文档带自己的 `<文档名>_attachment`；shared=统一收编进 assetsDir */
+  attachmentMode: "perDocument" | "shared";
+  /** perDocument 模式下，附件目录名模板，{filename} 会被替换为文档名（去扩展名） */
+  attachmentTemplate: string;
+  /** 文件树目录监视开关（外部变更自动刷新） */
+  treeWatch: boolean;
   /** 最近打开的文件（最多 5 个，新的在前） */
   recentFiles: string[];
   /** 附件文件夹名（插图时自动收编到笔记目录下的该文件夹） */
@@ -41,6 +57,8 @@ export interface Settings {
   lowEndMode: "auto" | "on" | "off";
   /** 快捷键：actionId -> 加速键字符串 */
   shortcuts: Record<string, string>;
+  /** 是否已显示过快捷键示意图（首次启动后置 false） */
+  shortcutGuideShown: boolean;
 }
 
 // ---------------- 快捷键注册表（对齐 MarkLite-快捷键设置-spec.md）----------------
@@ -173,16 +191,25 @@ export const DEFAULT_SETTINGS: Settings = {
   showTree: true,
   showPreview: true,
   lastFolder: null,
+  roots: [],
   lastFile: null,
   openTabs: [],
   hiddenPaths: [],
+  treeSort: "name",
+  treeCollapsed: [],
+  showNonMd: false,
+  hideAttachments: true,
+  attachmentMode: "perDocument",
+  attachmentTemplate: "{filename}_attachment",
+  treeWatch: true,
   recentFiles: [],
-  assetsDir: "assets",
+  assetsDir: "_attachment",
   compressImages: true,
   jpegQuality: 80,
   previewRealtimeMaxKB: 2048,
   lowEndMode: "auto",
   shortcuts: { ...DEFAULT_SHORTCUTS },
+  shortcutGuideShown: false,
 };
 
 export const FONT_SIZE_MIN = 11;
@@ -380,7 +407,7 @@ function sanitize(raw: unknown): Settings {
   }
   const fontSize = Number(s.fontSize);
   return {
-    theme: s.theme === "dark" ? "dark" : "light",
+    theme: s.theme === "dark" || s.theme === "auto" ? (s.theme as ThemeName) : "light",
     fontSize: Number.isFinite(fontSize)
       ? Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round(fontSize)))
       : DEFAULT_SETTINGS.fontSize,
@@ -400,10 +427,28 @@ function sanitize(raw: unknown): Settings {
     hiddenPaths: Array.isArray(s.hiddenPaths)
       ? s.hiddenPaths.filter((p): p is string => typeof p === "string" && !!p)
       : [],
+    treeSort:
+      s.treeSort === "mtime" || s.treeSort === "size" || s.treeSort === "type"
+        ? s.treeSort
+        : "name",
+    treeCollapsed: Array.isArray(s.treeCollapsed)
+      ? s.treeCollapsed.filter((p): p is string => typeof p === "string" && !!p).slice(0, 500)
+      : [],
+    showNonMd: s.showNonMd === true,
+    hideAttachments: s.hideAttachments !== false,
+    treeWatch: s.treeWatch !== false,
+    roots: Array.isArray(s.roots)
+      ? s.roots.filter((p): p is string => typeof p === "string" && !!p)
+      : [],
     recentFiles: Array.isArray(s.recentFiles)
       ? s.recentFiles.filter((f): f is string => typeof f === "string").slice(0, 5)
       : [],
     assetsDir: sanitizeAssetsDir(s.assetsDir),
+    attachmentMode: s.attachmentMode === "shared" ? "shared" : "perDocument",
+    attachmentTemplate:
+      typeof s.attachmentTemplate === "string" && s.attachmentTemplate.trim().length > 0
+        ? s.attachmentTemplate.trim()
+        : "{filename}_attachment",
     compressImages: s.compressImages !== false,
     jpegQuality:
       Number.isFinite(Number(s.jpegQuality))
@@ -416,6 +461,7 @@ function sanitize(raw: unknown): Settings {
     lowEndMode:
       s.lowEndMode === "on" || s.lowEndMode === "off" ? s.lowEndMode : "auto",
     shortcuts,
+    shortcutGuideShown: s.shortcutGuideShown === true,
   };
 }
 

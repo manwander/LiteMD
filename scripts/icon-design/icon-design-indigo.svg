@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    LiteMD icon v2 — "Vivid Gradient · Subtle Gloss"
+    Keeps the M + === (Markdown setext) brand mark, modernized:
+    - deep-space diagonal gradient (bright indigo → indigo → near-black violet)
+    - soft top-left glass gloss
+    - friendlier rounded M (capsule stems, round joins)
+    - === as three rounded pills
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B6BFF"/>
+      <stop offset="0.5" stop-color="#2E2FA0"/>
+      <stop offset="1" stop-color="#14123F"/>
+    </linearGradient>
+    <radialGradient id="gloss" cx="0.32" cy="0.16" r="0.95">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="depth" cx="0.5" cy="1.05" r="0.75">
+      <stop offset="0" stop-color="#0A0A2E" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#0A0A2E" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="clip">
+      <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#clip)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#gloss)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#depth)"/>
+
+    <!-- M mark: capsule stems + round center V -->
+    <path d="M256 676 L256 316 L512 616 L768 316 L768 676"
+          fill="none" stroke="#ffffff" stroke-width="118"
+          stroke-linejoin="round" stroke-linecap="round"/>
+
+    <!-- === underline as three rounded pills -->
+    <g fill="#ffffff">
+      <rect x="293" y="728" width="130" height="38" rx="19" ry="19"/>
+      <rect x="447" y="728" width="130" height="38" rx="19" ry="19"/>
+      <rect x="601" y="728" width="130" height="38" rx="19" ry="19"/>
+    </g>
+  </g>
+</svg>

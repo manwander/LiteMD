@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    LiteMD icon v5.1 — "White Raised Plate · Indigo Glow Ring · Sharp Mark"
+    White background as a softly raised plate:
+    - bottom cast shadow for lift
+    - radial body gradient: bright center, DEEPER shaded rim (subtle convex)
+    - (removed per user) top sheen + bottom inner shadow overlays
+    - keeps indigo halo, indigo M + === mark from v3/v4
+    Change vs v5: rim gray + outer stroke deepened one notch.
+  -->
+  <defs>
+    <!-- mark gradient (unchanged) -->
+    <linearGradient id="mark" x1="0" y1="300" x2="0" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6E7BFF"/>
+      <stop offset="1" stop-color="#2324A8"/>
+    </linearGradient>
+
+    <!-- plate body: bright center, deeper shaded rim (subtle convex, no extra sheen) -->
+    <radialGradient id="plateBody" cx="0.5" cy="0.45" r="0.74">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.66" stop-color="#E2E5F0"/>
+      <stop offset="0.92" stop-color="#D2D7E6"/>
+      <stop offset="1" stop-color="#C5CADC"/>
+    </radialGradient>
+
+    <!-- soft cast shadow under the plate -->
+    <radialGradient id="plateDrop" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.5" stop-color="#8A90AE" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#8A90AE" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- halo behind the mark -->
+    <radialGradient id="halo" cx="0.5" cy="0.47" r="0.40">
+      <stop offset="0" stop-color="#5B6BFF" stop-opacity="0.16"/>
+      <stop offset="0.55" stop-color="#5B6BFF" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#5B6BFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- crisp glow ring framing the mark -->
+    <radialGradient id="ring" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#5B6BFF" stop-opacity="0"/>
+      <stop offset="0.80" stop-color="#5B6BFF" stop-opacity="0"/>
+      <stop offset="0.90" stop-color="#6E7BFF" stop-opacity="0.50"/>
+      <stop offset="1" stop-color="#5B6BFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <clipPath id="clip">
+      <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230"/>
+    </clipPath>
+  </defs>
+
+  <!-- cast shadow (slightly larger, offset down) -->
+  <rect x="26" y="34" width="972" height="972" rx="226" ry="226" fill="url(#plateDrop)"/>
+
+  <g clip-path="url(#clip)">
+    <!-- plate body -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#plateBody)"/>
+
+    <!-- subtle glow halo behind the mark -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#halo)"/>
+
+    <!-- crisp glow ring framing the mark -->
+    <circle cx="512" cy="478" r="292" fill="url(#ring)"/>
+
+    <!-- M mark: bold capsule stems + round center V -->
+    <path d="M256 676 L256 316 L512 616 L768 316 L768 676"
+          fill="none" stroke="url(#mark)"
+          stroke-width="140"
+          stroke-linejoin="round" stroke-linecap="round"/>
+
+    <!-- === underline as three rounded pills -->
+    <g fill="url(#mark)">
+      <rect x="293" y="728" width="130" height="38" rx="19" ry="19"/>
+      <rect x="447" y="728" width="130" height="38" rx="19" ry="19"/>
+      <rect x="601" y="728" width="130" height="38" rx="19" ry="19"/>
+    </g>
+  </g>
+
+  <!-- faint outer rim definition so it doesn't disappear on white -->
+  <rect x="1" y="1" width="1022" height="1022" rx="229" ry="229"
+        fill="none" stroke="#B6BBD0" stroke-width="2"/>
+</svg>

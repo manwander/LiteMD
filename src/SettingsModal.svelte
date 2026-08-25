@@ -1,6 +1,8 @@
 <script lang="ts">
   // 设置面板：900 × 640、圆角 14、左侧 180 导航（对齐 MarkLite-快捷键设置-spec.md）
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount } from "svelte";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { invoke } from "@tauri-apps/api/core";
   import {
     SHORTCUT_GROUPS,
     DEFAULT_SHORTCUTS,
@@ -16,7 +18,7 @@
 
   export let settings: Settings;
   export let configPath = "";
-  export let tab: string = "快捷键";
+  export let tab: string = "通用";
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -29,6 +31,7 @@
 
   let capturing: string | null = null;
   let message = "";
+  let appVersion = "";
 
   function changed() {
     settings = settings;
@@ -38,6 +41,18 @@
   function close() {
     capturing = null;
     dispatch("close");
+  }
+
+  onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      appVersion = "";
+    }
+  });
+
+  function openLink(url: string) {
+    invoke("open_external", { url }).catch(() => {});
   }
 
   function startCapture(id: string) {
@@ -240,25 +255,60 @@
           <div class="group">
             <div class="row">
               <span class="row-label">
-                附件文件夹名
-                <small>插图时自动复制到笔记目录下的该文件夹，使用相对引用</small>
+                附件组织方式
+                <small>每篇文档独立：测试.md 的图片存于「测试_attachment/」；统一目录：所有图片进同一个文件夹</small>
               </span>
-              <span class="row-right">
-                <input
-                  class="text-input"
-                  type="text"
-                  placeholder="assets"
-                  bind:value={settings.assetsDir}
-                  on:change={changed}
-                />
+              <span class="row-right radio-group">
+                <label><input type="radio" bind:group={settings.attachmentMode} value="perDocument" on:change={changed} /> 每篇文档独立</label>
+                <label><input type="radio" bind:group={settings.attachmentMode} value="shared" on:change={changed} /> 统一目录</label>
               </span>
             </div>
+            {#if settings.attachmentMode === "perDocument"}
+              <div class="row">
+                <span class="row-label">
+                  附件目录模板
+                  <small>可用 {"{filename}"} 占位文档名（去扩展名），默认 {"{filename}_attachment"}</small>
+                </span>
+                <span class="row-right">
+                  <input
+                    class="text-input"
+                    type="text"
+                    placeholder={`{filename}_attachment`}
+                    bind:value={settings.attachmentTemplate}
+                    on:change={changed}
+                  />
+                </span>
+              </div>
+            {:else}
+              <div class="row">
+                <span class="row-label">
+                  统一附件文件夹名
+                  <small>插图时自动复制到笔记目录下的该文件夹，使用相对引用</small>
+                </span>
+                <span class="row-right">
+                  <input
+                    class="text-input"
+                    type="text"
+                    placeholder="_attachment"
+                    bind:value={settings.assetsDir}
+                    on:change={changed}
+                  />
+                </span>
+              </div>
+            {/if}
             <div class="row">
               <span class="row-label">
                 收编时压缩图片
                 <small>仅 JPEG/PNG；压缩后比原图更小才采用</small>
               </span>
               <input type="checkbox" bind:checked={settings.compressImages} on:change={changed} />
+            </div>
+            <div class="row">
+              <span class="row-label">
+                文件树隐藏附件文件夹
+                <small>对应附件目录在文件管理器中隐藏（磁盘仍保留）；关闭即显示</small>
+              </span>
+              <input type="checkbox" bind:checked={settings.hideAttachments} on:change={changed} />
             </div>
             <div class="row">
               <span class="row-label">
@@ -276,7 +326,6 @@
               />
             </div>
           </div>
-
         {:else if tab === "编辑器"}
           <div class="group first">
             <div class="row">
@@ -337,6 +386,14 @@
                     changed();
                   }}>深色</button
                 >
+                <button
+                  class="chip"
+                  class:on={settings.theme === "auto"}
+                  on:click={() => {
+                    settings.theme = "auto";
+                    changed();
+                  }}>自动</button
+                >
               </span>
             </div>
           </div>
@@ -361,9 +418,15 @@
 
         {:else}
           <div class="group first about">
-            <p><b>LiteMD</b> 0.1.0</p>
+            <p><b>LiteMD</b> {appVersion || "0.1.0"}</p>
             <p>超轻量 Markdown 编辑器 · Rust + Tauri 2 + Svelte 4 + CodeMirror 6</p>
             <p class="path">配置文件：{configPath || "localStorage（浏览器调试）"}</p>
+            <p class="links">
+              <button class="link" on:click={() => openLink("https://github.com/manwander/LiteMD")}>https://github.com/manwander/LiteMD</button>
+            </p>
+            <p class="links">
+              <button class="link" on:click={() => openLink("https://gitee.com/manwander/LiteMD")}>https://gitee.com/manwander/LiteMD</button>
+            </p>
           </div>
         {/if}
       </div>
@@ -632,6 +695,31 @@
     margin: 0 0 8px;
     font-size: 14px;
     color: var(--text-2);
+  }
+
+  .about .links {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .about .link {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 14px;
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .about .link:hover {
+    opacity: 0.8;
+  }
+
+  .about .links + .links {
+    margin-top: 4px;
   }
 
   input[type="checkbox"] {

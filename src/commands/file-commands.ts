@@ -53,17 +53,31 @@ export async function saveNoteAs(content: string): Promise<{ path: string; conte
   return { path: p, content };
 }
 
+// ---- 文件名清洗 ----
+// 清洗用户输入的文件/文件夹名：去除路径分隔符与 Windows 非法字符，并剥离 ".."，
+// 防止拼接成 "C:/notes/../evil.md" 之类的路径穿越。结果为空时调用方应报错。
+export function sanitizeName(name: string): string {
+  return name
+    .replace(/[\/\\:*?"<>|]/g, "") // 路径分隔符与 Windows 非法字符
+    .replace(/\.\./g, "") // 单处或连续 .. 防穿越
+    .trim();
+}
+
 // ---- 新建 ----
 
 export async function newFile(targetDir: string, filename: string): Promise<string> {
-  const fname = /\.md$/i.test(filename) ? filename : `${filename}.md`;
+  const clean = sanitizeName(filename);
+  if (!clean) throw new Error("文件名不能为空或仅含非法字符");
+  const fname = /\.md$/i.test(clean) ? clean : `${clean}.md`;
   const fullPath = `${targetDir}/${fname}`;
   await createFile(fullPath);
   return fullPath;
 }
 
 export async function newFolder(targetDir: string, folderName: string): Promise<string> {
-  const fullPath = `${targetDir}/${folderName}`;
+  const clean = sanitizeName(folderName);
+  if (!clean) throw new Error("文件夹名不能为空或仅含非法字符");
+  const fullPath = `${targetDir}/${clean}`;
   await createDir(fullPath);
   return fullPath;
 }
@@ -139,7 +153,9 @@ export async function migrateNoteImages(
   while ((m = imgRe.exec(text))) {
     let src = m[2];
     if (src.startsWith("<") && src.endsWith(">")) src = src.slice(1, -1);
-    if (/^([A-Za-z]:[\\/]|\/)/.test(src)) {
+    // 识别绝对路径（含 UNC 网络路径 \\server\share、//server/share）：
+    //  drive:\ 或 drive:/  | 双分隔符（UNC） | 单分隔符（Unix 根）
+    if (/^([A-Za-z]:[\\/]|[\\/]{2}|[\\/])/.test(src)) {
       jobs.push({ full: m[0], alt: m[1], src });
     }
   }
@@ -185,8 +201,4 @@ export function basename(p: string): string {
 
 export function dirname(p: string): string {
   return p.replace(/[\\/][^\\/]+$/, "") || p;
-}
-
-export function normalizePath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }

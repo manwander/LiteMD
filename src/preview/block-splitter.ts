@@ -10,6 +10,8 @@
 // - 全程不 split('\n')、不 join、不 slice 大字符串；行边界用 indexOf 扫描，
 //   哈希/分类/预览摘要均基于 (begin, end) 索引直接遍历 charCodeAt。
 
+import { sanitizeHtml } from "../sanitize";
+
 type MarkdownItLike = {
   parse: (src: string, env: unknown) => Array<{ type: string; map?: [number, number] | null }>;
   render: (src: string) => string;
@@ -705,7 +707,9 @@ export function renderBlock(md: MarkdownItLike, source: string, block: PreviewBl
   }
   if (begin >= end) return "";
   const slice = source.slice(begin, end); // 渲染必须有子串，仅此处分配（只针对视口内块）
-  return postProcessHtml(md.render(slice));
+  // C-01：预览是 {@html} 注入点，清洗必须是渲染链路的最后一步。
+  // 顺序 render → postProcess（生成任务列表 checkbox）→ sanitize（统一白名单收口）。
+  return sanitizeHtml(postProcessHtml(md.render(slice)));
 }
 
 /**

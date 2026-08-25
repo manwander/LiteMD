@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    LiteMD icon v3 — "White Tile · Glow Ring · Colored Mark"
+    Keeps the M + === (Markdown setext) brand mark, modernized:
+    - clean white rounded tile (subtle light border so it never vanishes on light UIs)
+    - soft indigo halo / glow ring (光圈) behind the mark
+    - mark + === filled with a bright indigo gradient (not white-on-white)
+  -->
+  <defs>
+    <linearGradient id="mark" x1="0" y1="300" x2="0" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7C8AFF"/>
+      <stop offset="1" stop-color="#2E2FA0"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.47" r="0.46">
+      <stop offset="0" stop-color="#5B6BFF" stop-opacity="0.34"/>
+      <stop offset="0.55" stop-color="#5B6BFF" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#5B6BFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ring" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#5B6BFF" stop-opacity="0"/>
+      <stop offset="0.80" stop-color="#5B6BFF" stop-opacity="0"/>
+      <stop offset="0.90" stop-color="#6E7BFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#5B6BFF" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="clip">
+      <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#clip)">
+    <!-- white tile -->
+    <rect x="0" y="0" width="1024" height="1024" fill="#FFFFFF"/>
+
+    <!-- glow halo behind the mark (光圈) -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#halo)"/>
+
+    <!-- crisp glow ring framing the mark -->
+    <circle cx="512" cy="478" r="292" fill="url(#ring)"/>
+
+    <!-- M mark: capsule stems + round center V -->
+    <path d="M256 676 L256 316 L512 616 L768 316 L768 676"
+          fill="none" stroke="url(#mark)"
+          stroke-width="118"
+          stroke-linejoin="round" stroke-linecap="round"/>
+
+    <!-- === underline as three rounded pills -->
+    <g fill="url(#mark)">
+      <rect x="293" y="728" width="130" height="38" rx="19" ry="19"/>
+      <rect x="447" y="728" width="130" height="38" rx="19" ry="19"/>
+      <rect x="601" y="728" width="130" height="38" rx="19" ry="19"/>
+    </g>
+  </g>
+
+  <!-- subtle tile border so a white icon still reads on white backgrounds -->
+  <rect x="2" y="2" width="1020" height="1020" rx="228" ry="228"
+        fill="none" stroke="#E6E8F2" stroke-width="4"/>
+</svg>
