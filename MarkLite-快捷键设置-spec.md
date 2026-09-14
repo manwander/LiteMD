@@ -1,3 +1,7 @@
+> **键位勘误（2026-09）**：本文为早期设计稿，所列默认键位与实现已有出入。
+> 现行权威来源：`src/settings.ts` 的 `SHORTCUT_GROUPS`（5 组 31 动作）与 `DEFAULT_SHORTCUTS`；
+> 例如加粗为 Alt+B（非 Ctrl+B）、删除线为 Ctrl+Shift+X（非 Alt+Shift+5）。
+
 # MarkLite 快捷键设置（设计规格）
 
 > 待写入 Ardot 设计文件：`MarkLite 编辑器设计`（fileId: 709917310604644）

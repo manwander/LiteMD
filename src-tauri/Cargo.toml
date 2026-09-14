@@ -31,8 +31,23 @@ printpdf = "0.6"
 owned_ttf_parser = "0.21"
 # 删除走系统回收站（可恢复）。默认永久删除属不可逆数据风险，见 delete_path 注释
 trash = "5"
-# 目录监视：外部增删改自动刷新文件树（FEAT-2）；失败时前端回退「窗口激活时刷新」
+# 目录监视：外部增删改自动刷新文件树（FEAT-2）；初始化失败仅记日志，树可手动/操作后刷新
 notify = "6"
+# ---- WebDAV 同步（见根目录 WebDAV同步-设计方案.md）----
+# rustls + 系统根证书：免 OpenSSL 运行时；danger_accept_invalid_certs / add_root_certificate
+# 覆盖「忽略 TLS 错误 / 自定义证书」；socks 支持代理
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "socks"] }
+quick-xml = "0.37"        # PROPFIND Multi-Status 解析（按 local-name 匹配，不信任命名空间前缀）
+sha2 = "0.10"             # 内容哈希（三方合并判据）
+urlencoding = "2"         # 中文/空格文件名逐段百分号编码
+httpdate = "1"            # Last-Modified RFC1123 解析
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }  # 冲突副本命名时间戳
+futures = "0.3"           # buffer_unordered 限并发传输
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 
 [profile.release]
 panic = "abort"

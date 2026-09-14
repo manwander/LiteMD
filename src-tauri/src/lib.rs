@@ -13,20 +13,9 @@ use printpdf::{Mm, PdfDocument};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use owned_ttf_parser as otp;
 
-// ---- 文件树数据结构（与 src/fs.ts 的 FolderNode / MdFile 对应）----
-#[derive(Serialize, Clone)]
-struct MdFile {
-    name: String,
-    path: String,
-}
-
-#[derive(Serialize, Clone)]
-struct FolderNode {
-    name: String,
-    path: String,
-    files: Vec<MdFile>,
-    children: Vec<FolderNode>,
-}
+// ---- WebDAV 同步（设计方案见根目录 WebDAV同步-设计方案.md）----
+// pub：集成测试（tests/webdav_e2e.rs）经真实 HTTP 与本地 WebDAV 服务器联调
+pub mod sync;
 
 // 把 dialog 返回的 FilePath 转成字符串路径；用户取消/转 path 失败都视为 None
 fn path_to_string(fp: Option<tauri_plugin_dialog::FilePath>) -> Option<String> {
@@ -230,133 +219,12 @@ fn pick_image_file(app: tauri::AppHandle) -> Option<String> {
     path_to_string(fp)
 }
 
-// ---- 读取文件夹下「一级文件夹 → 其内 .md 文件」的二级结构 ----
-// 根目录散落的 .md 文件归入虚拟节点「(根目录)」，保证不遗漏。
-// 微优化：用 DirEntry 自带的 file_type() 判类型（Windows 上每条目省去额外 stat 系统调用）；
-// 排序用 sort_by_cached_key 预计算小写键（避免比较函数里 O(n log n) 次 to_lowercase 分配）。
+// ---- 扩展名判定（list_dir / search 等命令共用）----
 fn is_md_ext(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
         .unwrap_or(false)
-}
-
-fn to_md_file(path: &std::path::Path) -> MdFile {
-    MdFile {
-        name: path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string(),
-        path: path.to_string_lossy().to_string(),
-    }
-}
-
-// 是否隐藏目录（以 . 开头，如 .git）：文件树不展示，避免递归出一大串无意义节点
-fn is_hidden_dir(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.starts_with('.'))
-        .unwrap_or(false)
-}
-
-// 递归构建文件夹节点：files 为本层直属 .md 文件，children 为子文件夹
-/// 目录树递归上限：超过该深度的子目录不再展开，避免极端深目录或符号链接环导致栈溢出/长时间卡死。
-const MAX_FOLDER_DEPTH: u32 = 50;
-
-fn build_folder(path: &std::path::Path, depth: u32) -> FolderNode {
-    let mut files: Vec<MdFile> = Vec::new();
-    let mut children: Vec<FolderNode> = Vec::new();
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            // file_type() 用 DirEntry 自带元数据，免额外 stat；失败时回退 path 查询
-            let is_dir = entry
-                .file_type()
-                .map(|t| t.is_dir())
-                .unwrap_or_else(|_| p.is_dir());
-            if is_dir {
-                if !is_hidden_dir(&p) {
-                    // 超深目录截断（仍作为空文件夹节点呈现，不递归其内容）
-                    if depth < MAX_FOLDER_DEPTH {
-                        children.push(build_folder(&p, depth + 1));
-                    }
-                }
-            } else if is_md_ext(&p) {
-                files.push(to_md_file(&p));
-            }
-        }
-    }
-    files.sort_by_cached_key(|a| a.name.to_lowercase());
-    children.sort_by_cached_key(|a| a.name.to_lowercase());
-    FolderNode {
-        name: path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string(),
-        path: path.to_string_lossy().to_string(),
-        files,
-        children,
-    }
-}
-
-// 异步命令：大目录递归可达数百 ms～秒级，同步执行会阻塞 IPC 处理线程导致整个窗口冻结；
-// spawn_blocking 把重活丢到独立线程池，前端 invoke 无需任何改动。
-#[tauri::command]
-async fn read_md_tree(root: String) -> Result<Vec<FolderNode>, String> {
-    tauri::async_runtime::spawn_blocking(move || read_md_tree_sync(root))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-fn read_md_tree_sync(root: String) -> Result<Vec<FolderNode>, String> {
-    let root = PathBuf::from(root);
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut folders: Vec<FolderNode> = Vec::new();
-    let mut root_files: Vec<MdFile> = Vec::new();
-    let entries = fs::read_dir(&root).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_dir = entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or_else(|_| path.is_dir());
-        if is_dir {
-            if !is_hidden_dir(&path) {
-                folders.push(build_folder(&path, 1));
-            }
-        } else if is_md_ext(&path) {
-            root_files.push(to_md_file(&path));
-        }
-    }
-    // 根目录散落文件作为第一个虚拟节点
-    if !root_files.is_empty() {
-        root_files.sort_by_cached_key(|a| a.name.to_lowercase());
-        let root_name = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(".")
-            .to_string();
-        folders.insert(
-            0,
-            FolderNode {
-                name: root_name,
-                path: root.to_string_lossy().to_string(),
-                files: root_files,
-                children: Vec::new(),
-            },
-        );
-    }
-    folders.sort_by_cached_key(|a| a.name.to_lowercase());
-    // 确保根目录虚拟节点始终在最前
-    if let Some(pos) = folders.iter().position(|f| f.path == root.to_string_lossy()) {
-        let node = folders.remove(pos);
-        folders.insert(0, node);
-    }
-    Ok(folders)
 }
 
 // ---- 单级目录列举（懒加载文件树用）----
@@ -623,7 +491,8 @@ fn watch_stop() -> Result<(), String> {
 /// 检查路径是否存在（用于拖拽冲突检测）
 #[tauri::command]
 fn path_exists(path: String) -> bool {
-    PathBuf::from(&path).exists()
+    // 安全：与其余命令统一口径过路径校验（Q-14）；非法/穿越路径直接视为不存在
+    validate_path(&path).map(|p| p.exists()).unwrap_or(false)
 }
 
 #[tauri::command]
@@ -1234,8 +1103,8 @@ fn replace_in_folder_sync(
     let mut files = Vec::new();
     collect_md_paths(&root, &mut files);
 
-    // 原子回滚：先将所有目标文件 rename 为 .bak，全部成功后统一删除 bak。
-    // 任意一步失败则从 bak 恢复全部已修改的文件。
+    // 原子回滚：先将所有目标文件 copy 为 .bak（保留原件直至替换成功），全部成功后统一删除 bak。
+    // 任意一步失败则从 bak 恢复全部已修改的文件，并一并清理 .bak，绝不残留备份文件。
     let mut bak_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (orig, bak)
     let mut files_changed = 0usize;
     let mut total = 0usize;
@@ -1269,12 +1138,13 @@ fn replace_in_folder_sync(
         let (new_text, count) = replace_literal(&content, &query, &replacement, case_sensitive);
         if count > 0 {
             if let Err(e) = fs::write(orig, &new_text) {
-                // 写入失败：全部从 bak 恢复
+                // 写入失败：全部从 bak 恢复，并清理所有 .bak（D-6：不留残留备份）
                 for (o, b) in &bak_paths {
                     let _ = fs::remove_file(o);
                     let _ = fs::copy(b, o);
+                    let _ = fs::remove_file(b);
                 }
-                return Err(format!("写入文件 {} 失败：{}", orig.display(), e));
+                return Err(format!("写入文件 {} 失败：{}（已回滚至替换前状态）", orig.display(), e));
             }
             files_changed += 1;
             total += count;
@@ -1385,14 +1255,6 @@ async fn cleanup_orphans_with(note_dir: String, assets_name: String, rel_paths: 
     .map_err(|e| e.to_string())?
 }
 
-/// 保留旧接口以兼容旧前端：内部走「列 + 删」两步，等价于以前的直接删除语义。
-/// 新代码请改用 list_orphan_assets + cleanup_orphans_with。
-#[tauri::command]
-async fn cleanup_orphans(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
-    let candidates = list_orphan_assets(note_dir.clone(), assets_name.clone()).await?;
-    cleanup_orphans_with(note_dir, assets_name, candidates).await
-}
-
 fn scan_orphans_sync(note_dir: String, assets_name: String) -> Result<Vec<String>, String> {
     let root = PathBuf::from(&note_dir);
     if !root.is_dir() {
@@ -1469,6 +1331,8 @@ fn collect_orphans_recursive(
 // ---- 导出 HTML（前端已拼好完整文档，这里只负责落盘）----
 #[tauri::command]
 fn export_html(path: String, html: String) -> Result<(), String> {
+    // 安全：导出写盘必须过路径校验，与 write_file 一致（Q-14）
+    let path = validate_path(&path)?;
     fs::write(path, html).map_err(|e| e.to_string())
 }
 
@@ -1626,6 +1490,8 @@ impl PdfLayout {
 
 #[tauri::command]
 fn export_pdf(path: String, markdown: String) -> Result<(), String> {
+    // 安全：导出写盘必须过路径校验（Q-14）
+    let path = validate_path(&path)?;
     let font = get_cjk_font().ok_or_else(|| "未找到可用的中文字体（如微软雅黑/黑体）".to_string())?;
     let face = &font.face;
     let (doc, page_idx, layer_idx) = PdfDocument::new(
@@ -1841,7 +1707,7 @@ fn export_pdf(path: String, markdown: String) -> Result<(), String> {
     }
     flush(&mut lt, &style, &mut buf, skip_depth);
 
-    lt.save(&path)
+    lt.save(&path.to_string_lossy())
 }
 
 // ---- 导出「自包含 Markdown」：把文档内本地图片内嵌为 base64 data URI，输出单文件 .md ----
@@ -2248,7 +2114,6 @@ pub fn run() {
             pick_save_file,
             pick_save_pdf_file,
             pick_image_file,
-            read_md_tree,
             list_dir,
             unique_path,
             search_filenames,
@@ -2270,7 +2135,6 @@ pub fn run() {
             list_md_files,
             search_in_folder,
             replace_in_folder,
-            cleanup_orphans,
             cleanup_orphans_with,
             list_orphan_assets,
             import_files,
@@ -2284,6 +2148,10 @@ pub fn run() {
             take_open_files,
             ack_open_files,
             open_external,
+            sync::sync_check_config,
+            sync::sync_run,
+            sync::sync_cancel,
+            sync::sync_folder_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LiteMD");
@@ -2501,6 +2369,132 @@ mod tests {
     fn validate_path_rejects_escape_above_root() {
         assert!(validate_path("C:/../windows/secret.txt").is_err());
     }
+
+    // ---- P0 删除安全守卫 guard_deletable（TR-020/021/022）----
+    #[test]
+    fn guard_deletable_rejects_nonexistent_path() {
+        // ISSUE-002：canonicalize 失败时不降级到原路径，而是直接拒绝（宁误拒不误删）。
+        let ghost = std::env::temp_dir().join(format!(
+            "litemd_guard_ghost_{}\\..\\a.md",
+            std::process::id()
+        ));
+        assert!(
+            guard_deletable(&ghost).is_err(),
+            "指向不存在/规范化失败的路径必须被拒绝，防止绕过守卫"
+        );
+    }
+
+    #[test]
+    fn guard_deletable_allows_real_temp_file() {
+        let base = std::env::temp_dir().join(format!("litemd_guard_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let file = base.join("note.md");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            guard_deletable(&file).is_ok(),
+            "正常临时文件（有 ≥1 层 Normal 组件且可规范化）应放行"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_deletable_rejects_drive_root() {
+        // 盘符根 "C:\" 规范化后仅含 Prefix+RootDir，无 Normal 组件 → 必须拒删整个盘。
+        assert!(guard_deletable(std::path::Path::new("C:\\")).is_err());
+    }
+
+    // ---- RB-002 大文件流式 UTF-8 边界（§5 盲区补测）----
+    #[test]
+    fn utf8_boundary_keeps_valid_prefix_and_drops_truncated_char() {
+        // 纯 ASCII：全部保留
+        assert_eq!(utf8_boundary(b"hello"), 5);
+        // 尾部半截汉字（3 字节只喂进 2）：丢弃残段，只留 'a'
+        assert_eq!(utf8_boundary(&[b'a', 0xE4, 0xB8]), 1);
+        // 保守裁剪：结尾即便是一枚完整汉字，也不纳入本次 head（留给下一分片），结果仍是合法边界
+        let d = [b'h', b'i', 0xE4, 0xB8, 0xAD];
+        let r = utf8_boundary(&d);
+        assert_eq!(r, 2);
+        assert!(std::str::from_utf8(&d[..r]).is_ok());
+    }
+
+    #[test]
+    fn utf8_boundary_never_yields_invalid_prefix() {
+        // 不变式：任意截断点返回的切片都必须是合法 UTF-8，且不超过入参长度。
+        let full = "中文abc漢字🎉mix🙂tail".as_bytes().to_vec();
+        for cut in 0..=full.len() {
+            let r = utf8_boundary(&full[..cut]);
+            assert!(r <= cut, "cut={cut} 越界 r={r}");
+            assert!(std::str::from_utf8(&full[..r]).is_ok(), "cut={cut} r={r} 返回非法前缀");
+        }
+    }
+
+    // ---- AT-011 删除侧逃逸守卫（§5 盲区补测）----
+    #[tokio::test]
+    async fn cleanup_orphans_with_deletes_only_inside_and_rejects_escape() {
+        let dir = std::env::temp_dir().join(format!("litemd_orphan_clean_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let legit = assets.join("a.png");
+        std::fs::write(&legit, "x").unwrap();
+        // 附件夹之外的文件：即便被列进清单也绝不能删
+        let outside = dir.join("keep.txt");
+        std::fs::write(&outside, "keep").unwrap();
+
+        let deleted = cleanup_orphans_with(
+            dir.to_string_lossy().to_string(),
+            "assets".to_string(),
+            vec![
+                "assets/a.png".to_string(),
+                "keep.txt".to_string(), // parent_name != assets → 拒
+                "../keep.txt".to_string(), // 逃逸名 → 拒
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deleted, vec!["assets/a.png".to_string()], "只应删除附件夹内合法项");
+        assert!(!legit.exists(), "合法孤儿应被删除");
+        assert!(outside.exists(), "附件夹外/逃逸目标必须存活");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- SR-028 跨文件替换：成功路径不得残留 .bak（D-6 相关，确定性覆盖清理步）----
+    #[test]
+    fn replace_in_folder_sync_success_leaves_no_bak() {
+        let dir = std::env::temp_dir().join(format!("litemd_replace_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "foo foo").unwrap();
+        std::fs::write(dir.join("b.md"), "x foo y").unwrap();
+
+        let r = replace_in_folder_sync(
+            dir.to_string_lossy().to_string(),
+            "foo".into(),
+            "bar".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.files_changed, 2);
+        assert_eq!(r.count, 3);
+        assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "bar bar");
+        assert_eq!(std::fs::read_to_string(dir.join("b.md")).unwrap(), "x bar y");
+
+        let baks: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bak"))
+            .collect();
+        assert!(baks.is_empty(), "成功替换后不应残留 .bak：{:?}", baks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 注：D-6「写失败→回滚→清 .bak」分支的确定性自动化测试需要把目标置只读来强制 fs::write 失败，
+    // 而 Windows 的 PermissionsExt::set_readonly 仍是 unstable（windows_permissions_ext），稳定工具链
+    // 无法零依赖触发。故此分支维持「源码修复 + 全量回归未破」，由人工清单 C8 实机复验（构造只读卷/
+    // 磁盘满令替换中途失败，核对回滚后无 .bak 残留、文件还原）。
 
     #[test]
     fn collect_orphans_does_not_delete_files() {

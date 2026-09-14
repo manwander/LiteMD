@@ -2,20 +2,6 @@
 // invoke 的参数名（path / content / root / html）必须与 Rust 命令形参一致。
 import { invoke, Channel } from "@tauri-apps/api/core";
 
-export interface MdFile {
-  name: string;
-  path: string;
-}
-
-export interface FolderNode {
-  name: string;
-  path: string;
-  files: MdFile[];
-  children: FolderNode[];
-  /** 懒加载标记：true=子项已列举；false/undefined=未加载（展开时才 list_dir） */
-  loaded?: boolean;
-}
-
 /** 单级目录列举的返回项（list_dir 命令） */
 export interface DirItem {
   name: string;
@@ -67,9 +53,6 @@ export const pickSaveFile = () => invoke<string | null>("pick_save_file");
 export const pickSavePdfFile = () => invoke<string | null>("pick_save_pdf_file");
 
 export const pickImageFile = () => invoke<string | null>("pick_image_file");
-
-export const readMdTree = (root: string) =>
-  invoke<FolderNode[]>("read_md_tree", { root });
 
 /** 单级目录列举（懒加载文件树用）：只返回 dir 这一层的子项，不递归 */
 export const listDir = (dir: string, showHidden: boolean) =>
@@ -220,10 +203,6 @@ export const cleanupOrphansWith = (
   assetsName: string,
   relPaths: string[]
 ) => invoke<string[]>("cleanup_orphans_with", { noteDir, assetsName, relPaths });
-
-/** 旧接口保留兼容：内部走 list + cleanup 两步 */
-export const cleanupOrphans = (noteDir: string, assetsName: string) =>
-  invoke<string[]>("cleanup_orphans", { noteDir, assetsName });
 
 export const exportHtml = (path: string, html: string) =>
   invoke<void>("export_html", { path, html });

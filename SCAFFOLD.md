@@ -182,4 +182,4 @@ npm run tauri build -- --target aarch64-unknown-linux-gnu
       产物主包 914KB → 724KB（gzip 325KB → 267KB），语言/高亮块按需加载
 - [x] 安全收紧：`tauri.conf.json` 的 `csp: null` → 最小白名单
       （`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:` + 开发期 localhost）
-- [ ] 导出 PDF（当前仅 HTML；PDF 需额外打印/转换方案）
+- [x] 导出 PDF（v2.0 已实现：pulldown-cmark + printpdf，A4 中文自动换行分页）

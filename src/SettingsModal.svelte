@@ -6,6 +6,8 @@
   import {
     SHORTCUT_GROUPS,
     DEFAULT_SHORTCUTS,
+    DEFAULT_SYNC,
+    SYNC_INTERVAL_OPTIONS,
     FONT_SIZE_MIN,
     FONT_SIZE_MAX,
     accelFromEvent,
@@ -15,6 +17,7 @@
     normalizeAccel,
     type Settings,
   } from "./settings";
+  import { syncCheckConfig, buildSyncConfig, type CheckReport } from "./sync";
 
   export let settings: Settings;
   export let configPath = "";
@@ -25,9 +28,41 @@
     change: void;
     pickFolder: void;
     export: void;
+    exportPdf: void;
+    pickSyncFolder: void;
+    syncNow: void;
+    syncForce: { mode: "forceUpload" | "forceDownload" };
   }>();
 
-  const NAV = ["通用", "编辑器", "外观", "快捷键", "导出", "关于"];
+  const NAV = ["通用", "编辑器", "外观", "快捷键", "同步", "导出", "关于"];
+
+  // ---- 同步页状态 ----
+  let syncChecking = false;
+  let syncReport: CheckReport | null = null;
+  let syncErr = "";
+  let showAdvanced = false;
+  let showPassword = false;
+  let forceChoice: "" | "upload" | "download" = "";
+
+  async function doCheckSync() {
+    syncChecking = true;
+    syncReport = null;
+    syncErr = "";
+    try {
+      syncReport = await syncCheckConfig(buildSyncConfig(settings, []));
+    } catch (e) {
+      syncErr = String(e);
+    } finally {
+      syncChecking = false;
+    }
+  }
+
+  function removeSyncFolder(i: number) {
+    settings.sync.folders = settings.sync.folders.filter((_, j) => j !== i);
+    changed();
+  }
+
+  const intervalLabel = (m: number) => (m === 0 ? "仅手动" : m < 60 ? `${m} 分钟` : `${m / 60} 小时`);
 
   let capturing: string | null = null;
   let message = "";
@@ -398,6 +433,259 @@
             </div>
           </div>
 
+        {:else if tab === "同步"}
+          <div class="group first">
+            <div class="row">
+              <span class="row-label">
+                启用同步
+                <small>把下方同步文件夹与 WebDAV 服务器双向同步（文件原样存储，任何 WebDAV 客户端可读）</small>
+              </span>
+              <input type="checkbox" bind:checked={settings.sync.enabled} on:change={changed} />
+            </div>
+            <div class="row">
+              <span class="row-label">同步目标</span>
+              <select value="webdav" disabled>
+                <option value="webdav">WebDAV</option>
+              </select>
+            </div>
+            <div class="row">
+              <span class="row-label">
+                WebDAV URL
+                {#if settings.sync.account.url && !/^https:\/\//i.test(settings.sync.account.url)}
+                  <small class="warn-text">⚠ 当前为 http 明文，口令与笔记内容在网络上可被窃听；建议配置 https 地址</small>
+                {:else}
+                  <small>如 https://your-server/dav/（支持 https 时全程 TLS 加密）</small>
+                {/if}
+              </span>
+              <span class="row-right">
+                <input class="text-input wide" type="text" placeholder="https://host:port/dav/"
+                  bind:value={settings.sync.account.url} on:change={changed} />
+              </span>
+            </div>
+            <div class="row">
+              <span class="row-label">
+                WebDAV 用户名
+                <small>明文存储于本机配置文件，与 Joplin 桌面版行为一致</small>
+              </span>
+              <input class="text-input" type="text" bind:value={settings.sync.account.username} on:change={changed} />
+            </div>
+            <div class="row">
+              <span class="row-label">WebDAV 密码</span>
+              <span class="row-right">
+                {#if showPassword}
+                  <input class="text-input" type="text"
+                    bind:value={settings.sync.account.password} on:change={changed} />
+                {:else}
+                  <input class="text-input" type="password"
+                    bind:value={settings.sync.account.password} on:change={changed} />
+                {/if}
+                <button class="mini" title={showPassword ? "隐藏" : "显示"} on:click={() => (showPassword = !showPassword)}>
+                  {showPassword ? "🙈" : "👁"}
+                </button>
+              </span>
+            </div>
+          </div>
+
+          <div class="divider" />
+          <div class="group">
+            <div class="row">
+              <span class="row-label">
+                同步文件夹
+                <small>本地文件夹 ↔ WebDAV 远端子路径；快照状态存于应用数据目录，不污染笔记目录</small>
+              </span>
+              <button class="btn" on:click={() => dispatch("pickSyncFolder")}>添加文件夹</button>
+            </div>
+            {#each settings.sync.folders as f, i}
+              <div class="row">
+                <span class="row-label">
+                  <small class="path">{f.localRoot}</small>
+                  <small>远端子路径 {f.basePath}</small>
+                </span>
+                <span class="row-right">
+                  <label><input type="checkbox" bind:checked={f.enabled} on:change={changed} /> 启用</label>
+                  <button class="mini" title="移除（不影响磁盘文件）" on:click={() => removeSyncFolder(i)}>✕</button>
+                </span>
+              </div>
+            {/each}
+            {#if !settings.sync.folders.length}
+              <p class="desc">尚未添加同步文件夹。</p>
+            {/if}
+            <div class="row">
+              <span class="row-label">
+                同步间隔
+                <small>窗口隐藏时自动暂停，恢复可见时若已过期立即补一轮</small>
+              </span>
+              <select bind:value={settings.sync.intervalMin} on:change={changed}>
+                {#each SYNC_INTERVAL_OPTIONS as m}
+                  <option value={m}>{intervalLabel(m)}</option>
+                {/each}
+              </select>
+            </div>
+            <div class="row">
+              <span class="row-label">
+                连接检查
+                <small>依次验证：网络可达 → 认证 → 读取 → 写入权限（探针文件即建即删）</small>
+              </span>
+              <span class="row-right">
+                <button class="btn" disabled={syncChecking || !settings.sync.account.url} on:click={doCheckSync}>
+                  {syncChecking ? "检查中…" : "检查同步配置"}
+                </button>
+                <button class="btn primary" disabled={!settings.sync.folders.length} on:click={() => dispatch("syncNow")}>
+                  立即同步
+                </button>
+              </span>
+            </div>
+            {#if syncErr}
+              <p class="desc warn-text">检查失败：{syncErr}</p>
+            {/if}
+            {#if syncReport}
+              <div class="group">
+                {#each syncReport.steps as st}
+                  <div class="row">
+                    <span class="row-label">
+                      {st.name === "network" ? "网络可达" : st.name === "auth" ? "认证成功" : st.name === "read" ? "读取正常" : st.name === "write" ? "写入权限" : st.name}
+                      <small>{st.message}</small>
+                    </span>
+                    <span class="tag {st.ok ? 'ok' : st.skipped ? 'skip' : 'bad'}">
+                      {st.ok ? "✓ 通过" : st.skipped ? "— 跳过" : "✗ 失败"}
+                    </span>
+                  </div>
+                {/each}
+                <p class="desc">{syncReport.allOk ? "成功！同步配置看起来没问题。" : "存在失败项，请根据上方提示修正后重试。"}</p>
+              </div>
+            {/if}
+          </div>
+
+          <div class="divider" />
+          <button class="btn adv-toggle" on:click={() => (showAdvanced = !showAdvanced)}>
+            {showAdvanced ? "▾" : "▸"} 显示高级选项
+          </button>
+          {#if showAdvanced}
+            <div class="group">
+              <div class="row">
+                <span class="row-label">
+                  冲突处理
+                  <small>双保留：本地文件不动，远端版本另存「（冲突副本 …）」，永不静默丢数据；较新者胜：可能覆盖本地编辑，慎用</small>
+                </span>
+                <select bind:value={settings.sync.conflictPolicy} on:change={changed}>
+                  <option value="keepBoth">双保留冲突副本（推荐）</option>
+                  <option value="newerWins">较新者胜</option>
+                </select>
+              </div>
+              <div class="row">
+                <span class="row-label">
+                  最大并发连接数
+                  <small>同时传输的文件数，1~16</small>
+                </span>
+                <input class="text-input narrow" type="number" min="1" max="16"
+                  bind:value={settings.sync.concurrency} on:change={changed} />
+              </div>
+              <div class="row">
+                <span class="row-label">
+                  单文件大小上限(MB)
+                  <small>超过该大小的文件跳过同步并在结果中提示</small>
+                </span>
+                <input class="text-input narrow" type="number" min="1" max="4096"
+                  bind:value={settings.sync.maxFileSizeMB} on:change={changed} />
+              </div>
+              <div class="row">
+                <span class="row-label">
+                  忽略文件模式
+                  <small>逗号分隔，如 .git/**, Thumbs.db, ~$*（不含 / 的模式按文件名匹配）</small>
+                </span>
+                <input class="text-input wide" type="text"
+                  value={settings.sync.ignorePatterns.join(", ")}
+                  on:blur={(e) => {
+                    settings.sync.ignorePatterns = e.currentTarget.value
+                      .split(",").map((x) => x.trim()).filter(Boolean);
+                    changed();
+                  }} />
+              </div>
+              <div class="row">
+                <span class="row-label">
+                  故障保护
+                  <small>当同步目标为空（通常是配置错误或 Bug），不要删除本地数据</small>
+                </span>
+                <input type="checkbox" bind:checked={settings.sync.failSafe} on:change={changed} />
+              </div>
+              <div class="row">
+                <span class="row-label">
+                  自定义 TLS 证书
+                  <small>逗号分隔的路径列表，可以是包含证书的目录，也可以直接指向单独的 .pem 文件</small>
+                </span>
+                <input class="text-input wide" type="text" placeholder="/my/cert_dir, /other/custom.pem"
+                  bind:value={settings.sync.advanced.customTlsCerts} on:change={changed} />
+              </div>
+              <div class="row">
+                <span class="row-label">
+                  忽略 TLS 证书错误
+                  <small>危险：将接受无效/自签证书，仅建议在受信内网使用</small>
+                </span>
+                <input type="checkbox" bind:checked={settings.sync.advanced.ignoreTlsErrors} on:change={changed} />
+              </div>
+              <div class="row">
+                <span class="row-label">启用代理</span>
+                <input type="checkbox" bind:checked={settings.sync.advanced.proxyEnabled} on:change={changed} />
+              </div>
+              {#if settings.sync.advanced.proxyEnabled}
+                <div class="row">
+                  <span class="row-label">代理 URL<small>例如 http://my.proxy.com:80 或 socks5h://127.0.0.1:1080</small></span>
+                  <input class="text-input wide" type="text" bind:value={settings.sync.advanced.proxyUrl} on:change={changed} />
+                </div>
+                <div class="row">
+                  <span class="row-label">代理连接超时(秒)</span>
+                  <input class="text-input narrow" type="number" min="0" max="600"
+                    bind:value={settings.sync.advanced.proxyTimeoutSec} on:change={changed} />
+                </div>
+              {/if}
+              <div class="row">
+                <span class="row-label">
+                  获得焦点时同步
+                  <small>窗口从后台切回时若开启则补跑一轮（距上轮 ≥30 秒）</small>
+                </span>
+                <input type="checkbox" bind:checked={settings.sync.advanced.syncOnWindowFocus} on:change={changed} />
+              </div>
+            </div>
+
+            <div class="divider" />
+            <div class="group">
+              <div class="row">
+                <span class="row-label">
+                  重新上传本地数据到同步目标
+                  <small>同步目标上的数据不正确或为空时，强制把本地数据全量上传（服务器端多余旧文件不会被删除）。需要二次确认。</small>
+                </span>
+                <button class="btn danger" on:click={() => (forceChoice = forceChoice === "upload" ? "" : "upload")}>
+                  {forceChoice === "upload" ? "取消" : "重新上传"}
+                </button>
+              </div>
+              {#if forceChoice === "upload"}
+                <div class="row">
+                  <span class="desc warn-text">确认忽略快照、把本地全部文件强制上传到 WebDAV？此操作会覆盖服务器上的同名文件。</span>
+                  <button class="btn danger" on:click={() => { dispatch("syncForce", { mode: "forceUpload" }); forceChoice = ""; }}>
+                    确认执行
+                  </button>
+                </div>
+              {/if}
+              <div class="row">
+                <span class="row-label">
+                  删除本地数据并从同步目标导入
+                  <small>本地数据不正确、同步目标上的数据正确时，把本地文件移入回收站后从服务器全量拉取。建议先导出备份。</small>
+                </span>
+                <button class="btn danger" on:click={() => (forceChoice = forceChoice === "download" ? "" : "download")}>
+                  {forceChoice === "download" ? "取消" : "重新导入"}
+                </button>
+              </div>
+              {#if forceChoice === "download"}
+                <div class="row">
+                  <span class="desc warn-text">确认把本地同步文件夹全部文件移入回收站、再从 WebDAV 下载？</span>
+                  <button class="btn danger" on:click={() => { dispatch("syncForce", { mode: "forceDownload" }); forceChoice = ""; }}>
+                    确认执行
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/if}
+
         {:else if tab === "导出"}
           <div class="group first">
             <div class="row">
@@ -410,9 +698,9 @@
             <div class="row">
               <span class="row-label">
                 导出 PDF
-                <small>规划中，将复用系统打印管线</small>
+                <small>Rust 侧排版渲染（A4/中文自动换行分页），当前文档内容</small>
               </span>
-              <span class="tag">未实现</span>
+              <button class="btn" on:click={() => dispatch("exportPdf")}>立即导出</button>
             </div>
           </div>
 
@@ -751,5 +1039,45 @@
   .text-input:focus {
     outline: none;
     border-color: var(--accent);
+  }
+
+  .text-input.wide {
+    width: 280px;
+  }
+
+  .text-input.narrow {
+    width: 72px;
+  }
+
+  .warn-text {
+    color: #b26a00;
+  }
+
+  .tag.ok {
+    color: #1a7f37;
+    background: rgba(26, 127, 55, 0.12);
+  }
+
+  .tag.skip {
+    color: var(--text-2);
+  }
+
+  .tag.bad {
+    color: #c0392b;
+    background: rgba(192, 57, 43, 0.12);
+  }
+
+  .btn.danger {
+    color: #c0392b;
+    border-color: rgba(192, 57, 43, 0.4);
+  }
+
+  .btn.danger:hover {
+    background: rgba(192, 57, 43, 0.08);
+  }
+
+  .adv-toggle {
+    margin: 4px 0 10px;
+    color: var(--accent);
   }
 </style>

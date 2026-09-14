@@ -20,6 +20,8 @@
   }
   // 窗口级查找面板命令：焦点不在编辑器内容区时 Ctrl+F / Ctrl+H 也能打开（兜底）
   import { openSearchPanel as openSearchPanelCmd } from "./search-panel";
+  // D-7：关闭标签「逐个确认」队列纯状态机（副作用留在本组件，流转逻辑可单测）
+  import { type CloseQueueState, emptyCloseQueue, requestClose as queueRequestClose, resolveCurrent, abortAll } from "./tab-close-queue";
     // 预览编辑模式键盘增强（快捷键/智能 Enter 与源码编辑器对齐）
     import { attachPreviewEditKeys, insertImageAtCaret, insertTableAtCaret, scrollCaretIntoView } from "./preview-edit-keys";
   import { initHighlight, highlightCode, setOnLangLoaded } from "./highlight";
@@ -83,7 +85,6 @@
     listMdFiles,
     listOrphanAssets,
     cleanupOrphansWith,
-    readMdTree,
     renamePath,
     exportHtml,
     exportPdf,
@@ -118,6 +119,17 @@
     type Settings,
   } from "./settings";
   import { settingsBridge } from "./settings-store";
+  import { SyncScheduler } from "./sync-scheduler";
+  import {
+    buildSyncConfig,
+    syncRun,
+    syncCancel,
+    isSyncBusyError,
+    summarizeSync,
+    syncFolderId,
+    type SyncSummary,
+  } from "./sync";
+  import { showToast } from "./toast";
   // 预览编辑模式：contenteditable 预览 + turndown 回写 markdown
   import TurndownService from "turndown";
   import { gfm } from "turndown-plugin-gfm";
@@ -674,7 +686,11 @@ console.log("Hello LiteMD");
   }
 
   // ---- 关闭标签：三按钮对话框（保存并关闭 / 不保存关闭 / 取消）----
-  let closeTabDialog: { path: string } | null = null;
+  // D-7 修复：脏标签「逐个确认」队列。closeQ 为纯状态机（tab-close-queue.ts，已单测），
+  // closeTabDialog 从 current 派生供模板渲染；本组件只负责副作用（doCloseTab/save/activateTab）。
+  // 旧实现单槽 closeTabDialog 会让批量「关闭其他/全部」只弹最后一个、其余丢失提示，已由此队列修正。
+  let closeQ: CloseQueueState = emptyCloseQueue;
+  $: closeTabDialog = closeQ.current ? { path: closeQ.current } : null;
   function requestCloseTab(path: string) {
     const idx = tabs.findIndex((t) => t.path === path);
     if (idx < 0) return;
@@ -690,25 +706,28 @@ console.log("Hello LiteMD");
       doCloseTab(path);
       return;
     }
-    closeTabDialog = { path: tab.path };
+    closeQ = queueRequestClose(closeQ, tab.path);
   }
   async function onCloseTabSave() {
-    const p = closeTabDialog?.path;
-    closeTabDialog = null;
-    if (!p) return;
+    const p = closeQ.current;
+    if (!p) { closeQ = resolveCurrent(closeQ); return; }
     // 保存目标标签：若不是激活标签，先切过去保存再关闭
     const idx = tabs.findIndex((t) => t.path === p);
-    if (idx >= 0 && idx !== activeIdx) await activateTab(idx);
-    if (currentPath) await save();
-    doCloseTab(p);
+    if (idx >= 0) {
+      if (idx !== activeIdx) await activateTab(idx);
+      if (currentPath) await save();
+      doCloseTab(p);
+    }
+    closeQ = resolveCurrent(closeQ);
   }
   function onCloseTabNoSave() {
-    const p = closeTabDialog?.path;
-    closeTabDialog = null;
+    const p = closeQ.current;
     if (p) doCloseTab(p);
+    closeQ = resolveCurrent(closeQ);
   }
   function onCloseTabCancel() {
-    closeTabDialog = null;
+    // 取消即中止整批关闭（用户明确表示不关当前标签，不再逐个追问其余）
+    closeQ = abortAll();
   }
   // 标签栏中键（按钮 1）点击：关闭该标签
   function onTabbarAuxClick(e: MouseEvent) {
@@ -945,9 +964,11 @@ console.log("Hello LiteMD");
     function onDragEnd() {
       dragMode = null;
     }
+    // FMT-007：调色板 12 色（补深红、青蓝两色以与文档/矩阵「12 色」一致）
     const PALETTE = [
       "#e53935", "#fb8c00", "#fdd835", "#43a047", "#1e88e5",
       "#8e24aa", "#6d4c41", "#546e7a", "#000000", "#ffffff",
+      "#c62828", "#00838f",
     ];
   let lastSaved: string | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1610,6 +1631,8 @@ console.log("Hello LiteMD");
 
       configPath = await settingsFilePath();
       if (!disposed) hlReady = true;
+      // 同步调度器：心跳内部有启动延迟（30s）与 enabled/间隔门控，此处无条件 start
+      syncScheduler.start();
 
       // 初始化完成：处理暂存的热启动事件（初始化期间 single-instance 转发的文件路径）
       bootReady = true;
@@ -1644,9 +1667,17 @@ console.log("Hello LiteMD");
       void showWindowOnce();
     });
 
+    const onVisChange = () => syncScheduler.onVisible();
+    const onWinFocus = () => syncScheduler.onFocus();
+    document.addEventListener("visibilitychange", onVisChange);
+    window.addEventListener("focus", onWinFocus);
+
     return () => {
       disposed = true;
       clearTimeout(showFailsafe);
+      syncScheduler.stop();
+      document.removeEventListener("visibilitychange", onVisChange);
+      window.removeEventListener("focus", onWinFocus);
       view?.destroy();
       unlistenClose?.();
       unlistenDrop?.();
@@ -1669,6 +1700,72 @@ console.log("Hello LiteMD");
     logOp("修改设置");
     persist();
   }
+
+  // ---------- WebDAV 同步（设计方案 §7.5/§8）----------
+  let syncBusy = false;
+  let syncProgress = "";
+  let syncConflicts = 0;
+  let lastSyncSummary: SyncSummary | null = null;
+
+  $: syncText = settings.sync.enabled
+    ? syncBusy
+      ? `同步中${syncProgress ? " " + syncProgress : ""}`
+      : settings.sync.lastSyncAt
+        ? `上次 ${new Date(settings.sync.lastSyncAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+        : "未同步"
+    : "";
+
+  async function doSyncRun(mode: "normal" | "forceUpload" | "forceDownload" = "normal"): Promise<boolean> {
+    // 同步中再点 = 请求取消（文件间检查点生效，已完成部分入快照可续传）
+    if (syncBusy && mode === "normal") {
+      void syncCancel().then(() => showToast("已请求取消同步", "info"));
+      return false;
+    }
+    if (!settings.sync.folders.some((f) => f.enabled)) {
+      showToast("尚未配置启用的同步文件夹（设置 → 同步）", "info");
+      return false;
+    }
+    syncBusy = true;
+    syncProgress = "";
+    const openDirty = tabs.filter((t) => isDirtyTab(t)).map((t) => t.path);
+    try {
+      const summary = await syncRun(buildSyncConfig(settings, openDirty), {
+        mode,
+        onEvent: (ev) => {
+          syncProgress = ev.total ? `${ev.done}/${ev.total}` : "";
+        },
+      });
+      lastSyncSummary = summary;
+      syncConflicts = summary.conflicts.length;
+      settings.sync.lastSyncAt = Date.now();
+      persist();
+      const text = summarizeSync(summary);
+      if (summary.errors.length) {
+        showToast(`同步完成：${text}`, "error", 5200);
+        logWarn("同步错误: " + summary.errors.join(" | "));
+      } else {
+        showToast(`同步完成：${text}`, summary.conflicts.length ? "info" : "success", 4200);
+      }
+      return true;
+    } catch (e) {
+      if (isSyncBusyError(e)) return false; // Q-12：如实上报「未执行」，调度器回退 lastRunAt 下轮重试
+      showToast("同步失败：" + String(e), "error", 5600);
+      logError("同步失败: " + String(e));
+      return true; // 已实际执行过（失败），不立即重试
+    } finally {
+      syncBusy = false;
+      syncProgress = "";
+    }
+  }
+
+  const syncScheduler = new SyncScheduler({
+    getSettings: () => settings.sync,
+    runSync: (trigger) => doSyncRun(trigger === "manual" ? "normal" : "normal"),
+    now: () => Date.now(),
+    isHidden: () => document.hidden,
+    setTimer: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (h) => clearInterval(h),
+  });
 
   // 预测式缩放（P1-3）：连续按 Ctrl+/- 时，先瞬时 transform:scale 编辑区（零 layout，<16ms 视觉反馈），
   // 再于 rAF 内提交真实字号（CodeMirror Compartment 重配置，仅视口几十行 O(视口)），主线程不阻塞。
@@ -2045,6 +2142,7 @@ console.log("Hello LiteMD");
     logOp("保存文件: " + currentPath);
     updateTitle();
     saveSession();
+    syncScheduler.notifySaved();
   }
 
   async function saveAs() {
@@ -2189,6 +2287,7 @@ ${safeRender(m, pullDoc())}
           docDirty = false;
           status = "已自动保存";
           updateTitle();
+          syncScheduler.notifySaved();
         } catch (e) {
           status = "自动保存失败：" + String(e);
         }
@@ -2431,7 +2530,9 @@ ${safeRender(m, pullDoc())}
   const italic = () => (previewExec("italic") || (view && wrapSelection(view, "*")));
   const underline = () => (previewExec("underline") || (view && wrapSelection(view, "__")));
   const strike = () => (previewExec("strikeThrough") || (view && wrapSelection(view, "~~")));
-  const h1 = () => (previewExec("formatBlock", "<h1>") || (view && toggleLinePrefix(view, "# ")));
+  // Q-19：编辑器路径改走 setHeading（与 Alt+1 快捷键、行内快捷菜单同一实现：
+  // 剥离旧级、toggle 还原、设后续行），不再用 toggleLinePrefix 的浅行为
+  const h1 = () => (previewExec("formatBlock", "<h1>") || (view && setHeading(view, 1)));
   const ul = () => (previewExec("insertUnorderedList") || (view && toggleLinePrefix(view, "- ")));
   const ol = () => (previewExec("insertOrderedList") || (view && toggleLinePrefix(view, "1. ")));
   // 任务列表：预览编辑无原生 execCommand，退化为新列表项（内容不受影响）
@@ -3419,6 +3520,10 @@ ${safeRender(m, pullDoc())}
     autoSave={settings.autoSave}
     fontSize={settings.fontSize}
     previewNotice={previewDisabledNotice}
+    {syncText}
+    {syncBusy}
+    {syncConflicts}
+    on:syncNow={() => void doSyncRun("normal")}
   />
 
   <!-- 行内快捷菜单（gutter 按钮弹出）-->
@@ -3483,9 +3588,31 @@ ${safeRender(m, pullDoc())}
       const f = await pickOpenFolder();
       if (f) await loadFolderIntoTree(f);
     }}
+    on:pickSyncFolder={async () => {
+      const f = await pickOpenFolder();
+      if (!f) return;
+      if (settings.sync.folders.some((x) => x.localRoot === f)) {
+        showToast("该文件夹已在同步列表中", "info");
+        return;
+      }
+      const id = await syncFolderId(f);
+      const name = f.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "notes";
+      settings.sync.folders = [
+        ...settings.sync.folders,
+        { id, localRoot: f, basePath: `/${name}/`, enabled: true },
+      ];
+      settings = settings;
+      onSettingsChange();
+    }}
+    on:syncNow={() => void doSyncRun("normal")}
+    on:syncForce={(e) => void doSyncRun(e.detail.mode)}
     on:export={() => {
       showSettings = false;
       exportHtmlDoc();
+    }}
+    on:exportPdf={() => {
+      showSettings = false;
+      exportPdfDoc();
     }}
   />
 {/if}
@@ -3616,7 +3743,7 @@ ${safeRender(m, pullDoc())}
             <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> <span>打开文件夹</span>
             <kbd>Ctrl</kbd>+<kbd>S</kbd> <span>保存</span>
             <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> <span>另存为</span>
-            <kbd>Ctrl</kbd>+<kbd>E</kbd> <span>导出 PDF</span>
+            <kbd>Ctrl</kbd>+<kbd>E</kbd> <span>导出 HTML</span>
           </div>
         </div>
         <div class="kb-section">
@@ -3626,6 +3753,8 @@ ${safeRender(m, pullDoc())}
             <kbd>Ctrl</kbd>+<kbd>Y</kbd> <span>重做</span>
             <kbd>Ctrl</kbd>+<kbd>F</kbd> <span>查找</span>
             <kbd>Ctrl</kbd>+<kbd>H</kbd> <span>替换</span>
+            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> <span>删除线</span>
+            <kbd>Alt</kbd>+<kbd>Enter</kbd> <span>复制表格行</span>
           </div>
         </div>
         <div class="kb-section">
@@ -3645,6 +3774,7 @@ ${safeRender(m, pullDoc())}
             <kbd>Alt</kbd>+<kbd>Q</kbd> <span>插入图片</span>
             <kbd>Alt</kbd>+<kbd>W</kbd> <span>代码块</span>
             <kbd>Alt</kbd>+<kbd>E</kbd> <span>插入表格</span>
+            <kbd>Alt</kbd>+<kbd>\</kbd> <span>表格加列</span>
             <kbd>Alt</kbd>+<kbd>`</kbd> <span>无序列表</span>
           </div>
         </div>

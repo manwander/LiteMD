@@ -116,7 +116,10 @@ describe("B-08 空文件夹提示", () => {
       filter: "",
       showHidden: false,
       showNonMd: false,
+      hideAttachments: true,
       assetsDir: "_attachment",
+      attachmentMode: "perDocument",
+      attachmentTemplate: "{filename}_attachment",
       hiddenPaths: [],
       sort: "name",
       version: 1,
@@ -134,7 +137,10 @@ describe("B-08 空文件夹提示", () => {
       filter: "",
       showHidden: false,
       showNonMd: false,
+      hideAttachments: true,
       assetsDir: "_attachment",
+      attachmentMode: "perDocument",
+      attachmentTemplate: "{filename}_attachment",
       hiddenPaths: [],
       sort: "name",
       version: 1,
@@ -208,7 +214,7 @@ describe("watcher Create 事件避免覆盖 revealCreated 刚确认的子项", (
     expect(parent.loaded).toBe(true);
     expect(parent.children.map((c) => c.name)).toContain("二级");
 
-    const flat = flatten({ ...store.get(), hiddenPaths: [], assetsDir: "_attachment", version: store.get().version });
+    const flat = flatten({ ...store.get(), hideAttachments: true, attachmentMode: "perDocument", attachmentTemplate: "{filename}_attachment", hiddenPaths: [], assetsDir: "_attachment", version: store.get().version });
     expect(flat.some((n) => n.kind === "folder" && n.path === `${root}/新建文件夹/二级`)).toBe(true);
     // 新建的二级文件夹本身是空的，应显示「（空文件夹）」提示，而不是让父目录误报空。
     expect(flat.some((n) => n.kind === "hint" && n.path.startsWith(`${root}/新建文件夹/二级`))).toBe(true);
@@ -255,7 +261,10 @@ describe("重复 key 兜底（移动多次卡死 M-03）", () => {
       filter: "",
       showHidden: false,
       showNonMd: false,
+      hideAttachments: true,
       assetsDir: "_attachment",
+      attachmentMode: "perDocument",
+      attachmentTemplate: "{filename}_attachment",
       hiddenPaths: [],
       sort: "name",
       version: 1,

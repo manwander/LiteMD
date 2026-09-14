@@ -17,7 +17,7 @@
     importFiles,
     searchFilenames,
   } from "./fs";
-  import { sanitizeName } from "./commands/file-commands";
+  import { sanitizeName } from "./filetree/types";
   import { logOp, logError } from "./logger";
   import { flatten } from "./filetree/flatten";
   import { loadFolderNode, reloadFolder, refreshFolderOf, reloadAllLoaded, refreshTree as refreshAllTree, revealCreated as opsRevealCreated, applyFsChanges as opsApplyFsChanges, addFolderNode, addFileNode } from "./filetree/ops";

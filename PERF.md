@@ -129,6 +129,10 @@ SettingsModal / FolderSearch / PromptModal / ConfirmModal 改为打开时 `impor
 - App.svelte：pendingEdit/previewEdits 累计与校验；pushPreview 超阈值保留 pendingEdit 防坐标系错位；scheduleOpenPreview/cancelOpenPreview 空闲帧推送预览
 
 ---
+## WebDAV 同步（2026-09-13，估算）
+
+新增依赖 reqwest(rustls)/quick-xml/sha2/futures/tokio-sync/chrono 等，估算 exe 体积 +1.5~2MB（rustls 纯 Rust、无 OpenSSL 运行时）。**尚未跑 `tauri build` 实测**；下次发版构建时在此回填真实增量，若超预期考虑裁剪 feature（如去 http2/socks）。
+
 ## 不做 / 暂缓（测量后结论）
 
 - Web Worker 切块渲染：P1-2/P1-4 后 1MB 档达标、2MB+ 走降级，暂不需要。

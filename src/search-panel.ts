@@ -84,14 +84,23 @@ const findNextMatch = (view: EditorView, dir: 1 | -1): boolean => {
 // ---- 自研匹配工具（不依赖官方 searchState） ----
 
 /** 替换文本转义（\n \r \t \\），与 SearchQuery.unquote 一致（类型定义未导出，自实现） */
-function unquoteText(text: string): string {
+export function unquoteText(text: string): string {
   return text.replace(/\\([nrt\\])/g, (_, ch) =>
     ch === "n" ? "\n" : ch === "r" ? "\r" : ch === "t" ? "\t" : "\\"
   );
 }
 
+/**
+ * 构造查询并暴露 validity：CM6 的 SearchQuery 对非法正则「不抛异常」，仅置 valid=false，
+ * 真正 new RegExp 抛错发生在 getCursor。D-4 修复依赖调用方判 `buildQuery(...).valid`，
+ * 无效时不得再走 matchesOf/getCursor（否则异常冒泡成全屏错误页）。导出以便单测固化该契约。
+ */
+export function buildQuery(search: string, caseSensitive: boolean, regexp: boolean): SearchQuery {
+  return new SearchQuery({ search, caseSensitive, regexp });
+}
+
 /** 迭代查询的所有匹配（最多 limit 个），按文档顺序返回 */
-function matchesOf(view: EditorView, q: SearchQuery, limit = 1e9): { from: number; to: number }[] {
+export function matchesOf(view: EditorView, q: SearchQuery, limit = 1e9): { from: number; to: number }[] {
   const out: { from: number; to: number }[] = [];
   // getCursor 的类型声明是标准 Iterator，但运行时是 SearchCursor（value/done 是属性）
   const cur = q.getCursor(view.state) as unknown as {
@@ -117,7 +126,7 @@ function selectMatchAt(view: EditorView, m: { from: number; to: number }) {
 }
 
 /** 按方向跳转匹配（dir=1 下一个，dir=-1 上一个），含文档回绕 */
-function selectMatch(view: EditorView, q: SearchQuery, dir: 1 | -1): boolean {
+export function selectMatch(view: EditorView, q: SearchQuery, dir: 1 | -1): boolean {
   const all = matchesOf(view, q, 1000);
   if (!all.length) return false;
   const { from, to } = view.state.selection.main;
@@ -142,7 +151,7 @@ function selectMatch(view: EditorView, q: SearchQuery, dir: 1 | -1): boolean {
 }
 
 /** 全选所有匹配，返回匹配数 */
-function selectAllMatches(view: EditorView, q: SearchQuery): number {
+export function selectAllMatches(view: EditorView, q: SearchQuery): number {
   const all = matchesOf(view, q, 1000);
   if (!all.length) return 0;
   view.dispatch({
@@ -154,7 +163,7 @@ function selectAllMatches(view: EditorView, q: SearchQuery): number {
 }
 
 /** 替换：当前选区正好是匹配则替换并跳下一个；否则仅选中下一个匹配 */
-function replaceCurrent(view: EditorView, q: SearchQuery): boolean {
+export function replaceCurrent(view: EditorView, q: SearchQuery): boolean {
   const { state } = view;
   if (state.readOnly) return false;
   const all = matchesOf(view, q, 1000);
@@ -178,7 +187,7 @@ function replaceCurrent(view: EditorView, q: SearchQuery): boolean {
 }
 
 /** 全部替换，返回替换数 */
-function replaceAllMatches(view: EditorView, q: SearchQuery): number {
+export function replaceAllMatches(view: EditorView, q: SearchQuery): number {
   const { state } = view;
   if (state.readOnly) return 0;
   const all = matchesOf(view, q, 1000);
@@ -345,14 +354,12 @@ class ChineseSearchPanel implements Panel {
       this.updateCount();
       return;
     }
-    let q: SearchQuery;
-    try {
-      q = new SearchQuery({
-        search: text,
-        caseSensitive: this.caseSensitive,
-        regexp: this.regexp,
-      });
-    } catch {
+    const q = buildQuery(text, this.caseSensitive, this.regexp);
+    // D-4 修复：CM6 SearchQuery 对非法正则「不抛异常」，只把 valid 置 false。
+    // 真正会 throw 的是后续 getCursor 内部 new RegExp，若不下发空查询，异常会冒到
+    // App 全局 error 钩子 → 弹全屏致命错误页（用户输入半截正则如 "(" 即触发）。
+    if (!q.valid) {
+      this.view.dispatch({ effects: setQueryEffect.of(null) });
       this.countEl.textContent = "正则表达式无效";
       return;
     }
@@ -418,11 +425,28 @@ class ChineseSearchPanel implements Panel {
       this.countEl.textContent = "";
       return;
     }
-    // SearchQuery 无 findAll，用 getCursor 迭代计数
-    let n = 0;
-    const cur = q.getCursor(this.view.state);
-    for (; !cur.next().done; ) n++;
-    this.countEl.textContent = n ? `共 ${n} 处` : "无匹配";
+    // D-4 修复（防御）：q.valid=false 时 getCursor 内部 new RegExp 会 throw，
+    // 绝不能让它冒到全局错误钩子。D-5 修复：计数上限 1000，避免超大文档
+    // 每次防抖都全文无界同步扫描造成卡顿；超限显示「≥1000」。
+    if (!q.valid) {
+      this.countEl.textContent = "正则表达式无效";
+      return;
+    }
+    try {
+      let n = 0;
+      let capped = false;
+      const cur = q.getCursor(this.view.state);
+      for (; !cur.next().done; ) {
+        n++;
+        if (n >= 1000) {
+          capped = true;
+          break;
+        }
+      }
+      this.countEl.textContent = n ? (capped ? "共 1000+ 处" : `共 ${n} 处`) : "无匹配";
+    } catch {
+      this.countEl.textContent = "正则表达式无效";
+    }
   }
 
   private onQueryKey(e: KeyboardEvent) {

@@ -146,4 +146,16 @@ export interface TreeHandlers {
   setTreePrefs(prefs: { collapsed: string[]; sort: string; showNonMd: boolean }): void;
   /** 根目录列表变化（父组件更新 settings.roots/lastFolder 并 persist） */
   onRootsChanged(roots: string[], lastFolder: string | null): void;
+  /** D-DOC-4：拖拽覆盖确认前查询目标是否已存在（App 经 pathExists 注入；可选，缺省时跳过覆盖确认） */
+  checkPathExists?(p: string): Promise<boolean>;
+}
+
+// ---- 文件名清洗（自 src/commands/file-commands.ts 迁入，原目录为无消费方死代码）----
+// 清洗用户输入的文件/文件夹名：去除路径分隔符与 Windows 非法字符，并剥离 ".."，
+// 防止拼接成 "C:/notes/../evil.md" 之类的路径穿越。结果为空时调用方应报错。
+export function sanitizeName(name: string): string {
+  return name
+    .replace(/[\/\:*?"<>|]/g, "") // 路径分隔符与 Windows 非法字符
+    .replace(/\.\./g, "") // 单处或连续 .. 防穿越
+    .trim();
 }

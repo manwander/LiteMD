@@ -277,7 +277,8 @@ const EDITOR_COMMANDS: Record<string, Command> = {
   "edit.find": (v) => openCnSearchPanel(false)(v), // Ctrl+F：中文查找面板
   "edit.replace": (v) => openCnSearchPanel(true)(v), // Ctrl+H：中文查找替换面板
   "table.duplicateRow": duplicateTableRow,
-  "table.addColumn": addTableColumn,
+  // 注：table.addColumn 的 scope 是 app（settings.ts 注册表），键位走窗口层直调
+  // addColumn()，此处不注册——曾误留字典项造成"双通道触发"疑虑（Q-18 清理）。
 };
 
 export function buildKeymap(cmKeys: Record<string, string>): KeyBinding[] {
@@ -629,48 +630,35 @@ export function wrapSelection(view: EditorView, marker: string, onSkip?: () => v
     requestAnimationFrame(() => view.focus());
 }
 
-// 行前缀切换：列表 / 引用 / 标题（支持多行选区，再次点击取消）
+// 行前缀切换：列表 / 引用（支持多行选区，再次点击取消）
+// D-2 修复：旧实现把多行整体增删的 delta 按「单行前缀长度」算并返回未映射的原坐标
+// selection，多行移除时 range.to 越过变短后的新文档末尾 → CodeMirror 抛 RangeError。
+// D-3 修复：改为逐行判定（该行有前缀则剥离、否则添加），符合矩阵 FMT-013「混合行按各自状态处理」。
+// 统一用 ChangeSet 构建变更并把各选区映射到新坐标，彻底消除越界。
 export function toggleLinePrefix(view: EditorView, prefix: string): void {
   const { state } = view;
-  const changes = state.changeByRange((range) => {
+  const seen = new Set<number>();
+  const lineChanges: { from: number; to: number; insert: string }[] = [];
+  for (const range of state.selection.ranges) {
     const startLine = state.doc.lineAt(range.from);
     const endLine = state.doc.lineAt(range.to);
-    const lineChanges: { from: number; to: number; insert: string }[] = [];
-    // 判断是否所有行都已有前缀（是则移除，否则添加）
-    let allHave = true;
     for (let i = startLine.number; i <= endLine.number; i++) {
+      if (seen.has(i)) continue;
+      seen.add(i);
       const line = state.doc.line(i);
-      if (!line.text.startsWith(prefix)) {
-        allHave = false;
-        break;
-      }
+      const has = line.text.startsWith(prefix);
+      lineChanges.push({
+        from: line.from,
+        to: line.to,
+        insert: has ? line.text.slice(prefix.length) : prefix + line.text,
+      });
     }
-    for (let i = startLine.number; i <= endLine.number; i++) {
-      const line = state.doc.line(i);
-      const next = allHave ? line.text.slice(prefix.length) : prefix + line.text;
-      lineChanges.push({ from: line.from, to: line.to, insert: next });
-    }
-    // 光标随前缀偏移：添加前缀时（行首光标）移到前缀后继续输入，行内光标整体右移；
-    // 移除前缀时反向回移（不低于行首）。否则光标停在“1. ”前，输入文字会跑到列表标记前。
-    const delta = allHave ? -prefix.length : prefix.length;
-    return {
-      changes: lineChanges,
-      range: EditorSelection.range(
-        Math.max(startLine.from, range.from + delta),
-        Math.max(startLine.from, range.to + delta)
-      ),
-    };
-  });
-  view.dispatch(changes);
-    requestAnimationFrame(() => view.focus());
-  // 长文档中行前缀变化后光标可能离开可视区,强制把光标滚到视口中央(y:'center')。
-  // 用 'center' 而不是 'nearest'/'end' 是为了避免「容器高度 > 内容高度」时空文档把光标留在
-  // padding 区域造成的「插入表格看不到」「被覆盖」误判。
-  view.dispatch({
-    selection: { anchor: view.state.selection.main.head },
-    // 不调用 scrollIntoView:小文档中 center/nearest 都会让视口停留在 padding 区域,
-    // 用户感觉「光标跳到文档前面」。依赖 view.focus() 内置的最近滚动即可。
-  });
+  }
+  const ch = state.changes(lineChanges);
+  // 只下发 changes，交给 CodeMirror 自动把现有选区映射到新坐标（比手工 ±delta 稳，
+  // 且避免在未挂载视图上显式设置 selection 触发视口测量异常）。
+  view.dispatch({ changes: ch });
+  requestAnimationFrame(() => view.focus());
 }
 
 // 设置标题级别：先剥离已有 # 前缀，再设为指定级别；已是该级别则移除（toggle）
@@ -707,14 +695,22 @@ export function setHeading(view: EditorView, level: number): void {
 }
 
 // 转为正文：剥离标题前缀（任何级别）
+// D-1 修复：不再用 changeByRange 返回未映射的原坐标 selection（光标落在正文内时
+// 剥离前缀会让新文档变短、旧 anchor 越界 → CodeMirror 抛 RangeError 且事务被拒、
+// 操作无效）。改为汇总各选区所在行的删除规格，构造 ChangeSet 后把选区映射到新坐标。
 export function toParagraph(view: EditorView): void {
   const { state } = view;
-  const changes = state.changeByRange((range) => {
+  const seen = new Set<number>();
+  const specs: { from: number; to: number; insert: string }[] = [];
+  for (const range of state.selection.ranges) {
     const line = state.doc.lineAt(range.from);
+    if (seen.has(line.number)) continue;
+    seen.add(line.number);
     const stripped = line.text.replace(/^#+\s+/, "");
-    return { changes: { from: line.from, to: line.to, insert: stripped }, range };
-  });
-  view.dispatch(changes);
+    specs.push({ from: line.from, to: line.to, insert: stripped });
+  }
+  const ch = state.changes(specs);
+  view.dispatch({ changes: ch });
   view.focus();
 }
 
@@ -966,7 +962,7 @@ export function setOrderedList(view: EditorView, start: number): void {
     };
     return {
       changes: lineChanges,
-      range: EditorSelection.range(mapEndpoint(range.anchor), mapEndpoint(range.head), range.goalColumn, range.bidiLevel, range.assoc),
+      range: EditorSelection.range(mapEndpoint(range.anchor), mapEndpoint(range.head), range.goalColumn ?? undefined, range.bidiLevel ?? undefined, range.assoc ?? undefined),
     };
   });
   // 合并 selection 与 scrollIntoView,避免滚动竞争导致跳顶

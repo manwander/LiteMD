@@ -53,7 +53,7 @@
 | 前端 | Svelte 4 + Vite 5 | 编译期优化、运行时极小 |
 | 编辑器 | CodeMirror 6 | liteSetup + 14 种语言白名单按需加载 |
 | 预览 | markdown-it + hljs | 动态 import，启动不加载解析器 |
-| 后端 | Rust，28 命令 | 文件 / 图片 / 搜索 / 导出 / 设置 |
+| 后端 | Rust，48 命令 | 文件 / 图片 / 搜索 / 导出 / 设置 / WebDAV 同步 |
 | 持久化 | settings.json | 临时文件 + rename 原子写入 |
 | 打包 | cargo 交叉编译 | 一条命令出三端安装包 |
 
@@ -147,13 +147,12 @@ LiteMD/
 │   ├── Cargo.toml              # tauri / dialog / image / base64 / regex / pulldown-cmark / printpdf / owned_ttf_parser
 │   ├── tauri.conf.json         # 窗口 1280×800、最小白名单 CSP、asset 协议、NSIS 简体中文安装器
 │   ├── capabilities/           # 插件权限（dialog:default）
-│   └── src/lib.rs              # 28 个 Tauri 命令（文件/树/图片/搜索替换/导出/设置）
+│   └── src/lib.rs              # 48 个 Tauri 命令（文件/树/图片/搜索替换/导出/设置/同步）
 ├── scripts/                    # 性能基准与回归测试（Node 24 原生 TS 直跑）
 │   ├── perf-bench.mjs          # 5 档文档切块/增量管线基准
 │   ├── splitter-equiv-test.mjs # 切块算法等价回归（29 用例）
 │   ├── splitter-incr-test.mjs  # 增量切块正确性回归（7 类用例）
 │   └── test-*.mjs / bench-*.mjs
-├── docs/                       # P0 验收清单、50MB 大文档性能方案
 ├── EDITOR-SELECTION.md         # 编辑器选型：CodeMirror 6 vs Vditor
 ├── SCAFFOLD.md                 # 脚手架方案与依赖清单
 ├── PERF.md                     # 性能优化实验记录（三轮，含最终基准数据）
@@ -205,6 +204,4 @@ node scripts/test-stream.mjs           # 分片载入区间
 - **EDITOR-SELECTION.md** — 编辑器内核选型对比与结论
 - **SCAFFOLD.md** — 脚手架方案、依赖清单、Tauri 配置说明
 - **PERF.md** — 性能优化实验记录与最终基准
-- **docs/P0-验收清单.md** — 真机验收清单（A~G 分组）
-- **docs/perf-50mb-plan.md** / **docs/perf-50mb-spec.md** — 50MB 大文档性能目标与方案
 - **MarkLite-快捷键设置-spec.md** — 快捷键设置面板 UI 设计规格

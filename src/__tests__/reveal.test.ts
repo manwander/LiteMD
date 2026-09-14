@@ -40,6 +40,7 @@ function flatNames(store: ReturnType<typeof mkStore>) {
     nodeMap: s.nodeMap, loadState: s.loadState, rootPaths: s.rootPaths,
     collapsed: s.collapsed, filter: s.filter, showHidden: s.showHidden,
     showNonMd: s.showNonMd, assetsDir: "_attachment", hiddenPaths: [], sort: s.sort, version: ++flatVersion,
+    hideAttachments: true, attachmentMode: "perDocument", attachmentTemplate: "{filename}_attachment",
   }).map((n) => n.name);
 }
 

@@ -4,6 +4,70 @@ import type { SettingsBridge } from "./settings-store";
 
 export type ThemeName = "light" | "dark" | "auto";
 
+// ---------------- WebDAV 同步（设计方案 §3.2） ----------------
+
+/** 一个同步条目：本地根目录 ↔ WebDAV basePath 下子目录 */
+export interface SyncFolder {
+  /** sha256(localRoot) 前 12 位（Rust sync_folder_id 派生，保证两端一致） */
+  id: string;
+  localRoot: string;
+  /** WebDAV 下的目录，如 /notes/ */
+  basePath: string;
+  enabled: boolean;
+}
+
+export interface SyncAdvanced {
+  ignoreTlsErrors: boolean;
+  /** 逗号分隔的证书文件/目录路径 */
+  customTlsCerts: string;
+  proxyEnabled: boolean;
+  proxyUrl: string;
+  proxyTimeoutSec: number;
+  /** 窗口获得焦点时补一次同步 */
+  syncOnWindowFocus: boolean;
+}
+
+export interface SyncSettings {
+  enabled: boolean;
+  account: { url: string; username: string; password: string };
+  folders: SyncFolder[];
+  /** 0 = 仅手动 */
+  intervalMin: number;
+  /** 最大并发传输数 1~16 */
+  concurrency: number;
+  conflictPolicy: "keepBoth" | "newerWins";
+  /** 远端为空（疑似配置错误）时不删本地 */
+  failSafe: boolean;
+  /** 单文件大小上限 MB，超过跳过 */
+  maxFileSizeMB: number;
+  ignorePatterns: string[];
+  advanced: SyncAdvanced;
+  lastSyncAt: number | null;
+}
+
+export const SYNC_INTERVAL_OPTIONS = [0, 1, 5, 15, 30, 60] as const;
+
+export const DEFAULT_SYNC: SyncSettings = {
+  enabled: false,
+  account: { url: "", username: "", password: "" },
+  folders: [],
+  intervalMin: 5,
+  concurrency: 5,
+  conflictPolicy: "keepBoth",
+  failSafe: true,
+  maxFileSizeMB: 100,
+  ignorePatterns: [".git/**", "Thumbs.db", "~$*"],
+  advanced: {
+    ignoreTlsErrors: false,
+    customTlsCerts: "",
+    proxyEnabled: false,
+    proxyUrl: "",
+    proxyTimeoutSec: 1,
+    syncOnWindowFocus: false,
+  },
+  lastSyncAt: null,
+};
+
 export interface Settings {
   /** 主题 */
   theme: ThemeName;
@@ -59,6 +123,8 @@ export interface Settings {
   shortcuts: Record<string, string>;
   /** 是否已显示过快捷键示意图（首次启动后置 false） */
   shortcutGuideShown: boolean;
+  /** WebDAV 同步配置（设计方案 §3.2） */
+  sync: SyncSettings;
 }
 
 // ---------------- 快捷键注册表（对齐 MarkLite-快捷键设置-spec.md）----------------
@@ -210,6 +276,7 @@ export const DEFAULT_SETTINGS: Settings = {
   lowEndMode: "auto",
   shortcuts: { ...DEFAULT_SHORTCUTS },
   shortcutGuideShown: false,
+  sync: JSON.parse(JSON.stringify(DEFAULT_SYNC)) as SyncSettings,
 };
 
 export const FONT_SIZE_MIN = 11;
@@ -381,6 +448,59 @@ function sanitizeAssetsDir(v: unknown): string {
   return name;
 }
 
+function sanitizeSync(raw: unknown): SyncSettings {
+  const s = (raw ?? {}) as Partial<SyncSettings>;
+  const acc = (s.account ?? {}) as Partial<SyncSettings["account"]>;
+  let url = typeof acc.url === "string" ? acc.url.trim() : "";
+  if (url && !/^https?:\/\//i.test(url)) url = ""; // 协议白名单：非法值清空（UI 会提示）
+  if (url && !url.endsWith("/")) url += "/"; // 规范化补尾斜杠
+  const folders: SyncFolder[] = Array.isArray(s.folders)
+    ? s.folders
+        .filter((f): f is SyncFolder => !!f && typeof f.localRoot === "string" && !!f.localRoot.trim())
+        .map((f) => ({
+          id: typeof f.id === "string" ? f.id : "",
+          localRoot: f.localRoot.trim(),
+          basePath:
+            typeof f.basePath === "string" && f.basePath.trim()
+              ? (f.basePath.trim().startsWith("/") ? f.basePath.trim() : "/" + f.basePath.trim())
+              : "/",
+          enabled: f.enabled !== false,
+        }))
+        .slice(0, 20)
+    : [];
+  const adv = (s.advanced ?? {}) as Partial<SyncAdvanced>;
+  const interval = Number(s.intervalMin);
+  const conc = Number(s.concurrency);
+  const maxFile = Number(s.maxFileSizeMB);
+  const pto = Number(adv.proxyTimeoutSec);
+  return {
+    enabled: s.enabled === true,
+    account: {
+      url,
+      username: typeof acc.username === "string" ? acc.username : "",
+      password: typeof acc.password === "string" ? acc.password : "",
+    },
+    folders,
+    intervalMin: (SYNC_INTERVAL_OPTIONS as readonly number[]).includes(interval) ? interval : DEFAULT_SYNC.intervalMin,
+    concurrency: Number.isFinite(conc) ? Math.min(16, Math.max(1, Math.round(conc))) : DEFAULT_SYNC.concurrency,
+    conflictPolicy: s.conflictPolicy === "newerWins" ? "newerWins" : "keepBoth",
+    failSafe: s.failSafe !== false,
+    maxFileSizeMB: Number.isFinite(maxFile) ? Math.min(4096, Math.max(1, Math.round(maxFile))) : DEFAULT_SYNC.maxFileSizeMB,
+    ignorePatterns: Array.isArray(s.ignorePatterns)
+      ? s.ignorePatterns.filter((p): p is string => typeof p === "string" && !!p.trim()).slice(0, 50)
+      : [...DEFAULT_SYNC.ignorePatterns],
+    advanced: {
+      ignoreTlsErrors: adv.ignoreTlsErrors === true,
+      customTlsCerts: typeof adv.customTlsCerts === "string" ? adv.customTlsCerts : "",
+      proxyEnabled: adv.proxyEnabled === true,
+      proxyUrl: typeof adv.proxyUrl === "string" ? adv.proxyUrl.trim() : "",
+      proxyTimeoutSec: Number.isFinite(pto) ? Math.min(600, Math.max(0, Math.round(pto))) : 1,
+      syncOnWindowFocus: adv.syncOnWindowFocus === true,
+    },
+    lastSyncAt: Number.isFinite(Number(s.lastSyncAt)) && s.lastSyncAt != null ? Number(s.lastSyncAt) : null,
+  };
+}
+
 function sanitize(raw: unknown): Settings {
   const s = (raw ?? {}) as Partial<Settings>;
   const shortcuts: Record<string, string> = { ...DEFAULT_SHORTCUTS };
@@ -415,7 +535,7 @@ function sanitize(raw: unknown): Settings {
     autoSave: s.autoSave !== false,
     autoSaveDelay:
       Number.isFinite(Number(s.autoSaveDelay)) && Number(s.autoSaveDelay) >= 300
-        ? Number(s.autoSaveDelay)
+        ? Math.min(3000, Number(s.autoSaveDelay)) // D-10 修复：补上限，防手改 settings.json 注入超大延迟令自动保存近乎失效
         : DEFAULT_SETTINGS.autoSaveDelay,
     showTree: s.showTree !== false,
     showPreview: s.showPreview !== false,
@@ -462,6 +582,7 @@ function sanitize(raw: unknown): Settings {
       s.lowEndMode === "on" || s.lowEndMode === "off" ? s.lowEndMode : "auto",
     shortcuts,
     shortcutGuideShown: s.shortcutGuideShown === true,
+    sync: sanitizeSync(s.sync),
   };
 }
 
@@ -475,11 +596,11 @@ export async function loadSettings(): Promise<Settings> {
     }
   }
   if (!text) text = localStorage.getItem(LS_KEY);
-  if (!text) return { ...DEFAULT_SETTINGS, shortcuts: { ...DEFAULT_SHORTCUTS } };
+  if (!text) return { ...DEFAULT_SETTINGS, shortcuts: { ...DEFAULT_SHORTCUTS }, sync: JSON.parse(JSON.stringify(DEFAULT_SYNC)) };
   try {
     return sanitize(JSON.parse(text));
   } catch {
-    return { ...DEFAULT_SETTINGS, shortcuts: { ...DEFAULT_SHORTCUTS } };
+    return { ...DEFAULT_SETTINGS, shortcuts: { ...DEFAULT_SHORTCUTS }, sync: JSON.parse(JSON.stringify(DEFAULT_SYNC)) };
   }
 }
 

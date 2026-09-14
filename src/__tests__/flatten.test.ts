@@ -29,6 +29,8 @@ function base(over: Partial<FlattenInput> = {}): FlattenInput {
     hiddenPaths: [],
     hideAttachments: true,
     assetsDir: "_attachment",
+    attachmentMode: "perDocument",
+    attachmentTemplate: "{filename}_attachment",
     sort: "name",
     version: 1,
     ...over,

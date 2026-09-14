@@ -1,6 +1,9 @@
 <script lang="ts">
   // 状态栏：纯展示组件，把 App.svelte 里散落的 7 个 span 收敛进来。
   // 数据通过 props 传入，不持有内部状态，HMR / 测试都更稳定。
+  import { createEventDispatcher } from "svelte";
+  const dispatch = createEventDispatcher<{ syncNow: void }>();
+
   export let currentPath: string | null;
   export let status: string;
   export let cursorLine: number;
@@ -14,6 +17,10 @@
    * 这里给一个常驻徽标说明原因，避免被当成 bug。空串表示不显示。
    */
   export let previewNotice: string = "";
+  /** 同步状态文案（"上次 14:22" / "同步中 3/17"）；空串=未启用同步，不显示 */
+  export let syncText: string = "";
+  export let syncBusy: boolean = false;
+  export let syncConflicts: number = 0;
 </script>
 
 <footer class="statusbar">
@@ -25,6 +32,18 @@
     </span>
   {/if}
   <span class="spacer" />
+  {#if syncText}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <span
+      class="sb-sync"
+      class:busy={syncBusy}
+      title="点击立即同步（WebDAV）"
+      role="button"
+      tabindex="0"
+      on:click={() => dispatch("syncNow")}
+      on:keydown={(e) => e.key === "Enter" && dispatch("syncNow")}
+    >{syncBusy ? "⟳ " : "⇅ "}{syncText}{syncConflicts ? ` · 冲突 ${syncConflicts}` : ""}</span>
+  {/if}
   <span>行 {cursorLine} : 列 {cursorCol}</span>
   <span>{words} 字 · {chars} 字符</span>
   <span>{autoSave ? "自动保存开" : "自动保存关"}</span>
@@ -39,5 +58,19 @@
     padding: 0 6px;
     white-space: nowrap;
     cursor: help;
+  }
+  .sb-sync {
+    color: var(--text-2);
+    border-radius: 4px;
+    padding: 0 6px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .sb-sync:hover {
+    background: var(--border);
+    color: var(--text);
+  }
+  .sb-sync.busy {
+    color: var(--accent);
   }
 </style>
