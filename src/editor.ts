@@ -248,6 +248,14 @@ function wrapCmd(marker: string): Command {
   };
 }
 
+// 成对 HTML 标签命令（下划线等 CommonMark 无原生语法的行内样式）
+function tagCmd(open: string, close: string): Command {
+  return (v) => {
+    wrapTags(v, open, close);
+    return true;
+  };
+}
+
 const linkCmd: Command = (v) => {
   insertLink(v);
   return true;
@@ -264,7 +272,7 @@ function headingCmd(level: number): Command {
 const EDITOR_COMMANDS: Record<string, Command> = {
   "format.bold": wrapCmd("**"),
   "format.italic": wrapCmd("*"),
-  "format.underline": wrapCmd("__"),
+  "format.underline": tagCmd("<u>", "</u>"),
   "format.strike": wrapCmd("~~"),
   "format.link": linkCmd,
   "format.h1": headingCmd(1),
@@ -585,8 +593,8 @@ export function getDoc(view: EditorView): string {
 
 // ---------------- 编辑命令（工具栏共用）----------------
 
-// 行内包裹 / 取消包裹：选中文本前后加 marker（如 ** 加粗、* 斜体、__ 下划线、~~ 删除线）
-// 若选中文本已被同一 marker 包裹，则移除（toggle）。
+// 行内包裹 / 取消包裹：选中文本前后加同一 marker（如 ** 加粗、* 斜体、~~ 删除线）
+// 若选中文本已被同一 marker 包裹，则移除（toggle）。下划线等用不同开闭标签的样式走 wrapTags。
 export function wrapSelection(view: EditorView, marker: string, onSkip?: () => void): void {
   const { state } = view;
   // 大选区短路：避免 sliceDoc 全量物化（详见 MAX_FORMAT_SELECTION）
@@ -628,6 +636,43 @@ export function wrapSelection(view: EditorView, marker: string, onSkip?: () => v
   });
   view.dispatch(changes);
     requestAnimationFrame(() => view.focus());
+}
+
+// 成对 HTML 标签包裹 / 取消（下划线用 <u>，CommonMark 无原生下划线语法）。
+// 与 wrapSelection 同构，但开/闭标签可不同；支持「已包裹则取消」的 toggle 语义。
+export function wrapTags(view: EditorView, open: string, close: string): void {
+  const { state } = view;
+  if (selectionTooLarge(state)) return;
+  const changes = state.changeByRange((range) => {
+    const text = state.sliceDoc(range.from, range.to);
+    if (text.startsWith(open) && text.endsWith(close) && text.length >= open.length + close.length) {
+      const inner = text.slice(open.length, text.length - close.length);
+      return {
+        changes: { from: range.from, to: range.to, insert: inner },
+        range: EditorSelection.range(range.from, range.from + inner.length),
+      };
+    }
+    if (!text) {
+      const before = state.sliceDoc(Math.max(0, range.from - open.length), range.from);
+      const after = state.sliceDoc(range.to, Math.min(state.doc.length, range.to + close.length));
+      if (before === open && after === close) {
+        return {
+          changes: [
+            { from: range.from - open.length, to: range.from, insert: "" },
+            { from: range.to, to: range.to + close.length, insert: "" },
+          ],
+          range: EditorSelection.cursor(range.from - open.length),
+        };
+      }
+    }
+    const inner = text || "文本";
+    return {
+      changes: { from: range.from, to: range.to, insert: `${open}${inner}${close}` },
+      range: EditorSelection.range(range.from + open.length, range.from + open.length + inner.length),
+    };
+  });
+  view.dispatch(changes);
+  requestAnimationFrame(() => view.focus());
 }
 
 // 行前缀切换：列表 / 引用（支持多行选区，再次点击取消）

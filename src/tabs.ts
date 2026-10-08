@@ -6,7 +6,6 @@ import { normPath } from "./filetree/types";
 
 export interface TabPathLike {
   path: string;
-  [k: string]: unknown;
 }
 
 /**
@@ -37,4 +36,27 @@ export function renameTabPathDedup<T extends TabPathLike>(
     if (dupIdx === activeIdx) newActive = renamedIdx;
   }
   return { tabs: arr, activeIdx: newActive };
+}
+
+/**
+ * 关闭标签后应使用的 activeIdx（仅在移除后数组非空时调用）。
+ * 背景（C-2 修复）：旧实现只在「关闭的是当前激活标签」时调整 activeIdx，
+ * 漏掉了「关闭一个排在激活标签之前的干净标签」的情况——数组缩短 1 但
+ * activeIdx 未减，导致越界指向错误的标签对象，进而 save()/脏检测/关闭确认
+ * 全部对错标签生效，可静默丢失未保存改动。
+ *
+ * 三种情形（idx = 被关闭标签在【移除前】数组中的下标）：
+ * - idx === activeIdx：激活标签被关，切到相邻（原 Math.min(idx, len-1) 语义）。
+ * - idx < activeIdx：关闭激活标签之前的标签，激活位整体前移 1。
+ * - idx > activeIdx：关闭激活标签之后的标签，激活位不变。
+ */
+export function computeActiveIdxAfterClose(
+  tabs: TabPathLike[],
+  activeIdx: number,
+  idx: number
+): number {
+  const nextLen = tabs.length - 1;
+  if (idx === activeIdx) return Math.min(idx, Math.max(0, nextLen - 1));
+  if (idx < activeIdx) return activeIdx - 1;
+  return activeIdx;
 }

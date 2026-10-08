@@ -11,6 +11,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import {
   wrapSelection,
+  wrapTags,
   toggleLinePrefix,
   setHeading,
   toParagraph,
@@ -235,5 +236,31 @@ describe("TBL-004 表格列对齐", () => {
     let ret = true;
     cursorAnd(v, 2, (view) => (ret = setTableColumnAlign(view, "left")));
     expect(ret).toBe(false);
+  });
+});
+
+// ---------------- FMT-003b 下划线（wrapTags <u>，M1 修复：不再是加粗 __） ----------------
+describe("下划线 wrapTags（M1：产出 <u> 而非 __）", () => {
+  it("正：选区包裹成 <u>x</u>", () => {
+    const v = makeView("x");
+    selectAnd(v, 0, 1, (view) => wrapTags(view, "<u>", "</u>"));
+    expect(v.state.doc.toString()).toBe("<u>x</u>");
+    // 关键：不应产出被 markdown-it 解析为加粗的 __x__
+    expect(v.state.doc.toString()).not.toBe("__x__");
+  });
+  it("toggle：已包裹的选区再执行剥回", () => {
+    const v = makeView("<u>x</u>");
+    selectAnd(v, 0, 8, (view) => wrapTags(view, "<u>", "</u>"));
+    expect(v.state.doc.toString()).toBe("x");
+  });
+  it("空光标且两侧恰为 <u></u> → 剥除", () => {
+    const v = makeView("<u></u>");
+    cursorAnd(v, 3, (view) => wrapTags(view, "<u>", "</u>"));
+    expect(v.state.doc.toString()).toBe("");
+  });
+  it("无选区插入占位「文本」", () => {
+    const v = makeView("");
+    cursorAnd(v, 0, (view) => wrapTags(view, "<u>", "</u>"));
+    expect(v.state.doc.toString()).toBe("<u>文本</u>");
   });
 });

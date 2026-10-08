@@ -1122,6 +1122,7 @@
     }
     // 从资源管理器拖入文件（dragDropEnabled=true 时 Tauri 派发，与内部 Pointer 拖拽互不冲突）
     let unlistenDrop: UnlistenFn | null = null;
+    let disposed = false; // 若组件在 onDragDropEvent 的 Promise resolve 前被销毁，需就地回收，防泄漏（FileTree 会随聚焦模式反复挂/卸）
     try {
       getCurrentWebview()
         .onDragDropEvent((event) => {
@@ -1129,12 +1130,16 @@
             void importOsFiles(event.payload.paths, event.payload.position);
           }
         })
-        .then((fn) => (unlistenDrop = fn))
+        .then((fn) => {
+          if (disposed) { fn(); return; }
+          unlistenDrop = fn;
+        })
         .catch(() => {});
     } catch {
       // 非 Tauri 环境（浏览器调试 / jsdom 测试）getCurrentWebview 不存在，静默降级
     }
     return () => {
+      disposed = true;
       if (typeof window !== "undefined") {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
@@ -1203,7 +1208,7 @@
 
 <aside class="sidebar" style="width:{sidebarWidth}px">
   <div class="panel-head">
-    <span style="flex:1" />
+    <span style="flex:1"></span>
     <button on:click={() => addRoot()} title="添加文件夹为根目录">＋</button>
     <button on:click={() => newFileIn(newTargetDir())} title="新建笔记（在当前上下文文件夹下创建）">📄+</button>
     <button on:click={() => newFolderIn(newTargetDir())} title="新建文件夹（在当前上下文文件夹下创建）">+</button>
@@ -1379,7 +1384,7 @@
 
   <div class="tree-status">
     <span class="ts-count" title="当前列表项数">{flatTree.length} 项</span>
-    <span class="ts-spacer" />
+    <span class="ts-spacer"></span>
     {#if state.rootPaths.length}
       <button
         class="ts-btn"
@@ -1412,7 +1417,7 @@
           <button class="ctx-item" on:click={ctxNewFile}>📄 新建笔记</button>
           <button class="ctx-item" on:click={ctxNewFolder}>📁 新建文件夹</button>
           <button class="ctx-item" on:click={ctxRefreshFolder}>↻ 刷新此根</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
           <button class="ctx-item" on:click={ctxAddRoot}>＋ 添加文件夹为根</button>
           <button class="ctx-item danger" on:click={ctxRemoveRoot}>✕ 移除根目录</button>
         {:else if ctxMenu.kind === "folder"}
@@ -1421,29 +1426,29 @@
           <button class="ctx-item" on:click={ctxRename}>✎ 重命名</button>
           <button class="ctx-item" on:click={ctxReveal}>📂 在资源管理器打开</button>
           <button class="ctx-item" on:click={ctxRefreshFolder}>↻ 刷新</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
         {:else if ctxMenu.kind === "file"}
           <button class="ctx-item" on:click={ctxOpen}>📂 打开</button>
           <button class="ctx-item" on:click={ctxRename}>✎ 重命名</button>
           <button class="ctx-item" on:click={ctxReveal}>📂 在资源管理器打开</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
           <button class="ctx-item" on:click={ctxNewFile}>📄 新建笔记</button>
           <button class="ctx-item" on:click={ctxNewFolder}>📁 新建文件夹</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
         {:else}
           <button class="ctx-item" on:click={ctxCopy}>📋 复制到…</button>
           <button class="ctx-item" on:click={ctxMove}>➡ 移动到…</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
           <button class="ctx-item" on:click={ctxHide}>🙈 隐藏</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
           <button class="ctx-item danger" on:click={ctxDelete}>🗑 删除</button>
         {/if}
         {#if ctxMenu.kind !== "multi"}
           <button class="ctx-item" on:click={ctxCopy}>📋 复制到…</button>
           <button class="ctx-item" on:click={ctxMove}>➡ 移动到…</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
           <button class="ctx-item" on:click={ctxHide}>🙈 隐藏</button>
-          <div class="ctx-sep" />
+          <div class="ctx-sep"></div>
           <button class="ctx-item danger" on:click={ctxDelete}>🗑 删除</button>
         {/if}
       </div>

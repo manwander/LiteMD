@@ -18,6 +18,15 @@
   --hl-func: #4078f2;
   --hl-type: #c18401;
 
+  /* 补全缺失令牌（曾被 var() 引用却从未定义 → 背景/颜色失效；见 --bg-soft/--muted 使用处） */
+  --bg-soft: #eef0f2;      /* 输入框/筛选框底色 */
+  --muted: #565b61;        /* 次要图标/提示文字（深灰近黑，满足对比度） */
+  --text-3: #767b82;       /* 三级次要文字（替代对灰字再叠加 opacity） */
+  /* 语义状态色（此前散落为 6+ 个硬编码红/橙/绿），统一走令牌 + 深浅主题 */
+  --danger: #c62828;
+  --success: #1a7f37;
+  --warning: #b45309;
+
   /* 安全区域：支持刘海屏 / 圆角屏 / Windows 11 Mica */
   /* stylelint-disable-next-line value-keyword-case */
   --safe-top: env(safe-area-inset-top, 0px);
@@ -46,6 +55,14 @@
   --hl-func: #61afef;
   --hl-type: #e5c07b;
 
+  /* 补全缺失令牌（深色主题） */
+  --bg-soft: #2f3036;
+  --muted: #b3b4bb;
+  --text-3: #9a9ba3;
+  --danger: #ff6b6b;
+  --success: #4ade80;
+  --warning: #fbbf24;
+
   /* 安全区域 */
   /* stylelint-disable-next-line value-keyword-case */
   --safe-top: env(safe-area-inset-top, 0px);
@@ -57,6 +74,27 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* 键盘可达性：为可交互元素提供统一可见焦点环（此前大量 outline:none 无回补）。
+   仅 :focus-visible（键盘触发）显示，不影响鼠标点击。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+/* 尊重系统「减少动态效果」偏好（WCAG 2.3.3）：抑制动画/过渡，
+   低端集显也省下合成开销。仅降级视觉，不改变布局。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 html,
@@ -883,6 +921,20 @@ button:disabled:hover {
 .preview-content code {
   font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
   font-size: 13px;
+  background: var(--bg-soft);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+/* 预览链接：此前无 a{} 规则 → 回落浏览器默认蓝/紫，深色模式几乎不可读（finding #1） */
+.preview-content a,
+.preview-edit a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.preview-content a:hover,
+.preview-edit a:hover {
+  opacity: 0.8;
 }
 
 /* 预览：表格 */

@@ -31,7 +31,7 @@
   import StatusBar from "./StatusBar.svelte";
   import Toast from "./Toast.svelte";
   import FileTree from "./FileTree.svelte";
-  import { renameTabPathDedup } from "./tabs";
+  import { renameTabPathDedup, computeActiveIdxAfterClose } from "./tabs";
   import { resolveLowEnd, buildDegrade } from "./lowend";
   import { setDims, getDims, loadDims, saveDims } from "./image-dims";
   import type { EditRange } from "./preview/block-splitter";
@@ -46,6 +46,7 @@
     setDocStreaming,
     STREAM_THRESHOLD,
     wrapSelection,
+    wrapTags,
     toggleLinePrefix,
     insertLink,
     insertImage,
@@ -164,6 +165,9 @@
   // markdown-it 动态 import：解析器移出启动主 chunk，首次预览/导出时才加载
   let md: MarkdownIt | null = null;
   let mdLoading: Promise<MarkdownIt> | null = null;
+  // H-6：导出 HTML 时置真——图片规则跳过本地路径→asset:// 转换与目录绝对化，
+  // 保留原始（相对）引用，使导出的 HTML 连同 assets 目录一起分享时图片仍可显示。
+  let exportingHtml = false;
   function initMd(): Promise<MarkdownIt> {
     if (md) return Promise.resolve(md);
     if (!mdLoading) {
@@ -199,19 +203,23 @@
             }
             // 相对路径（收编后的 assets/xxx）：按当前笔记所在目录拼成绝对路径后再转换
             const isRemote = /^(https?:|data:|blob:)/.test(src);
-            if (!isRemote && !/^([A-Za-z]:[\\/]|\/)/.test(src) && currentPath) {
-              src = dirname(currentPath) + "/" + src;
-            }
-            // 本地绝对路径（Windows 盘符或 Unix / 开头）转 asset URL
-            if (/^([A-Za-z]:[\\/]|\/)/.test(src)) {
-              token.attrs![srcIndex][1] = convertFileSrc(src);
+            // H-6：导出 HTML 时跳过 asset:// 转换与绝对化，保留原始相对引用
+            // （http://asset.localhost/... 或 asset:// 离开本应用后一律无法解析）。
+            if (!exportingHtml) {
+              if (!isRemote && !/^([A-Za-z]:[\\/]|\/)/.test(src) && currentPath) {
+                src = dirname(currentPath) + "/" + src;
+              }
+              // 本地绝对路径（Windows 盘符或 Unix / 开头）转 asset URL
+              if (/^([A-Za-z]:[\\/]|\/)/.test(src)) {
+                token.attrs![srcIndex][1] = convertFileSrc(src);
+              }
             }
             // 懒加载：长文档多图时避免一次性全部解码，滚动到视口才加载
             if (token.attrIndex("loading") < 0) token.attrPush(["loading", "lazy"]);
             if (token.attrIndex("decoding") < 0) token.attrPush(["decoding", "async"]);
             // 尺寸内联（P1-5）：命中尺寸索引则注入 width/height，浏览器用 aspect-ratio
             // 预留空间，图片加载完成不再导致预览滚动跳变。缺失则不加，行为与普通图一致。
-            if (!isRemote && currentPath) {
+            if (!isRemote && !exportingHtml && currentPath) {
               const d = getDims(dirname(currentPath), rawRef);
               if (d) {
                 if (token.attrIndex("width") < 0) token.attrPush(["width", String(d.w)]);
@@ -280,6 +288,11 @@ console.log("Hello LiteMD");
   function copyFatalLog() {
     const text = fatalError ? `${fatalError.msg}\n${fatalError.stack}` : "";
     void navigator.clipboard?.writeText(text).catch(() => {});
+  }
+  // H-1：给用户一个「不重启也能继续」的逃生阀。多数操作异常已被就地收敛，
+  // 兜底页仅用于真正意外的运行时错误；关闭它可回到界面保存未保存内容。
+  function dismissFatal() {
+    fatalError = null;
   }
 
   // ---- 多标签管理 ----
@@ -427,7 +440,10 @@ console.log("Hello LiteMD");
     if (sessionTimer) clearTimeout(sessionTimer);
     sessionTimer = setTimeout(() => {
       const cur = tabs[activeIdx];
-      if (cur && view) {
+      // H2：流式载入 / 切换文档期间（suppressSave / loadingBigDoc / 该标签正被流式载入）
+      // 编辑器内容尚未就绪，此时 pullDoc 可能取到半载截断文本，一旦写入会话并在下次
+      // 启动自动落盘会截断原文件。此情形跳过内容同步，仅保存既有稳定状态。
+      if (cur && view && !suppressSave && !loadingBigDoc && docStreamTab !== cur) {
         cur.content = pullDoc();
         cur.dirty = docDirty || (lastSaved !== null && source !== lastSaved);
         cur.savedContent = lastSaved ?? cur.savedContent;
@@ -711,12 +727,27 @@ console.log("Hello LiteMD");
   async function onCloseTabSave() {
     const p = closeQ.current;
     if (!p) { closeQ = resolveCurrent(closeQ); return; }
-    // 保存目标标签：若不是激活标签，先切过去保存再关闭
     const idx = tabs.findIndex((t) => t.path === p);
     if (idx >= 0) {
-      if (idx !== activeIdx) await activateTab(idx);
-      if (currentPath) await save();
-      doCloseTab(p);
+      const tab = tabs[idx];
+      // H-2：直接写盘「被关闭的那个标签」，不再依赖 activateTab→save 对
+      // 「当前激活标签 / currentPath」的隐式耦合。旧实现里 save() 在
+      // suppressSave / lastSaved===null / loadFailed 时会静默早退（不抛错），
+      // 随后仍无条件 doCloseTab → 用户点「保存并关闭」却被无保存关闭，丢失改动。
+      if (idx === activeIdx) syncTabState(tab); // 激活标签：先拉编辑器最新全文进 tab.content
+      if (tab.loadFailed) {
+        // 载入失败：内容与磁盘无关联，绝不写盘覆盖，等同「不保存关闭」
+        doCloseTab(p);
+      } else {
+        try {
+          await writeFile(tab.path, tab.content);
+          tab.savedContent = tab.content;
+          tab.dirty = false;
+          doCloseTab(p); // 仅确认写盘成功后才关闭
+        } catch (e) {
+          ioFail("保存并关闭", e); // 失败则保留标签，让用户重试或选择「不保存关闭」
+        }
+      }
     }
     closeQ = resolveCurrent(closeQ);
   }
@@ -743,9 +774,13 @@ console.log("Hello LiteMD");
     const idx = tabs.findIndex((t) => t.path === path);
     if (idx < 0) return;
     if (tabs[idx] === docStreamTab) abortDocStream(); // 关闭正在流式载入的标签才中止流
+    // 关掉针对本标签排队的挂起定时器，防止其在 800ms~1.5s 后于下一个活动标签上误触发。
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     const wasActive = idx === activeIdx;
     const wasPath = tabs[idx].path;
     const next = tabs.filter((t) => t.path !== path);
+    const newActive = computeActiveIdxAfterClose(tabs, activeIdx, idx); // C-2
     tabs = next;
     if (next.length === 0) {
       // 预览编辑模式：丢弃未回写的编辑（标签已关闭），退出模式并清空容器，
@@ -773,10 +808,14 @@ console.log("Hello LiteMD");
       previewEdits = undefined;
       previewSource = "";
       previewStale = false;
-    } else if (wasActive) {
-      activeIdx = Math.min(idx, next.length - 1);
-      applyTabState(next[activeIdx]);
-      settings.lastFile = next[activeIdx].path;
+    } else {
+      // C-2：关闭非激活标签时，若它排在激活标签之前，激活索引需前移，
+      // 否则 tabs[activeIdx] 会指向错误的标签（save / 脏检测 / 关闭确认全部错位）。
+      activeIdx = newActive;
+      if (wasActive) {
+        applyTabState(next[activeIdx]);
+        settings.lastFile = next[activeIdx].path;
+      }
     }
     saveSession();
     updateTitle();
@@ -905,7 +944,7 @@ console.log("Hello LiteMD");
           if (res.count > 0) {
             await writeFile(mdNew, res.text);
             // 当前打开的文档：同步编辑器内容，避免预览里图裂
-            if (currentPath && norm(currentPath) === norm(mdNew)) {
+            if (currentPath && norm(currentPath) === norm(mdNew) && view) {
               suppressSave = true;
               setDoc(view, res.text);
               source = res.text;
@@ -1248,6 +1287,11 @@ console.log("Hello LiteMD");
     return settings.theme;
   }
 
+  // 系统配色变化回调：顶层定义保证函数引用稳定，matchMedia 监听可幂等 remove/add
+  const onScheme = () => {
+    if (settings.theme === "auto") applyAppearance();
+  };
+
   function applyAppearance() {
     const dark = resolvedTheme() === "dark";
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -1260,30 +1304,35 @@ console.log("Hello LiteMD");
     let disposed = false;
 
     // 轻量崩溃日志：仅记录未捕获异常，供排障回传（平时无日志、不影响体验）
+    // H4：命名 handler + 保存 matchMedia 引用，卸载时统一 remove，
+    // 否则 App 重挂载（或 HMR）会叠加 window error/rejection 监听与 onScheme 监听。
+    const sendLog = (msg: string) => { try { void logFrontend(msg); } catch { /* ignore */ } };
+    const onWinError = (e: any) => {
+      sendLog(`ERROR ${e.message} @ ${e.filename}:${e.lineno} :: ${e.error && e.error.stack ? e.error.stack : ""}`);
+      // 仅对未被 try/catch 兜住的运行时错误展示错误页（避免正常流程的轻微报错刷屏）
+      if (!fatalError) fatalError = { msg: e.message || "未知错误", stack: e.error?.stack || "" };
+    };
+    const onWinRejection = (e: any) => {
+      sendLog(`UNHANDLED_REJECTION ${e.reason && e.reason.stack ? e.reason.stack : String(e.reason)}`);
+      if (!fatalError)
+        fatalError = {
+          msg: String(e.reason?.message || e.reason || "未处理的异步异常"),
+          stack: e.reason?.stack || String(e.reason),
+        };
+    };
+    let schemeMq: MediaQueryList | null = null;
     if (typeof window !== "undefined") {
-      const sendLog = (msg: string) => { try { void logFrontend(msg); } catch { /* ignore */ } };
-      window.addEventListener("error", (e: any) => {
-        sendLog(`ERROR ${e.message} @ ${e.filename}:${e.lineno} :: ${e.error && e.error.stack ? e.error.stack : ""}`);
-        // 仅对未在被 try/catch 兜住的运行时错误展示错误页（避免正常流程的轻微报错刷屏）
-        if (!fatalError) fatalError = { msg: e.message || "未知错误", stack: e.error?.stack || "" };
-      });
-      window.addEventListener("unhandledrejection", (e: any) => {
-        sendLog(`UNHANDLED_REJECTION ${e.reason && e.reason.stack ? e.reason.stack : String(e.reason)}`);
-        if (!fatalError)
-          fatalError = {
-            msg: String(e.reason?.message || e.reason || "未处理的异步异常"),
-            stack: e.reason?.stack || String(e.reason),
-          };
-      });
+      window.addEventListener("error", onWinError);
+      window.addEventListener("unhandledrejection", onWinRejection);
 
       // 自动主题：跟随系统配色（仅当 theme=auto 时响应系统切换）
+      // 幂等：先 remove 再 add（onScheme 为稳定函数引用），防 HMR 重入导致监听累积
       try {
-        const mq = window.matchMedia("(prefers-color-scheme: dark)");
-        const onScheme = () => {
-          if (settings.theme === "auto") applyAppearance();
-        };
-        if (mq.addEventListener) mq.addEventListener("change", onScheme);
-        else if ((mq as any).addListener) (mq as any).addListener(onScheme);
+        schemeMq = window.matchMedia("(prefers-color-scheme: dark)");
+        if (schemeMq.removeEventListener) schemeMq.removeEventListener("change", onScheme);
+        else if ((schemeMq as any).removeListener) (schemeMq as any).removeListener(onScheme);
+        if (schemeMq.addEventListener) schemeMq.addEventListener("change", onScheme);
+        else if ((schemeMq as any).addListener) (schemeMq as any).addListener(onScheme);
       } catch {
         /* 旧浏览器无 matchMedia，忽略 */
       }
@@ -1305,14 +1354,15 @@ console.log("Hello LiteMD");
 
     // 初始化 Tauri 窗口 API
     import("@tauri-apps/api/window").then((mod) => {
-      tauriWindow = mod.getCurrentWindow() as any;
+      const win = mod.getCurrentWindow() as any;
+      tauriWindow = win;
       // 关闭拦截：未保存时确认
-      tauriWindow.onCloseRequested((e: any) => {
+      win.onCloseRequested((e: any) => {
         // 先拦截（阻止默认关闭），再走统一确认流程（兼容 Alt+F4 等系统关闭）
         e.preventDefault();
         // 延迟到事件处理结束后再弹同步确认框，避免阻塞关闭事件回调
         setTimeout(() => requestClose(), 0);
-      }).then((fn) => { unlistenClose = fn; }).catch(() => {});
+      }).then((fn: () => void) => { if (disposed) { fn(); return; } unlistenClose = fn; }).catch(() => {});
       // 拖拽文件到窗口：.md 直接打开；图片文件收编并插入
       // 注意：getCurrentWindow().onDragDropEvent 的数据在 e.payload 里（payload.type / payload.paths），
       // 顶层没有 type/paths 字段——直接读 e.type 会永远为 undefined 导致拖拽失效。
@@ -1325,10 +1375,10 @@ console.log("Hello LiteMD");
           const imgFile = paths.find((p: string) => /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i.test(p));
           if (imgFile) void insertImageByPath(imgFile);
         }
-      }).then((fn: () => void) => { unlistenDrop = fn; }).catch(() => {});
+      }).then((fn: () => void) => { if (disposed) { fn(); return; } unlistenDrop = fn; }).catch(() => {});
       // 窗口拖拽/缩放：置忙挂起后台任务（P1-1）
-      tauriWindow!.onMoved(markWindowBusy).then((fn: () => void) => { unlistenMoved = fn; }).catch(() => {});
-      tauriWindow!.onResized(markWindowBusy).then((fn: () => void) => { unlistenResized = fn; }).catch(() => {});
+      tauriWindow!.onMoved(markWindowBusy).then((fn: () => void) => { if (disposed) { fn(); return; } unlistenMoved = fn; }).catch(() => {});
+      tauriWindow!.onResized(markWindowBusy).then((fn: () => void) => { if (disposed) { fn(); return; } unlistenResized = fn; }).catch(() => {});
     }).catch(() => {
       // 浏览器调试模式，无 Tauri 窗口 API
     });
@@ -1438,6 +1488,7 @@ console.log("Hello LiteMD");
         }
         for (const p of payload) openFileByPathSafe(p);
       }).then((unlisten) => {
+        if (disposed) { unlisten(); return; }
         unlistenOpenFiles = unlisten;
       }).catch(() => {});
 
@@ -1689,6 +1740,23 @@ console.log("Hello LiteMD");
       perfObservers.forEach((o) => { try { o.disconnect(); } catch { /* ignore */ } });
       document.body.classList.remove("window-busy");
       window.removeEventListener("paste", onPaste);
+      // H4：移除崩溃兜底监听与系统配色监听，防 App 重挂载时监听累积。
+      if (typeof window !== "undefined") {
+        window.removeEventListener("error", onWinError);
+        window.removeEventListener("unhandledrejection", onWinRejection);
+        if (schemeMq) {
+          try {
+            if (schemeMq.removeEventListener) schemeMq.removeEventListener("change", onScheme);
+            else if ((schemeMq as any).removeListener) (schemeMq as any).removeListener(onScheme);
+          } catch { /* ignore */ }
+        }
+      }
+      // 清除仍可能指向「已关闭标签」的挂起定时器，避免陈旧自动保存/渲染/会话计时器
+      // 在 800ms~1.5s 后对新活动标签误触发（防错时写盘）。
+      if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      if (sessionTimer) { clearTimeout(sessionTimer); sessionTimer = null; }
+      if (previewEditTimer) { clearTimeout(previewEditTimer); previewEditTimer = null; }
     };
   });
 
@@ -1932,10 +2000,10 @@ console.log("Hello LiteMD");
         return `![${alt}](${src})`;
       },
     });
-    // 下划线：execCommand('underline') 产出 <u> → 还原为编辑器模式的 __ 标记
+    // 下划线：<u> 保留为原始 HTML（CommonMark 无原生下划线语法；编辑器与预览均 html:true 可识别）
     t.addRule("litemd-underline", {
       filter: "u",
-      replacement: (content) => (content ? `__${content}__` : ""),
+      replacement: (content) => (content ? `<u>${content}</u>` : ""),
     });
     // 硬换行：<br> → 「两个空格+换行」，对齐编辑器 Shift+Enter 软换行（同段内）
     t.addRule("litemd-br", { filter: "br", replacement: () => "  \n" });
@@ -2101,6 +2169,19 @@ console.log("Hello LiteMD");
     updateTitle();
   }
 
+  // H-1：把可恢复的 IPC/写盘异常收敛为「状态栏 + toast」，绝不冒泡成全屏致命页。
+  function ioFail(label: string, e: unknown): void {
+    const msg = label + "失败：" + String((e as { message?: string })?.message ?? e);
+    status = msg;
+    logError(msg);
+    showToast(msg, "error", 4000);
+  }
+
+  // M6：导出产物里内插文件名等文本时的最小 HTML 转义（防 </title>/<img onerror> 注入）。
+  function escapeHtmlText(s: string): string {
+    return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+  }
+
   async function save() {
     if (previewEditMode) flushPreviewEdit(); // 预览编辑模式下先同步编辑器内容
     // P0 数据安全：applyTabState 期间（currentPath 已设、source/lastSaved 尚未同步到新文档）
@@ -2128,7 +2209,14 @@ console.log("Hello LiteMD");
       updateTitle();
       return;
     }
-    await writeFile(currentPath, text);
+    try {
+      await writeFile(currentPath, text);
+    } catch (e) {
+      // H-1：普通写盘失败（磁盘满 / 文件被占用 / 权限）是可恢复错误，绝不能冒泡到
+      // 全局 unhandledrejection → 全屏「致命错误」页劫持用户的全部未保存文档。
+      ioFail("保存", e);
+      return;
+    }
     source = text;
     lastSaved = text;
     docDirty = false;
@@ -2154,7 +2242,12 @@ console.log("Hello LiteMD");
     if (!p) return;
     const np = norm(p);
     const text = pullDoc();
-    await writeFile(np, text);
+    try {
+      await writeFile(np, text);
+    } catch (e) {
+      ioFail("另存为", e);
+      return;
+    }
     // 目标路径已在其它标签打开：写盘后关闭当前标签，已有标签采用最新内容（避免重复标签）
     const dup = tabs.findIndex((t) => t.path === np && t.path !== currentPath);
     if (dup >= 0) {
@@ -2194,8 +2287,12 @@ console.log("Hello LiteMD");
     }
     const p = await pickSaveFile();
     if (!p) return;
-    await writeFile(p, pullDoc());
-    status = "已导出 " + basename(p);
+    try {
+      await writeFile(p, pullDoc());
+      status = "已导出 " + basename(p);
+    } catch (e) {
+      ioFail("导出 Markdown", e);
+    }
   }
 
   async function exportPdfDoc() {
@@ -2206,9 +2303,13 @@ console.log("Hello LiteMD");
     const p = await pickSavePdfFile();
     if (!p) return;
     const finalPath = /\.pdf$/i.test(p) ? p : p + ".pdf";
-    await exportPdf(finalPath, pullDoc());
-    status = "已导出 " + basename(finalPath);
-    logOp("导出PDF: " + finalPath);
+    try {
+      await exportPdf(finalPath, pullDoc());
+      status = "已导出 " + basename(finalPath);
+      logOp("导出PDF: " + finalPath);
+    } catch (e) {
+      ioFail("导出 PDF", e);
+    }
   }
 
   async function exportHtmlDoc() {
@@ -2220,12 +2321,20 @@ console.log("Hello LiteMD");
     if (!p) return;
     const title = basename(currentPath);
     const m = md ?? (await initMd()); // 导出前确保解析器就绪（首导触发动态加载）
+    // H-6：渲染导出正文期间关闭 asset:// 转换，图片保留相对引用（否则导出件图全断）。
+    let bodyHtml = "";
+    exportingHtml = true;
+    try {
+      bodyHtml = safeRender(m, pullDoc());
+    } finally {
+      exportingHtml = false;
+    }
     const full = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${title}</title>
+<title>${escapeHtmlText(title)}</title>
 <style>
   body{max-width:780px;margin:40px auto;padding:0 20px;font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.7;color:#1f2329}
   pre{background:#f7f8f9;border:1px solid #e5e7eb;border-radius:6px;padding:12px;overflow:auto}
@@ -2235,12 +2344,16 @@ console.log("Hello LiteMD");
 </style>
 </head>
 <body>
-${safeRender(m, pullDoc())}
+${bodyHtml}
 </body>
 </html>`;
-    await exportHtml(p, full);
-    status = "已导出 " + basename(p);
-    logOp("导出HTML: " + p);
+    try {
+      await exportHtml(p, full);
+      status = "已导出 " + basename(p);
+      logOp("导出HTML: " + p);
+    } catch (e) {
+      ioFail("导出 HTML", e);
+    }
   }
 
   async function exportBundledMd() {
@@ -2251,12 +2364,16 @@ ${safeRender(m, pullDoc())}
     const baseDir = currentPath.replace(/[\\/][^\\/]+$/, "") || currentPath;
     const savePath = await pickSaveBundledFile(currentPath);
     if (!savePath) return; // 用户取消
-    const res = await exportBundledMarkdown(savePath, pullDoc(), baseDir);
-    let msg = `已导出自包含 Markdown（内嵌 ${res.embedded} 张图片）`;
-    if (res.failed > 0) msg += `，${res.failed} 张读取失败已保留原路径`;
-    if (res.skipped > 0) msg += `，${res.skipped} 张为外链/已内嵌跳过`;
-    status = msg;
-    logOp("导出自包含MD: " + savePath);
+    try {
+      const res = await exportBundledMarkdown(savePath, pullDoc(), baseDir);
+      let msg = `已导出自包含 Markdown（内嵌 ${res.embedded} 张图片）`;
+      if (res.failed > 0) msg += `，${res.failed} 张读取失败已保留原路径`;
+      if (res.skipped > 0) msg += `，${res.skipped} 张为外链/已内嵌跳过`;
+      status = msg;
+      logOp("导出自包含MD: " + savePath);
+    } catch (e) {
+      ioFail("导出自包含 Markdown", e);
+    }
   }
 
   // ---------- 自动保存 ----------
@@ -2528,7 +2645,7 @@ ${safeRender(m, pullDoc())}
   }
   const bold = () => (previewExec("bold") || (view && wrapSelection(view, "**")));
   const italic = () => (previewExec("italic") || (view && wrapSelection(view, "*")));
-  const underline = () => (previewExec("underline") || (view && wrapSelection(view, "__")));
+  const underline = () => (previewExec("underline") || (view && wrapTags(view, "<u>", "</u>")));
   const strike = () => (previewExec("strikeThrough") || (view && wrapSelection(view, "~~")));
   // Q-19：编辑器路径改走 setHeading（与 Alt+1 快捷键、行内快捷菜单同一实现：
   // 剥离旧级、toggle 还原、设后续行），不再用 toggleLinePrefix 的浅行为
@@ -2828,23 +2945,29 @@ ${safeRender(m, pullDoc())}
     const maxEdge = degrade.imageMaxEdge;
     const quality = degrade.webpQuality;
     try {
-      let rel: string;
+      let rel: string | undefined;
       if (imageWorkerSupported()) {
         // 主线程零解码/转码：Worker 内完成降采样 + WebP 编码，仅回传数百 KB 字节（transferable）
-        const res = await processImageInWorker(file, {
-          maxEdge,
-          quality: lossless ? 1 : quality,
-          lossless,
-          format: lossless ? "png" : "webp",
-        });
-        // 已在 Worker 内转 WebP/PNG，Rust 侧不再二次压缩（compress=false）；
-        // raw IPC 直传数百 KB 字节，免 base64 编码（失败自动回退 base64）
-        rel = await sendAssetBytes(res.format, res.bytes, false, settings.jpegQuality);
-        // 记录并 best-effort 落盘图片尺寸，供预览渲染规则注入 width/height 预留空间（P1-5）
-        setDims(base, rel, res.width, res.height);
-        void saveDims(base, currentAttachmentName());
-      } else {
-        // 回退：旧 WebView / 无 Worker 环境；raw IPC 直传原图字节，
+        try {
+          const res = await processImageInWorker(file, {
+            maxEdge,
+            quality: lossless ? 1 : quality,
+            lossless,
+            format: lossless ? "png" : "webp",
+          });
+          // 已在 Worker 内转 WebP/PNG，Rust 侧不再二次压缩（compress=false）；
+          // raw IPC 直传数百 KB 字节，免 base64 编码（失败自动回退 base64）
+          rel = await sendAssetBytes(res.format, res.bytes, false, settings.jpegQuality);
+          // 记录并 best-effort 落盘图片尺寸，供预览渲染规则注入 width/height 预留空间（P1-5）
+          setDims(base, rel, res.width, res.height);
+          void saveDims(base, currentAttachmentName());
+        } catch (we) {
+          // C-1/M3 兜底：Worker 转码运行期失败（旧逻辑会直接放弃整张图）→ 回退原图字节路径。
+          logError("图片 Worker 转码失败，回退原图直传: " + String(we));
+        }
+      }
+      if (!rel) {
+        // 回退：旧 WebView / Worker 不支持或转码失败；raw IPC 直传原图字节，
         // 免主线程 uint8ToBase64（10MB 图约 200~280ms 同步阻塞）
         const buf = await file.arrayBuffer();
         rel = await sendAssetBytes(ext, new Uint8Array(buf), settings.compressImages, settings.jpegQuality);
@@ -3119,7 +3242,17 @@ ${safeRender(m, pullDoc())}
 
   function run(e: KeyboardEvent, fn: () => unknown) {
     e.preventDefault();
-    fn();
+    // H-1：快捷键 handler 可能是 async（save/open/export…）。同步异常与未处理的
+    // Promise rejection 都在此兜住并转成状态栏提示，避免冒泡到全局 unhandledrejection
+    // 而把可恢复的瞬时失败升级成全屏「致命错误」页。
+    try {
+      const r = fn();
+      if (r && typeof (r as Promise<unknown>).then === "function") {
+        (r as Promise<unknown>).catch((err) => ioFail("操作", err));
+      }
+    } catch (err) {
+      ioFail("操作", err);
+    }
   }
 
   // ---- 关闭流程（未保存确认）----
@@ -3252,7 +3385,7 @@ ${safeRender(m, pullDoc())}
             打开文件夹 <span>{accel("file.openFolder")}</span>
           </div>
           {#if settings.recentFiles.length}
-            <div class="sep-line" />
+            <div class="sep-line"></div>
             <div class="menu-header">最近打开</div>
             {#each settings.recentFiles as rf}
               <div on:click={() => { menuOpen = false; openFileByPath(rf); }} title={rf}>
@@ -3260,7 +3393,7 @@ ${safeRender(m, pullDoc())}
               </div>
             {/each}
           {/if}
-          <div class="sep-line" />
+          <div class="sep-line"></div>
           <div on:click={() => { menuOpen = false; save(); }}>
             保存 <span>{accel("file.save")}</span>
           </div>
@@ -3280,11 +3413,11 @@ ${safeRender(m, pullDoc())}
           <div on:click={() => { menuOpen = false; exportBundledMd(); }}>
             导出自包含 MD（图片内嵌）<span>单文件</span>
           </div>
-          <div class="sep-line" />
+          <div class="sep-line"></div>
           <div on:click={() => { menuOpen = false; openFolderSearch(); }}>
             文件夹内查找替换 <span>Ctrl + Shift + F</span>
           </div>
-          <div class="sep-line" />
+          <div class="sep-line"></div>
           <div on:click={() => { menuOpen = false; migrateImages(); }}>
             迁移图片附件 <span>绝对路径→相对</span>
           </div>
@@ -3294,7 +3427,7 @@ ${safeRender(m, pullDoc())}
           <div on:click={() => { menuOpen = false; doCleanupAssets(); }}>
             清理未引用附件 <span>{settings.attachmentMode === "shared" ? settings.assetsDir + "/" : "按文档目录"}</span>
           </div>
-          <div class="sep-line" />
+          <div class="sep-line"></div>
           <div on:click={() => { menuOpen = false; showSettings = true; }}>
             设置 <span>快捷键 / 外观</span>
           </div>
@@ -3306,7 +3439,7 @@ ${safeRender(m, pullDoc())}
       <button on:click={doUndo} title="撤销 {accel('edit.undo')}">↶</button>
       <button on:click={doRedo} title="重做 {accel('edit.redo')}">↷</button>
       <button on:click={openFolderSearch} title="文件夹内查找替换 Ctrl+Shift+F">🔍</button>
-      <span class="sep" />
+      <span class="sep"></span>
       <button on:click={bold} title="加粗 {accel('format.bold')}"><b>B</b></button>
       <button on:click={italic} title="斜体 {accel('format.italic')}"><i>I</i></button>
       <button on:click={underline} title="下划线 {accel('format.underline')}"><u>U</u></button>
@@ -3322,7 +3455,7 @@ ${safeRender(m, pullDoc())}
         {#if colorMenu}
           <div class="color-pop">
             {#each PALETTE as hex}
-              <button class="swatch" style="background:{hex}" title={hex} on:click={() => pickColor(hex)} />
+              <button class="swatch" style="background:{hex}" title={hex} on:click={() => pickColor(hex)}></button>
             {/each}
             <label class="custom-color" title="自定义颜色">
               <input type="color" value="#ff0000" on:change={onCustomColor} />
@@ -3331,7 +3464,7 @@ ${safeRender(m, pullDoc())}
           </div>
         {/if}
       </span>
-      <span class="sep" />
+      <span class="sep"></span>
       <button on:click={h1} title="标题">H</button>
       <button on:click={ul} title="无序列表">•</button>
       <button on:click={ol} title="有序列表">1.</button>
@@ -3340,11 +3473,11 @@ ${safeRender(m, pullDoc())}
       <button on:click={link} title="插入链接 {accel('format.link')}">🔗</button>
       <button on:click={insertImg} title="插入图片">🖼</button>
       <button on:click={codeBlock} title="插入代码块">{'{ }'}</button>
-      <span class="sep" />
+      <span class="sep"></span>
       <button on:click={() => alignCol("left")} title="左对齐（表格列）">⬅</button>
       <button on:click={() => alignCol("center")} title="居中对齐（表格列）">☰</button>
       <button on:click={() => alignCol("right")} title="右对齐（表格列）">➡</button>
-      <span class="sep" />
+      <span class="sep"></span>
       <button on:click={toggleTheme} title="切换主题">
         {settings.theme === "dark" ? "☀" : "🌙"}
       </button>
@@ -3396,7 +3529,7 @@ ${safeRender(m, pullDoc())}
         on:collapse={() => (showTree = false)}
       />
       <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="splitter" on:mousedown={(e) => startDrag("sidebar", e)} title="拖动调整宽度" />
+      <div class="splitter" on:mousedown={(e) => startDrag("sidebar", e)} title="拖动调整宽度"></div>
     {/if}
 
     <main class="editor">
@@ -3404,10 +3537,13 @@ ${safeRender(m, pullDoc())}
         <div class="tabbar" on:auxclick={onTabbarAuxClick}>
           <div class="tab-scroll">
             {#each tabs as tab, i (tab.path)}
+              <!-- svelte-ignore a11y-click-events-have-key-events -->
               <div
                 class="tab"
                 class:active={i === activeIdx}
                 data-path={tab.path}
+                role="tab"
+                tabindex="-1"
                 on:click={() => activateTab(i)}
                 on:contextmenu|preventDefault={(e) => {
                   // 右键标签：显示操作菜单（关闭/关闭其他/关闭全部）
@@ -3423,7 +3559,7 @@ ${safeRender(m, pullDoc())}
               </div>
             {/each}
           </div>
-          <span style="flex:1" />
+          <span style="flex:1"></span>
           {#if !showTree}
             <button class="tab-act" on:click={() => (showTree = true)} title="展开目录">›</button>
           {/if}
@@ -3459,6 +3595,7 @@ ${safeRender(m, pullDoc())}
         ></div>
       {/if}
       <!-- 编辑器容器始终保留在 DOM（仅隐藏），避免 CodeMirror 视图被销毁后无法重新挂载 -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div
         class="editor-host"
         bind:this={editorHost}
@@ -3467,20 +3604,20 @@ ${safeRender(m, pullDoc())}
       ></div>
       {#if loadingBigDoc}
         <div class="loading-veil" role="status" aria-live="polite">
-          <div class="loading-spinner" />
+          <div class="loading-spinner"></div>
           <div class="loading-text">正在载入大文档…{(streamProgress * 100).toFixed(0)}%</div>
-          <div class="loading-bar"><div class="loading-bar-fill" style="width:{(streamProgress * 100).toFixed(1)}%" /></div>
+          <div class="loading-bar"><div class="loading-bar-fill" style="width:{(streamProgress * 100).toFixed(1)}%"></div></div>
         </div>
       {/if}
     </main>
 
     {#if showPreview}
       <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="splitter" on:mousedown={(e) => startDrag("preview", e)} title="拖动调整宽度" />
+      <div class="splitter" on:mousedown={(e) => startDrag("preview", e)} title="拖动调整宽度"></div>
       <section class="preview" style="width:{previewWidth}px">
         <div class="panel-head">
           <span>预览</span>
-          <span style="flex:1" />
+          <span style="flex:1"></span>
           {#if previewStale}
             <span class="pv-hint" title="文档超过实时预览阈值，打字时不再自动更新预览">已暂停实时预览</span>
             <button
@@ -3529,22 +3666,23 @@ ${safeRender(m, pullDoc())}
   <!-- 行内快捷菜单（gutter 按钮弹出）-->
   {#if quickMenu}
     <!-- svelte-ignore a11y-click-events-have-key-events -->
+    <!-- svelte-ignore a11y-no-static-element-interactions -->
     <div class="quick-overlay" on:click={closeQuickMenu}>
-      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div
         class="quick-menu"
         style="top:{quickMenu.top}px;left:{quickMenu.left}px"
         on:click|stopPropagation
       >
-        <div class="quick-item" on:click={() => quickHeading(1)}><span class="qh">H1</span>一级标题</div>
-        <div class="quick-item" on:click={() => quickHeading(2)}><span class="qh">H2</span>二级标题</div>
-        <div class="quick-item" on:click={() => quickHeading(3)}><span class="qh">H3</span>三级标题</div>
-        <div class="quick-item" on:click={() => quickHeading(4)}><span class="qh">H4</span>四级标题</div>
-        <div class="quick-item" on:click={() => quickHeading(5)}><span class="qh">H5</span>五级标题</div>
-        <div class="quick-sep" />
-        <div class="quick-item" on:click={quickParagraph}><span class="qh">¶</span>正文</div>
-        <div class="quick-item" on:click={quickCodeBlock}><span class="qh">{'{}'}</span>代码块</div>
-        <div class="quick-item" on:click={quickBold}><span class="qh"><b>B</b></span>加粗</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={() => quickHeading(1)}><span class="qh">H1</span>一级标题</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={() => quickHeading(2)}><span class="qh">H2</span>二级标题</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={() => quickHeading(3)}><span class="qh">H3</span>三级标题</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={() => quickHeading(4)}><span class="qh">H4</span>四级标题</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={() => quickHeading(5)}><span class="qh">H5</span>五级标题</div>
+        <div class="quick-sep"></div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={quickParagraph}><span class="qh">¶</span>正文</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={quickCodeBlock}><span class="qh">{'{}'}</span>代码块</div>
+        <div class="quick-item" role="menuitem" tabindex="-1" on:click={quickBold}><span class="qh"><b>B</b></span>加粗</div>
       </div>
     </div>
   {/if}
@@ -3555,7 +3693,7 @@ ${safeRender(m, pullDoc())}
     ["rh-nw", "NorthWest"], ["rh-ne", "NorthEast"], ["rh-sw", "SouthWest"], ["rh-se", "SouthEast"],
   ] as [cls, dir]}
     <!-- svelte-ignore a11y-no-static-element-interactions -->
-    <div class="rh {cls}" on:mousedown={() => winResize(dir)} />
+    <div class="rh {cls}" on:mousedown={() => winResize(dir)}></div>
   {/each}
 
   <!-- 全局操作反馈 Toast（成功/失败/提示，自动消失） -->
@@ -3569,6 +3707,7 @@ ${safeRender(m, pullDoc())}
         <div class="fatal-msg">{fatalError.msg}</div>
         <pre class="fatal-stack">{fatalError.stack}</pre>
         <div class="fatal-actions">
+          <button on:click={dismissFatal}>继续编辑</button>
           <button on:click={copyFatalLog}>复制错误信息</button>
           <button class="primary" on:click={() => location.reload()}>重启应用</button>
         </div>
@@ -3605,7 +3744,7 @@ ${safeRender(m, pullDoc())}
       onSettingsChange();
     }}
     on:syncNow={() => void doSyncRun("normal")}
-    on:syncForce={(e) => void doSyncRun(e.detail.mode)}
+    on:syncForce={(e: CustomEvent<{ mode: "forceUpload" | "forceDownload" }>) => void doSyncRun(e.detail.mode)}
     on:export={() => {
       showSettings = false;
       exportHtmlDoc();

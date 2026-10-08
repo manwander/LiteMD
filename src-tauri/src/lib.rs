@@ -24,8 +24,13 @@ fn path_to_string(fp: Option<tauri_plugin_dialog::FilePath>) -> Option<String> {
 }
 
 // ---- 路径安全校验（ISSUE-001/002/009）----
-/// 校验并规范化路径：拒绝空路径、拒绝含 .. 穿越的路径、返回绝对路径。
-/// defense-in-depth：即使前端被 XSS 注入，也无法通过 IPC 读写任意文件。
+/// 词法规范化并拒绝相对穿越：拒绝空路径、就地消除 `..`/`.` 组件（`..` 越出起点即报错）。
+///
+/// 注意（审计 H3 澄清）：这里**只做词法层**的穿越防护，绝对路径会被原样接受——
+/// 因为本编辑器的正常用法就是打开/保存用户经系统对话框选择的任意位置文件。
+/// 因此它**不能**单独阻止「WebView 被 XSS 攻破后读写任意绝对路径」；该场景的真正防线是
+/// CSP（`script-src 'self'`）。若需纵深防御，应改为维护「经对话框授权的根集合」并要求
+/// 写/删目标 canonicalize 后落在其内——但那会改变冷启动文件关联等入口的语义，属产品决策。
 fn validate_path(path: &str) -> Result<PathBuf, String> {
     if path.trim().is_empty() {
         return Err("路径不能为空".to_string());
@@ -556,7 +561,8 @@ fn guard_deletable(path: &Path) -> Result<(), String> {
 /// 错误，由前端识别并二次确认后，才允许调用 `delete_path_permanent` 永久删除。
 #[tauri::command]
 fn delete_path(path: String) -> Result<(), String> {
-    let path = PathBuf::from(&path);
+    // H2 修复：删除前先经 validate_path 词法规范化并拒绝 .. 穿越（旧实现直接用裸路径）。
+    let path = validate_path(&path)?;
     if !path.exists() {
         return Err("路径不存在".to_string());
     }
@@ -567,7 +573,8 @@ fn delete_path(path: String) -> Result<(), String> {
 /// 永久删除（不可恢复）。仅在回收站不可用且用户二次确认后由前端调用。
 #[tauri::command]
 fn delete_path_permanent(path: String) -> Result<(), String> {
-    let path = PathBuf::from(&path);
+    // H2 修复：同样先规范化并拒绝 .. 穿越，再做根/浅层守卫。
+    let path = validate_path(&path)?;
     if !path.exists() {
         return Err("路径不存在".to_string());
     }
@@ -2241,8 +2248,12 @@ fn open_external(url: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &url])
+        // H5 修复：不再经 `cmd /c start`。cmd.exe 会二次解析引号/特殊字符（MSVC argv 的
+        // `\"` 转义对它无效），含空格 + 内嵌引号的 URL 可逃逸出 start 参数、追加执行任意命令。
+        // explorer.exe 直接把 URL 作为单个参数交给默认浏览器，不经 shell 解析
+        // （与 reveal_in_explorer 的无 shell 做法一致）。
+        std::process::Command::new("explorer")
+            .arg(&url)
             .spawn()
             .map_err(|e| e.to_string())?;
     }

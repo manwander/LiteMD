@@ -377,6 +377,33 @@ pub async fn run_folder_sync<T: Transport>(
     let label = default_copy_label();
     let (items, notes, protected) = build_plan(&local, &remote, &snap, &opts, &label);
 
+    // M5 修复：下载执行前未知远端体积，恶意/超大远端对象会被整体读入内存（并发 ≤16）
+    // 造成内存耗尽。PROPFIND 列表已带回每个对象的 size，这里据此过滤超限的下载项：
+    // 仅跳过下载，不影响上传、也不会因远端「看似消失」而误删本地副本。
+    let mut items = items;
+    if opts.max_file_size > 0 {
+        let rsize: std::collections::HashMap<String, u64> =
+            remote.iter().map(|e| (normalize_rel_key(&e.path), e.size)).collect();
+        let cap = opts.max_file_size;
+        let mut kept = Vec::with_capacity(items.len());
+        for it in items.into_iter() {
+            if matches!(it.kind, ActionKind::Download) {
+                if let Some(sz) = rsize.get(&normalize_rel_key(&it.rel)) {
+                    if *sz > cap {
+                        skipped.push(format!(
+                            "跳过超大远端文件（> {} MB）：{}",
+                            cap / (1024 * 1024),
+                            it.rel
+                        ));
+                        continue;
+                    }
+                }
+            }
+            kept.push(it);
+        }
+        items = kept;
+    }
+
     let mut summary = SyncSummary::default();
     summary.skipped.append(&mut skipped);
     summary.errors.extend(notes);

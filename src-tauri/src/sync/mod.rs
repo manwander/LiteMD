@@ -158,10 +158,19 @@ fn build_opts(cfg: &SyncConfigDto, folder: &FolderDto, mode: SyncMode) -> Engine
 }
 
 fn to_rel_under(root: &str, abs: &str) -> Option<String> {
-    let r = root.replace('\\', "/").trim_end_matches('/').to_lowercase();
     let a = abs.replace('\\', "/");
-    if a.to_lowercase().starts_with(&r) {
-        let rel = a[r.len()..].trim_start_matches('/');
+    let a_lower = a.to_lowercase();
+    let r = root.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    if a_lower.starts_with(&r) {
+        // M6 修复：r.len() 是「小写规范化后根」的字节长度，可能与原始大小写串 a 的字节
+        // 布局不一致（如土耳其 İ→i̇ 会让 to_lowercase 改变字节长度），直接 a[r.len()..]
+        // 可能切在非字符边界而 panic；在 panic="abort" 下会崩溃整个应用。
+        // 纯 ASCII 路径三者等长、行为不变；异常 Unicode 则回退到不超过边界的最大安全切点。
+        let mut cut = r.len().min(a.len());
+        while cut > 0 && !a.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let rel = a[cut..].trim_start_matches('/');
         if !rel.is_empty() {
             return Some(rel.to_string());
         }

@@ -31,7 +31,7 @@
       ⚠ {previewNotice}
     </span>
   {/if}
-  <span class="spacer" />
+  <span class="spacer"></span>
   {#if syncText}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <span

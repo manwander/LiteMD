@@ -55,3 +55,14 @@ if (typeof (globalThis as { cancelAnimationFrame?: unknown }).cancelAnimationFra
     clearTimeout(id);
   };
 }
+
+// jsdom 未实现 ResizeObserver；Svelte 5 client 编译的组件在挂载时会同步
+// 触达 onMount 中的 observer 注册（如 FileTree 宽度观察），这里兜底为空实现。
+class ResizeObserverStub {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+if (typeof (globalThis as { ResizeObserver?: unknown }).ResizeObserver !== "function") {
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = ResizeObserverStub;
+}

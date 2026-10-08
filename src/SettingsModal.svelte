@@ -208,7 +208,7 @@
                 </div>
               {/each}
             </div>
-            {#if gi < SHORTCUT_GROUPS.length - 1}<div class="divider" />{/if}
+            {#if gi < SHORTCUT_GROUPS.length - 1}<div class="divider"></div>{/if}
           {/each}
 
         {:else if tab === "通用"}
@@ -260,7 +260,7 @@
               </select>
             </div>
           </div>
-          <div class="divider" />
+          <div class="divider"></div>
           <div class="group">
             <div class="row">
               <span class="row-label">
@@ -286,7 +286,7 @@
               </span>
             </div>
           </div>
-          <div class="divider" />
+          <div class="divider"></div>
           <div class="group">
             <div class="row">
               <span class="row-label">
@@ -486,7 +486,7 @@
             </div>
           </div>
 
-          <div class="divider" />
+          <div class="divider"></div>
           <div class="group">
             <div class="row">
               <span class="row-label">
@@ -556,7 +556,7 @@
             {/if}
           </div>
 
-          <div class="divider" />
+          <div class="divider"></div>
           <button class="btn adv-toggle" on:click={() => (showAdvanced = !showAdvanced)}>
             {showAdvanced ? "▾" : "▸"} 显示高级选项
           </button>
@@ -647,7 +647,7 @@
               </div>
             </div>
 
-            <div class="divider" />
+            <div class="divider"></div>
             <div class="group">
               <div class="row">
                 <span class="row-label">

@@ -5,6 +5,8 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 // svelte 插件：支持在测试中实例化 .svelte 组件（FileTree 冒烟测试）
 export default defineConfig({
   plugins: [svelte()],
+  // Svelte 5：jsdom 环境下强制走 client（浏览器）入口，避免组件被编译成 SSR 版本
+  resolve: process.env.VITEST ? { conditions: ["browser"] } : undefined,
   test: {
     environment: "jsdom",
     globals: true,

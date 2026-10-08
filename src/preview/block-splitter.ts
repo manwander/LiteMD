@@ -10,7 +10,7 @@
 // - 全程不 split('\n')、不 join、不 slice 大字符串；行边界用 indexOf 扫描，
 //   哈希/分类/预览摘要均基于 (begin, end) 索引直接遍历 charCodeAt。
 
-import { sanitizeHtml } from "../sanitize";
+import { sanitizeHtml } from "../sanitize.ts";
 
 type MarkdownItLike = {
   parse: (src: string, env: unknown) => Array<{ type: string; map?: [number, number] | null }>;

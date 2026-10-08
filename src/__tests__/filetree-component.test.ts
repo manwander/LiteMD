@@ -1,7 +1,7 @@
 // FileTree 组件冒烟测试：在 jsdom 中真实挂载组件，
 // 复现「嵌套根导致 keyed each 重复 key 崩溃」与「树形缩进」。
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { tick } from "svelte";
+import { tick, mount } from "svelte";
 import FileTree from "../FileTree.svelte";
 import { createTreeStore } from "../filetree/store";
 import type { TreeHandlers } from "../filetree/types";
@@ -76,7 +76,7 @@ function mountNestedRoots() {
   }));
   const target = document.createElement("div");
   document.body.appendChild(target);
-  const comp = new FileTree({
+  const comp = mount(FileTree, {
     target,
     props: {
       store,
@@ -131,7 +131,7 @@ describe("FileTree 组件挂载", () => {
     const store = createTreeStore();
     const target = document.createElement("div");
     document.body.appendChild(target);
-    new FileTree({
+    mount(FileTree, {
       target,
       props: {
         store,
@@ -160,7 +160,7 @@ describe("FileTree 组件挂载", () => {
     }));
     const target = document.createElement("div");
     document.body.appendChild(target);
-    new FileTree({
+    mount(FileTree, {
       target,
       props: {
         store,
@@ -197,7 +197,7 @@ describe("FileTree 组件挂载", () => {
     document.body.appendChild(target);
     const listDirMock = vi.mocked(listDir);
     listDirMock.mockClear();
-    new FileTree({
+    mount(FileTree, {
       target,
       props: {
         store,

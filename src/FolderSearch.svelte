@@ -141,7 +141,7 @@
     <div class="head">
       <span class="title">文件夹内查找替换</span>
       <span class="folder" title={folder}>{folder}</span>
-      <span style="flex:1" />
+      <span style="flex:1"></span>
       <button class="x" on:click={() => dispatch("close")} title="关闭">✕</button>
     </div>
 
