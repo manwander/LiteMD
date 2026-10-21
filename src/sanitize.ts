@@ -78,6 +78,76 @@ const FORBID_ATTR = [
 let hookInstalled = false;
 
 /**
+ * 允许保留的内联样式属性白名单（markdown-it 高亮/表格对齐等正常场景）。
+ * 明确排除 position/z-index/behavior/transform 等可做点击劫持或布局覆盖的属性；
+ * 值与属性名同时检查，阻断 url()/expression()/@import 等外链与脚本面。
+ */
+const SAFE_STYLE_PROPS = new Set([
+  "color",
+  "background",
+  "background-color",
+  "font",
+  "font-family",
+  "font-size",
+  "font-style",
+  "font-weight",
+  "line-height",
+  "letter-spacing",
+  "text-align",
+  "text-decoration",
+  "text-indent",
+  "white-space",
+  "vertical-align",
+  "border",
+  "border-color",
+  "border-style",
+  "border-width",
+  "border-radius",
+  "border-collapse",
+  "border-spacing",
+  "padding",
+  "padding-top",
+  "padding-right",
+  "padding-bottom",
+  "padding-left",
+  "margin",
+  "margin-top",
+  "margin-right",
+  "margin-bottom",
+  "margin-left",
+  "width",
+  "min-width",
+  "max-width",
+  "height",
+  "min-height",
+  "max-height",
+  "opacity",
+  "list-style-type",
+]);
+
+/** 危险 CSS 值模式：外链、脚本表达式、行为绑定；反斜杠用于阻断 CSS 转义绕过（u\72l(...)） */
+const UNSAFE_STYLE_VALUE = /url\s*\(|expression\s*\(|javascript:|vbscript:|@import|behavior\s*:|-moz-binding|image-set\s*\(|element\s*\(|\\/i;
+
+/** 清洗单个元素的内联 style：仅保留白名单属性与安全值，其余丢弃 */
+function sanitizeStyleAttr(el: Element): void {
+  const raw = el.getAttribute("style");
+  if (!raw) return;
+  const kept: string[] = [];
+  // 限制单元素样式长度，避免超长垃圾串拖慢解析/渲染
+  for (const decl of raw.slice(0, 4000).split(";")) {
+    const idx = decl.indexOf(":");
+    if (idx <= 0) continue;
+    const prop = decl.slice(0, idx).trim().toLowerCase();
+    const value = decl.slice(idx + 1).trim();
+    if (!SAFE_STYLE_PROPS.has(prop)) continue;
+    if (!value || UNSAFE_STYLE_VALUE.test(value)) continue;
+    kept.push(`${prop}: ${value}`);
+  }
+  if (kept.length) el.setAttribute("style", kept.join("; "));
+  else el.removeAttribute("style");
+}
+
+/**
  * 安装一次性 DOMPurify 钩子：
  * 1. 外链统一加 target=_blank + rel=noopener noreferrer（防 window.opener 劫持）
  * 2. 任务列表以外的 <input> 一律降级为禁用复选框，杜绝表单注入
@@ -89,6 +159,8 @@ function ensureHooks(): void {
   DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     const el = node as unknown as Element;
     if (typeof el.getAttribute !== "function") return;
+    // 内联样式走白名单：DOMPurify 默认放行 style 属性，但 CSS 可外链/覆盖布局
+    if (el.hasAttribute("style")) sanitizeStyleAttr(el);
     if (el.tagName === "A") {
       const href = el.getAttribute("href") || "";
       // 仅对「外部 http(s) 链接」加 target=_blank + rel=noopener，

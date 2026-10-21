@@ -5,6 +5,8 @@ import { watchDirs, watchStop } from "../fs";
 
 export interface FsChange {
   path: string;
+  /** 同一事件携带的全部路径（rename 等事件含旧/新两个路径）；缺省时回退 path */
+  paths?: string[];
   kind: string;
 }
 

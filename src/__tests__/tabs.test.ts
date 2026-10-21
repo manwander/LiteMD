@@ -1,7 +1,12 @@
 // 标签路径重命名去重（updateTabPath 崩溃修复 M-04）：
 // 多次移动落到同一目标 + 覆盖时，不能产生两个同路径标签，否则标签栏 keyed-each 抛重复 key 卡死。
 import { describe, it, expect } from "vitest";
-import { renameTabPathDedup, computeActiveIdxAfterClose, type TabPathLike } from "../tabs";
+import {
+  renameTabPathDedup,
+  renameTabsUnderPath,
+  computeActiveIdxAfterClose,
+  type TabPathLike,
+} from "../tabs";
 
 function uniquePaths(tabs: TabPathLike[]): boolean {
   const s = new Set(tabs.map((t) => t.path));
@@ -44,6 +49,61 @@ describe("renameTabPathDedup 去重", () => {
     expect(uniquePaths(next)).toBe(true);
     expect(next.length).toBe(1);
     expect(activeIdx).toBe(0); // 激活切到唯一剩下的（被改名的）标签
+  });
+});
+
+describe("renameTabsUnderPath（P0-3：文件夹移动后批量重映射）", () => {
+  it("重映射文件夹下所有标签，且不误伤同前缀的兄弟目录", () => {
+    const tabs = [
+      { path: "C:/notes/a.md" },
+      { path: "C:/notes/sub/b.md" },
+      { path: "C:/notes2/c.md" }, // 前缀相同但非子路径，必须保持原样
+      { path: "C:/other/d.md" },
+    ];
+    const { tabs: next, activeIdx } = renameTabsUnderPath(tabs, "C:/notes", "C:/archive/notes", 1);
+    expect(next.map((t) => t.path)).toEqual([
+      "C:/archive/notes/a.md",
+      "C:/archive/notes/sub/b.md",
+      "C:/notes2/c.md",
+      "C:/other/d.md",
+    ]);
+    expect(activeIdx).toBe(1);
+    expect(uniquePaths(next)).toBe(true);
+  });
+
+  it("目标路径已有标签：保留被移动的标签、移除重复标签，激活索引跟随重映射", () => {
+    const tabs = [
+      { path: "C:/b/x.md" }, // 旧目标标签（将被替换）
+      { path: "C:/a/x.md" }, // 激活标签，移动后接管 C:/b/x.md
+      { path: "C:/a/y.md" },
+    ];
+    const { tabs: next, activeIdx } = renameTabsUnderPath(tabs, "C:/a", "C:/b", 1);
+    expect(next.map((t) => t.path)).toEqual(["C:/b/x.md", "C:/b/y.md"]);
+    expect(uniquePaths(next)).toBe(true);
+    expect(activeIdx).toBe(0);
+  });
+
+  it("激活标签恰为被覆盖的重复标签时，切换到接管该路径的新标签", () => {
+    const tabs = [
+      { path: "C:/b/x.md" }, // 激活且被替换
+      { path: "C:/a/x.md" },
+    ];
+    const { tabs: next, activeIdx } = renameTabsUnderPath(tabs, "C:/a", "C:/b", 0);
+    expect(next.map((t) => t.path)).toEqual(["C:/b/x.md"]);
+    expect(activeIdx).toBe(0);
+  });
+
+  it("无匹配标签时原样返回（同一数组引用）", () => {
+    const tabs = [{ path: "C:/x/a.md" }, { path: "C:/y/b.md" }];
+    const res = renameTabsUnderPath(tabs, "C:/z", "C:/w", 1);
+    expect(res.tabs).toBe(tabs);
+    expect(res.activeIdx).toBe(1);
+  });
+
+  it("仅重命名单个文件（非目录）同样生效", () => {
+    const tabs = [{ path: "C:/a/old.md" }, { path: "C:/a/keep.md" }];
+    const { tabs: next } = renameTabsUnderPath(tabs, "C:/a/old.md", "C:/a/new.md", 0);
+    expect(next.map((t) => t.path)).toEqual(["C:/a/new.md", "C:/a/keep.md"]);
   });
 });
 

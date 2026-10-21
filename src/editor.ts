@@ -540,7 +540,13 @@ export function diffRange(
 export async function setDocStreaming(
   view: EditorView,
   text: string,
-  opts?: { threshold?: number; chunkSize?: number; onProgress?: (r: number) => void },
+  opts?: {
+    threshold?: number;
+    chunkSize?: number;
+    onProgress?: (r: number) => void;
+    /** 取消判据：标签被再次切换时旧载入必须尽早停止写入，避免两个载入流程交错污染文档 */
+    cancelled?: () => boolean;
+  },
 ): Promise<void> {
   const threshold = opts?.threshold ?? STREAM_THRESHOLD;
   if (text.length <= threshold) {
@@ -555,6 +561,7 @@ export async function setDocStreaming(
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
     const ranges = chunkRanges(text.length, chunk);
     for (let i = 0; i < ranges.length; i++) {
+      if (opts?.cancelled?.()) return; // 让位给新的载入，不再写入本块之后的内容
       const [from, to] = ranges[i];
       view.dispatch({ changes: { from, insert: text.slice(from, to) } });
       // 每写入一块让出一次，保证遮罩进度绘制、主线程不饿死
@@ -564,6 +571,7 @@ export async function setDocStreaming(
   } finally {
     suppressListener = false;
   }
+  if (opts?.cancelled?.()) return;
   // 文档整体替换后重建围栏索引：空闲帧重建（同上，避免流式载入末尾再同步冻结一次）。
   // 流式期间击键级维护已被 suppressListener 禁用，此处显式标脏并交予空闲帧重建。
   markFenceDirty();

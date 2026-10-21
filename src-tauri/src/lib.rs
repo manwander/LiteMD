@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 use notify::Watcher;
 use tauri_plugin_dialog::DialogExt;
 use regex::Regex;
+use encoding_rs::GBK;
 use printpdf::{Mm, PdfDocument};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use owned_ttf_parser as otp;
@@ -55,26 +56,162 @@ fn validate_path(path: &str) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
+// ---- 原子写盘 ----
+// ISSUE 修复：原先 fs::write / 固定名临时文件在崩溃或磁盘满时会留下截断/半截内容，
+// 甚至（save_settings 旧逻辑）先删旧文件再 rename，失败即丢配置。
+// atomic_write：同目录唯一临时文件 → write_all + sync_all → rename 覆盖目标；
+// 任一步失败都会清理临时文件并返回错误，目标旧内容保持原样。
+fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // 进程内自增序号，配合进程 id + 纳秒时间戳保证临时文件名唯一
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("无法确定目标目录: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("无法解析目标文件名: {}", path.display()))?;
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}-{}-{}",
+        file_name,
+        std::process::id(),
+        seq,
+        nanos
+    ));
+
+    let result = (|| -> Result<(), String> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("创建临时文件失败: {}", e))?;
+        f.write_all(data).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        drop(f);
+        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // 失败清理：临时文件绝不残留（旧目标未被触碰）
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+// ---- 文本解码（IDENT 兼容多种中文常见编码）----
+// 原实现直接 from_utf8_to_string，GBK/UTF-16 中文文件全部打不开。
+// 识别顺序：UTF-8 BOM → UTF-16LE/BE BOM → 无 BOM 严格 UTF-8 → GBK（要求零错误）。
+const UNKNOWN_ENCODING_ERR: &str = "文件编码无法识别（支持 UTF-8/UTF-16/GBK）";
+
+fn decode_text(bytes: &[u8]) -> Result<String, String> {
+    // 1) UTF-8 BOM（EF BB BF）
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return std::str::from_utf8(&bytes[3..])
+            .map(|s| s.to_string())
+            .map_err(|_| UNKNOWN_ENCODING_ERR.to_string());
+    }
+    // 2) UTF-16LE BOM（FF FE）
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        if (bytes.len() - 2) % 2 != 0 {
+            return Err(UNKNOWN_ENCODING_ERR.to_string());
+        }
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16(&units).map_err(|_| UNKNOWN_ENCODING_ERR.to_string());
+    }
+    // 3) UTF-16BE BOM（FE FF）
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        if (bytes.len() - 2) % 2 != 0 {
+            return Err(UNKNOWN_ENCODING_ERR.to_string());
+        }
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16(&units).map_err(|_| UNKNOWN_ENCODING_ERR.to_string());
+    }
+    // 4) 无 BOM：先严格 UTF-8（现代编辑器主流格式，优先保证不改语义）
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Ok(s.to_string());
+    }
+    // 5) GBK：要求零替换错误，避免把二进制文件误解码成乱码文本
+    let (decoded, _enc, had_errors) = GBK.decode(bytes);
+    if !had_errors {
+        return Ok(decoded.into_owned());
+    }
+    Err(UNKNOWN_ENCODING_ERR.to_string())
+}
+
 // ---- 文件读写 ----
 // ---- 轻量前端崩溃日志：仅记录未捕获异常，供排障回传（平时无日志、不影响体验）----
 #[tauri::command]
 fn log_frontend(line: String) {
+    use std::io::Write;
+    // 无界增长修复：写前检查大小，超过 5MB 轮转为同目录 .old（先删旧 .old）；
+    // 单条日志截断到 16KB（按字符边界），避免超大对象/循环错误把日志刷爆。
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    const MAX_LINE_BYTES: usize = 16 * 1024;
     let p = std::env::temp_dir().join("litemd-frontend.log");
+    if let Ok(m) = fs::metadata(&p) {
+        if m.len() > MAX_LOG_BYTES {
+            let old = p.with_extension("log.old");
+            let _ = fs::remove_file(&old);
+            let _ = fs::rename(&p, &old);
+        }
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        let _ = std::io::Write::write_all(&mut f, format!("{}\n", line).as_bytes());
+        let mut s = line;
+        if s.len() > MAX_LINE_BYTES {
+            let mut end = MAX_LINE_BYTES;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+        let _ = f.write_all(format!("{}\n", s).as_bytes());
     }
 }
 
 #[tauri::command]
 fn read_file(path: String) -> Result<String, String> {
     let validated = validate_path(&path)?;
-    fs::read_to_string(validated).map_err(|e| e.to_string())
+    // 多编码支持：UTF-8/UTF-16/GBK（见 decode_text）
+    let bytes = fs::read(validated).map_err(|e| e.to_string())?;
+    decode_text(&bytes)
 }
 
 #[tauri::command]
 fn write_file(path: String, content: String) -> Result<(), String> {
     let validated = validate_path(&path)?;
-    fs::write(validated, content).map_err(|e| e.to_string())
+    // 原子写盘：崩溃/磁盘满不会把原文件截断
+    atomic_write(&validated, content.as_bytes())
+}
+
+// 二进制读取（base64 返回）：供前端读取附件等非文本文件；max_bytes 夹在 1..=64MB，
+// 超过文件大小时明确报错，避免经 IPC 拉取巨量数据打爆内存。
+#[tauri::command]
+fn read_file_b64(path: String, max_bytes: usize) -> Result<String, String> {
+    use base64::Engine;
+    let p = validate_path(&path)?;
+    let max = max_bytes.clamp(1, 64 * 1024 * 1024);
+    let len = fs::metadata(&p).map_err(|e| e.to_string())?.len();
+    if len > max as u64 {
+        return Err(format!("文件过大（{} 字节，上限 {} 字节）", len, max));
+    }
+    let bytes = fs::read(&p).map_err(|e| e.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
 // ---- 大文档分片流式载入（P0）----
@@ -119,12 +256,27 @@ async fn read_file_head(path: String, bytes: usize) -> Result<ReadHead, String> 
     let norm = validate_path(&path).map_err(|e| e.to_string())?.to_string_lossy().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::Read;
+        // 头片上限 1MB（下限 1B）：避免异常/恶意 bytes 触发一次巨量分配
+        const MAX_HEAD_BYTES: usize = 1024 * 1024;
+        let bytes = bytes.clamp(1, MAX_HEAD_BYTES);
         let mut f = fs::File::open(&norm).map_err(|e| e.to_string())?;
         let total = f.metadata().map(|m| m.len()).unwrap_or(0);
         let take = (bytes as u64).min(total) as usize;
         let mut buf = vec![0u8; take];
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
-        let end = utf8_boundary(&buf);
+        // 大文件分片仅支持 UTF-8：UTF-16 BOM 给出明确错误（流式协议按 UTF-8 字符边界切分）
+        if buf.starts_with(&[0xFF, 0xFE]) || buf.starts_with(&[0xFE, 0xFF]) {
+            return Err("大文件分片仅支持 UTF-8 编码（检测到 UTF-16 BOM，请先转换为 UTF-8）".to_string());
+        }
+        // 严格校验头片字节：error_len() 为 Some 说明存在非法字节（非 UTF-8 文件）；
+        // 为 None 说明只是尾部完整多字节字符被截断，回退到字符边界（utf8_boundary）。
+        let end = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(e) if e.error_len().is_none() => utf8_boundary(&buf),
+            Err(_) => {
+                return Err("大文件分片仅支持 UTF-8 编码（文件包含非法字节，请先转换为 UTF-8）".to_string())
+            }
+        };
         let head = String::from_utf8(buf[..end].to_vec()).map_err(|e| e.to_string())?;
         Ok(ReadHead { head, head_bytes: end as u64, total })
     })
@@ -134,6 +286,9 @@ async fn read_file_head(path: String, bytes: usize) -> Result<ReadHead, String> 
 
 /// 从 offset 字节起按 chunk 分片读取，经 Channel 推送字符串片（按字符边界切分）。
 /// 读毕（含尾片）正常返回；前端以 invoke 的 Promise 结束作为「流结束」信号。
+///
+/// 编码约束：仅支持 UTF-8。非法字节立即报错停止（不再 lossy 兜底、不无限累积）；
+/// 跨块不完整字符最多 3 字节 carry，与下一块拼接后再解码。
 #[tauri::command]
 async fn stream_file_rest(
     path: String,
@@ -145,31 +300,48 @@ async fn stream_file_rest(
     let norm = validate_path(&path).map_err(|e| e.to_string())?.to_string_lossy().to_string();
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{Read, Seek, SeekFrom};
-        let chunk = chunk.max(64 * 1024);
+        // 分片夹在 64KB..=8MB：过小放大 IPC 次数，过大让单帧文本超出前端预算
+        let chunk = chunk.clamp(64 * 1024, 8 * 1024 * 1024);
         let mut f = fs::File::open(&norm).map_err(|e| e.to_string())?;
         f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; chunk];
-        let mut tail: Vec<u8> = Vec::new(); // 上一片末尾被字符边界截剩的 1~3 字节
+        let mut carry: Vec<u8> = Vec::new(); // 上一片末尾被截断的 1~3 字节（不完整 UTF-8 前缀）
         loop {
             let n = f.read(&mut buf).map_err(|e| e.to_string())?;
             if n == 0 {
-                if !tail.is_empty() {
-                    // 文件尾部残留非法 UTF-8（损坏文件）：lossy 输出兜底，不丢内容
-                    on_chunk
-                        .send(String::from_utf8_lossy(&tail).into_owned())
-                        .map_err(|e| e.to_string())?;
+                if !carry.is_empty() {
+                    // 文件尾部残留不完整字符：非法 UTF-8，明确报错而不是静默丢/糊
+                    return Err("文件结尾存在不完整的 UTF-8 字符，已停止流式读取".to_string());
                 }
                 break;
             }
-            let mut data = if tail.is_empty() { Vec::new() } else { std::mem::take(&mut tail) };
+            let mut data = Vec::with_capacity(carry.len() + n);
+            data.extend_from_slice(&carry);
             data.extend_from_slice(&buf[..n]);
-            let end = utf8_boundary(&data);
-            if end < data.len() {
-                tail = data.split_off(end);
-            }
-            if !data.is_empty() {
-                let s = String::from_utf8(data).map_err(|e| e.to_string())?;
-                on_chunk.send(s).map_err(|e| e.to_string())?;
+            match std::str::from_utf8(&data) {
+                Ok(s) => {
+                    carry.clear();
+                    if !s.is_empty() {
+                        on_chunk.send(s.to_string()).map_err(|e| e.to_string())?;
+                    }
+                }
+                Err(e) => {
+                    if e.error_len().is_some() {
+                        // 非法字节：立即报错停止，绝不继续累积
+                        return Err("文件不是合法 UTF-8 编码，已停止流式读取".to_string());
+                    }
+                    let valid = e.valid_up_to();
+                    if data.len() - valid > 3 {
+                        // 理论上 error_len()==None 时残余必为 1~3 字节，这里兜底防御
+                        return Err("文件不是合法 UTF-8 编码，已停止流式读取".to_string());
+                    }
+                    carry = data[valid..].to_vec();
+                    if valid > 0 {
+                        let s = std::str::from_utf8(&data[..valid])
+                            .map_err(|_| "文件不是合法 UTF-8 编码，已停止流式读取".to_string())?;
+                        on_chunk.send(s.to_string()).map_err(|e| e.to_string())?;
+                    }
+                }
             }
         }
         Ok(())
@@ -253,18 +425,23 @@ async fn list_dir(dir: String, show_hidden: bool) -> Result<Vec<DirItem>, String
     // 大目录列举可能达数百 ms：丢到独立线程池，避免阻塞 IPC/异步执行线程导致窗口冻结。
     tauri::async_runtime::spawn_blocking(move || {
     let dir = PathBuf::from(&dir);
-    eprintln!("[list_dir] 请求路径: {:?}", dir);
     if !dir.is_dir() {
-        eprintln!("[list_dir] 路径不是文件夹: {:?}", dir);
         return Err(format!("路径不是文件夹或不存在: {}", dir.to_string_lossy()));
     }
+    // 条目上限：超大目录（含隐藏项）直接报错，避免把 IPC/前端内存拖垮
+    const MAX_DIR_ENTRIES: usize = 20000;
     let mut items: Vec<DirItem> = Vec::new();
     let entries = fs::read_dir(&dir)
         .map_err(|e| format!("无法读取目录 {}: {}", dir.to_string_lossy(), e))?;
     let mut total = 0;
-    let mut skipped_hidden = 0;
     for entry in entries.flatten() {
         total += 1;
+        if total > MAX_DIR_ENTRIES {
+            return Err(format!(
+                "目录条目过多（超过 {} 项，含隐藏项），请打开更具体的子目录",
+                MAX_DIR_ENTRIES
+            ));
+        }
         let p = entry.path();
         let is_dir = entry
             .file_type()
@@ -278,7 +455,6 @@ async fn list_dir(dir: String, show_hidden: bool) -> Result<Vec<DirItem>, String
         // 隐藏项（以 . 开头）按 show_hidden 决定；文件夹始终返回，
         // 文件全量返回（带 is_md 标志），由前端按「显示资源文件」开关决定是否展示。
         if hidden && !show_hidden {
-            skipped_hidden += 1;
             continue;
         }
         let (size, mtime) = if is_dir {
@@ -314,7 +490,6 @@ async fn list_dir(dir: String, show_hidden: bool) -> Result<Vec<DirItem>, String
     }
     // 目录在前、文件在后，各自按名称（不区分大小写）排序
     items.sort_by_cached_key(|a| (if a.is_dir { 0 } else { 1 }, a.name.to_lowercase()));
-    eprintln!("[list_dir] 返回 {} 项 (总条目: {}, 隐藏跳过: {})", items.len(), total, skipped_hidden);
     Ok(items)
     })
     .await
@@ -358,10 +533,25 @@ fn unique_path(path: String) -> Result<String, String> {
     Ok(find_unique_path(&p).to_string_lossy().to_string())
 }
 
-/// 递归搜索目录树中文件名包含 query 的项（大小写不敏感，最多 limit 条）。
+/// 递归搜索目录树中文件名包含 query 的项（大小写不敏感，最多 limit 条，limit 上限 10000）。
 /// 用于文件树过滤时搜索「未加载目录」中的匹配（FEAT-1）。
+/// 异步：整树遍历是重 IO，丢到独立线程池，避免阻塞 IPC/异步执行线程；
+/// 递归深度上限 32，防止超深目录（或符号链接环）把遍历拖爆。
 #[tauri::command]
-fn search_filenames(
+async fn search_filenames(
+    root: String,
+    query: String,
+    show_hidden: bool,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        search_filenames_sync(root, query, show_hidden, limit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn search_filenames_sync(
     root: String,
     query: String,
     show_hidden: bool,
@@ -372,10 +562,11 @@ fn search_filenames(
         return Err(format!("路径不是文件夹或不存在: {}", root.to_string_lossy()));
     }
     let q = query.to_lowercase();
-    let limit = limit.max(1).min(1000);
+    let limit = limit.max(1).min(10000);
+    const MAX_DEPTH: usize = 32;
     let mut out: Vec<String> = Vec::new();
-    fn walk(dir: &Path, q: &str, show_hidden: bool, limit: usize, out: &mut Vec<String>) {
-        if out.len() >= limit {
+    fn walk(dir: &Path, q: &str, show_hidden: bool, limit: usize, depth: usize, out: &mut Vec<String>) {
+        if depth > MAX_DEPTH || out.len() >= limit {
             return;
         }
         let entries = match fs::read_dir(dir) {
@@ -393,13 +584,13 @@ fn search_filenames(
                 continue;
             }
             if p.is_dir() {
-                walk(&p, q, show_hidden, limit, out);
+                walk(&p, q, show_hidden, limit, depth + 1, out);
             } else if name.to_lowercase().contains(q) {
                 out.push(p.to_string_lossy().to_string());
             }
         }
     }
-    walk(&root, &q, show_hidden, limit, &mut out);
+    walk(&root, &q, show_hidden, limit, 0, &mut out);
     Ok(out)
 }
 
@@ -432,14 +623,17 @@ fn watch_dirs(roots: Vec<String>, app: tauri::AppHandle) -> Result<(), String> {
         let mut watcher = match notify::recommended_watcher(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(ev) = res {
-                    let path = ev
+                    // 一次事件可能携带多个路径（rename 等）：全部放进 payload。
+                    // 保持前端既有 { path, kind } 结构兼容（path 取首个），新增 paths 数组携带全部路径。
+                    let paths: Vec<String> = ev
                         .paths
-                        .first()
+                        .iter()
                         .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if path.is_empty() {
+                        .collect();
+                    if paths.is_empty() {
                         return;
                     }
+                    let first = paths.first().cloned().unwrap_or_default();
                     let kind = match ev.kind {
                         notify::EventKind::Create(_) => "create",
                         notify::EventKind::Remove(_) => "remove",
@@ -449,27 +643,23 @@ fn watch_dirs(roots: Vec<String>, app: tauri::AppHandle) -> Result<(), String> {
                     };
                     let _ = app2.emit(
                         "fs-change",
-                        serde_json::json!({ "path": path, "kind": kind }),
+                        serde_json::json!({ "path": first, "paths": paths, "kind": kind }),
                     );
                 }
             },
         ) {
             Ok(w) => w,
-            Err(e) => {
-                eprintln!("[watch_dirs] 监视初始化失败: {}", e);
-                return;
-            }
+            // 初始化失败静默返回（前端已降级为手动刷新），不向 stderr 打噪音日志
+            Err(_) => return,
         };
         for root in &watch_roots {
             let p = std::path::Path::new(root);
-            // 跳过已不存在的根（用户删除/移动后 roots 残留），不产生噪音日志；
+            // 跳过已不存在的根（用户删除/移动后 roots 残留）；
             // 其余有效根继续监视，单个失败不影响整体。
             if !p.is_dir() {
                 continue;
             }
-            if let Err(e) = watcher.watch(p, notify::RecursiveMode::Recursive) {
-                eprintln!("[watch_dirs] 无法监视 {}: {}", root, e);
-            }
+            let _ = watcher.watch(p, notify::RecursiveMode::Recursive);
         }
         // 阻塞直到停止信号或持续运行
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -504,14 +694,18 @@ fn path_exists(path: String) -> bool {
 fn create_file(path: String) -> Result<String, String> {
     // 安全：新建文件必须过路径校验，与 read/write 一致，杜绝文件名含 ../ 造成穿越
     let path = validate_path(&path)?;
-    if path.exists() {
-        return Err("文件已存在".to_string());
-    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, "").map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+    // TOCTOU 修复：exists() 后写存在竞态窗口。改用 create_new，
+    // 由操作系统保证「不存在才创建」，已存在直接返回明确错误。
+    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(_f) => Ok(path.to_string_lossy().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err("文件已存在".to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -526,18 +720,66 @@ fn create_dir(path: String) -> Result<String, String> {
 }
 
 // ---- 文件 / 文件夹管理：删除、移动、复制 ----
-/// 危险路径守卫：拒绝删除盘符根 / 文件系统根 / 层级过浅的目录。
+/// 大小写不敏感比较两条路径（仅总量级守卫用；Windows 路径本就大小写不敏感）
+#[cfg(windows)]
+fn same_path_ci(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        s.trim_end_matches('/').to_lowercase()
+    }
+    norm(a) == norm(b)
+}
+
+/// Windows 下规范化路径；失败时退回原路径（仅用于与已知关键目录比较）
+#[cfg(windows)]
+fn canonical_or_self(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Windows 下禁止删除的系统安装树：目标位于这些目录内部同样拒绝
+/// （系统文件/程序目录不应由笔记应用删除，宁可误拒）。
+#[cfg(windows)]
+fn protected_delete_trees() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec![
+        PathBuf::from(r"C:\Windows"),
+        PathBuf::from(r"C:\Program Files"),
+        PathBuf::from(r"C:\Program Files (x86)"),
+        PathBuf::from(r"C:\ProgramData"),
+    ];
+    if let Some(sys) = env::var_os("SystemRoot").or_else(|| env::var_os("windir")) {
+        v.push(PathBuf::from(sys));
+    }
+    v
+}
+
+/// Windows 下仅禁止「目录根本身」的用户目录（其子内容仍可正常删除）
+#[cfg(windows)]
+fn protected_delete_roots() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec![PathBuf::from(r"C:\Users")];
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        v.push(PathBuf::from(profile));
+    }
+    v
+}
+
+/// 危险路径守卫：拒绝删除盘符根 / 文件系统根 / 关键系统目录 / 用户主目录根。
 ///
 /// 触发场景并不只有「用户手滑」：路径拼接出错、符号链接指向上层、
 /// 前端传来空串被 PathBuf 解析成相对根，都可能让一次删除命中整个盘。
 /// 这里做最后一道硬拦截 —— 宁可误拒，不可误删。
+///
+/// 规则：
+/// 1) 路径必须存在且可 canonicalize（规范化失败直接拒绝，不降级）；
+/// 2) 拒绝盘符根 / 文件系统根（无 Normal 组件）；
+/// 3) Windows 下拒绝系统安装树（Windows/Program Files/ProgramData 及其内部）；
+/// 4) Windows 下拒绝 C:\Users、所有用户主目录根（C:\Users\*）及 USERPROFILE 本身；
+///    比较大小写不敏感。用户目录内的普通文件/子目录不受影响。
+/// 其余路径仍允许走回收站删除（delete_path）。
 fn guard_deletable(path: &Path) -> Result<(), String> {
-    if path.parent().is_none() {
-        return Err("拒绝删除：不能删除根目录".to_string());
+    // 必须真实存在：canonicalize 失败/不存在时直接拒绝删除，宁误拒不误删（ISSUE-002）。
+    if !path.exists() {
+        return Err("拒绝删除：路径不存在或无法访问".to_string());
     }
-    // 规范化后统计路径组件数：Windows 下 "C:\" 只有 Prefix + RootDir 两段
-    // ISSUE-002 修复：canonicalize 失败时不再降级到原始路径（可能绕过守卫），
-    // 而是直接拒绝删除，宁误拒不误删。
     let canonical = path.canonicalize().map_err(|e| {
         format!("路径规范化失败，出于安全考虑拒绝操作: {}", e)
     })?;
@@ -546,7 +788,37 @@ fn guard_deletable(path: &Path) -> Result<(), String> {
         .filter(|c| matches!(c, std::path::Component::Normal(_)))
         .count();
     if normal_parts == 0 {
-        return Err("拒绝删除：路径层级过浅，可能是盘符根目录".to_string());
+        return Err("拒绝删除：不能删除盘符根/文件系统根目录".to_string());
+    }
+    #[cfg(windows)]
+    {
+        for root in protected_delete_trees() {
+            let rc = canonical_or_self(&root);
+            if canonical.starts_with(&rc) {
+                return Err(format!(
+                    "拒绝删除：目标位于系统关键目录 {} 内，不可删除",
+                    root.display()
+                ));
+            }
+        }
+        for root in protected_delete_roots() {
+            let rc = canonical_or_self(&root);
+            if same_path_ci(&canonical, &rc) {
+                return Err(format!(
+                    "拒绝删除：{} 是系统/用户关键目录根，不可删除",
+                    root.display()
+                ));
+            }
+        }
+        // 拒绝 C:\Users 的直接子项（任何用户主目录根，而不只是当前用户）
+        let users_root = canonical_or_self(Path::new(r"C:\Users"));
+        if canonical
+            .parent()
+            .map(|p| same_path_ci(p, &users_root))
+            .unwrap_or(false)
+        {
+            return Err("拒绝删除：用户主目录根本身，不可删除".to_string());
+        }
     }
     Ok(())
 }
@@ -770,6 +1042,87 @@ fn maybe_compress(bytes: &[u8], ext: &str, quality: u8) -> Vec<u8> {
     }
 }
 
+// 附件单文件大小上限（base64 解码后 / raw 直传均适用）：100MB
+const MAX_ASSET_BYTES: usize = 100 * 1024 * 1024;
+
+/// 附件写入目标目录的安全解析（store_asset / import_asset_bytes / import_asset_raw 共用）。
+///
+/// 校验：
+/// 1) ext 仅允许 [A-Za-z0-9]{1,10} 且必须在白名单内（png/jpg/jpeg/webp/gif/bmp/avif/svg）；
+/// 2) assets_name 必须是相对子路径：拒绝空串、绝对路径、盘符、反斜杠、任何 ".." 组件、控制字符；
+/// 3) note_dir 不存在时先 create_dir_all；join 后必须落在 canonicalize(note_dir) 内
+///    （词法检查 + canonicalize 双重确认，防符号链接逃逸）。
+/// 返回经 canonicalize 确认的附件目录（调用方在其中拼文件名）。
+fn safe_asset_target(note_dir: &str, assets_name: &str, ext: &str) -> Result<PathBuf, String> {
+    // ---- ext 白名单 ----
+    let ext_lower = ext.to_lowercase();
+    if ext.is_empty()
+        || ext.len() > 10
+        || !ext.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return Err(format!("非法附件扩展名: {}", ext));
+    }
+    const ALLOWED_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "svg"];
+    if !ALLOWED_EXTS.contains(&ext_lower.as_str()) {
+        return Err(format!(
+            "不支持的附件扩展名: {}（允许 png/jpg/jpeg/webp/gif/bmp/avif/svg）",
+            ext
+        ));
+    }
+
+    // ---- assets_name 相对子路径校验 ----
+    if assets_name.is_empty() {
+        return Err("附件目录名不能为空".to_string());
+    }
+    if assets_name.chars().any(|c| c.is_control()) {
+        return Err("附件目录名不能包含控制字符".to_string());
+    }
+    if assets_name.contains('\\') {
+        return Err("附件目录名不能包含反斜杠".to_string());
+    }
+    if assets_name.contains(':') {
+        return Err("附件目录名不能包含冒号（绝对路径/盘符）".to_string());
+    }
+    let rel = Path::new(assets_name);
+    if rel.is_absolute() {
+        return Err("附件目录名必须是相对子路径".to_string());
+    }
+    let mut saw_normal = false;
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(_) => saw_normal = true,
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err("附件目录名不能包含 . 或 .. 组件".to_string());
+            }
+            _ => return Err("附件目录名必须是相对子路径（不允许绝对路径或盘符）".to_string()),
+        }
+    }
+    if !saw_normal {
+        return Err("附件目录名不能为空".to_string());
+    }
+
+    // ---- 目标必须落在 note_dir 内 ----
+    let note = PathBuf::from(note_dir);
+    if !note.exists() {
+        fs::create_dir_all(&note)
+            .map_err(|e| format!("无法创建笔记目录 {}: {}", note_dir, e))?;
+    }
+    let note_canon = note
+        .canonicalize()
+        .map_err(|e| format!("无法规范化笔记目录 {}: {}", note_dir, e))?;
+    let target = note_canon.join(rel);
+    if !target.starts_with(&note_canon) {
+        return Err("附件目录越出笔记目录".to_string());
+    }
+    fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    // canonicalize 兜底：目录内若有指向外部的符号链接，这里会被识破
+    let target_canon = target.canonicalize().map_err(|e| e.to_string())?;
+    if !target_canon.starts_with(&note_canon) {
+        return Err("附件目录越出笔记目录".to_string());
+    }
+    Ok(target_canon)
+}
+
 // 以内容哈希命名并写入 assets/（已存在则跳过，天然去重）；返回相对路径
 fn store_asset(
     bytes: &[u8],
@@ -782,25 +1135,34 @@ fn store_asset(
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
 
+    if bytes.len() > MAX_ASSET_BYTES {
+        return Err(format!(
+            "附件过大（{} 字节，上限 100MB）",
+            bytes.len()
+        ));
+    }
+    let ext = ext.trim_start_matches('.').trim().to_lowercase();
+    let ext = if ext.is_empty() { "png".to_string() } else { ext };
+    // 路径安全：assets_name 必须是相对子路径且目标必须落在笔记目录内
+    let assets_dir = safe_asset_target(note_dir, assets_name, &ext)?;
+
     let mut hasher = DefaultHasher::new();
     hasher.write(bytes);
     let hash = hasher.finish();
-
-    let assets_dir = PathBuf::from(note_dir).join(assets_name);
-    fs::create_dir_all(&assets_dir).map_err(|e| e.to_string())?;
 
     let filename = format!("img-{:016x}.{}", hash, ext);
     let target = assets_dir.join(&filename);
     // 目标已存在（内容相同）则跳过写入，直接复用
     if !target.exists() {
         let final_bytes = if compress {
-            maybe_compress(bytes, ext, quality)
+            maybe_compress(bytes, &ext, quality)
         } else {
             bytes.to_vec()
         };
-        fs::write(&target, &final_bytes).map_err(|e| e.to_string())?;
+        // 原子写盘：崩溃不会把附件写成半截
+        atomic_write(&target, &final_bytes)?;
     }
-    Ok(format!("{}/{}", assets_name, filename))
+    Ok(format!("{}/{}", assets_name.trim_matches('/'), filename))
 }
 
 // ---- 附件收编：把图片复制到笔记目录的 assets/，内容哈希命名（去重），可选压缩，返回相对路径 ----
@@ -830,6 +1192,11 @@ fn import_asset_sync(
     let source = PathBuf::from(&source);
     if !source.is_file() {
         return Err("源文件不存在".to_string());
+    }
+    // 先按元数据拦截超大文件，避免 fs::read 一次性分配后才在 store_asset 报错
+    let len = fs::metadata(&source).map_err(|e| e.to_string())?.len();
+    if len > MAX_ASSET_BYTES as u64 {
+        return Err(format!("附件过大（{} 字节，上限 100MB）", len));
     }
     let ext = source
         .extension()
@@ -867,11 +1234,16 @@ fn import_asset_bytes_sync(
 ) -> Result<String, String> {
     use base64::Engine;
 
+    // 解码前按编码长度预判（base64 膨胀约 4/3），避免超长输入先触发巨量分配
+    if data_b64.len() / 4 * 3 > MAX_ASSET_BYTES {
+        return Err("附件过大（base64 解码后超过 100MB 上限）".to_string());
+    }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| e.to_string())?;
-    let ext = ext.trim_start_matches('.').trim().to_lowercase();
-    let ext = if ext.is_empty() { "png".to_string() } else { ext };
+    if bytes.len() > MAX_ASSET_BYTES {
+        return Err(format!("附件过大（{} 字节，上限 100MB）", bytes.len()));
+    }
     store_asset(&bytes, &ext, &note_dir, &assets_name, compress, quality)
 }
 
@@ -882,6 +1254,10 @@ async fn import_asset_raw(request: tauri::ipc::Request<'_>) -> Result<String, St
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("expect raw body".into());
     };
+    // 先按原始体长度拦截，避免为超大请求再克隆一份造成双倍内存占用
+    if bytes.len() > MAX_ASSET_BYTES {
+        return Err(format!("附件过大（{} 字节，上限 100MB）", bytes.len()));
+    }
     let bytes = bytes.clone();
     let header = |name: &str| -> Result<String, String> {
         request
@@ -1116,6 +1492,19 @@ fn replace_in_folder_sync(
     let mut files_changed = 0usize;
     let mut total = 0usize;
 
+    // 备份文件名唯一：旧的固定 `<name>.md.bak` 在两次替换并发/上次残留时会互相覆盖
+    let unique_bak = |path: &Path| -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static BAK_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = BAK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("note.md");
+        path.with_file_name(format!(".{}.bak-{}-{}-{}", name, std::process::id(), seq, nanos))
+    };
+
     // 大文件跳过：避免全量读入内存导致 OOM（与 search_in_folder 一致，阈值 32MB）
     const MAX_REPLACE_FILE: u64 = 32 * 1024 * 1024;
     // 第一步：创建所有 .bak
@@ -1125,7 +1514,7 @@ fn replace_in_folder_sync(
                 continue;
             }
         }
-        let bak_path = PathBuf::from(path).with_extension("md.bak");
+        let bak_path = unique_bak(path);
         if let Err(e) = fs::copy(path, &bak_path) {
             // 复制失败：删除已创建的 .bak 备份（原始文件尚未改动，无需从 bak 恢复）
             for (_orig, bak) in &bak_paths {
@@ -1144,10 +1533,10 @@ fn replace_in_folder_sync(
         };
         let (new_text, count) = replace_literal(&content, &query, &replacement, case_sensitive);
         if count > 0 {
-            if let Err(e) = fs::write(orig, &new_text) {
+            if let Err(e) = atomic_write(orig, new_text.as_bytes()) {
                 // 写入失败：全部从 bak 恢复，并清理所有 .bak（D-6：不留残留备份）
                 for (o, b) in &bak_paths {
-                    let _ = fs::remove_file(o);
+                    // 直接覆盖复制（copy 会截断目标），避免先删后复制失败导致原件彻底丢失
                     let _ = fs::copy(b, o);
                     let _ = fs::remove_file(b);
                 }
@@ -1249,11 +1638,15 @@ async fn cleanup_orphans_with(note_dir: String, assets_name: String, rel_paths: 
                 continue;
             }
             if candidate.is_file() {
-                if let Err(e) = fs::remove_file(&candidate) {
-                    eprintln!("[cleanup_orphans_with] 删除失败 {:?}: {}", candidate, e);
-                    continue;
+                // 数据安全：孤儿清理同样走系统回收站（误删可还原），不永久删除。
+                // 回收站不可用时报错并跳过，绝不降级为不可恢复删除。
+                match trash::delete(&candidate) {
+                    Ok(()) => deleted.push(rel),
+                    Err(e) => {
+                        eprintln!("[cleanup_orphans_with] 移入回收站失败 {:?}: {}", candidate, e);
+                        continue;
+                    }
                 }
-                deleted.push(rel);
             }
         }
         Ok(deleted)
@@ -1340,7 +1733,7 @@ fn collect_orphans_recursive(
 fn export_html(path: String, html: String) -> Result<(), String> {
     // 安全：导出写盘必须过路径校验，与 write_file 一致（Q-14）
     let path = validate_path(&path)?;
-    fs::write(path, html).map_err(|e| e.to_string())
+    atomic_write(&path, html.as_bytes())
 }
 
 // ---- 导出 PDF：pulldown-cmark 解析 → printpdf 排版（A4，自动换行/分页）----
@@ -1481,7 +1874,9 @@ impl PdfLayout {
             text,
             size_pt as f32,
             Mm((MARGIN_MM + indent_mm) as f32),
-            Mm(self.baseline as f32),
+            // printpdf 0.6 坐标系原点在页面左下角：baseline 是「距页顶」距离，
+            // 必须翻转成距页底距离，否则整页文字上下颠倒/从底部倒排。
+            Mm((PAGE_H_MM - self.baseline) as f32),
             &self.font,
         );
         self.baseline += line_h;
@@ -1957,7 +2352,7 @@ fn export_bundled_markdown(
         skipped: 0,
     };
     let bundled = bundle_markdown_sync(&markdown, &base, &mut stats);
-    fs::write(&save, bundled).map_err(|e| e.to_string())?;
+    atomic_write(&save, bundled.as_bytes())?;
     Ok(BundleResult {
         embedded: stats.embedded,
         failed: stats.failed,
@@ -2006,21 +2401,9 @@ fn load_settings(app: tauri::AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, json: String) -> Result<(), String> {
     let path = settings_path(&app)?;
-    // ISSUE-004 修复：原子写入。先写临时文件，再用 rename 原子替换。
-    // Rust std::fs::rename 在 Windows 上使用 MoveFileExW + MOVEFILE_REPLACE_EXISTING，
-    // 可原子替换已存在文件，无需先 remove（消除中间崩溃致配置丢失的窗口）。
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| e.to_string())?;
-    match fs::rename(&tmp, &path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // 兜底：某些老旧 Windows / 网络盘不支持原子替换，回退到 remove+rename
-            if path.exists() {
-                let _ = fs::remove_file(&path);
-            }
-            fs::rename(&tmp, &path).map_err(|e| e.to_string())
-        }
-    }
+    // ISSUE-004 修复：原子写入（唯一临时文件 + sync_all + rename 覆盖）。
+    // 绝不再走「先删旧文件再 rename」：该兜底在 rename 失败时会直接丢失全部配置。
+    atomic_write(&path, json.as_bytes())
 }
 
 #[tauri::command]
@@ -2112,6 +2495,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             read_file,
+            read_file_b64,
             write_file,
             file_size,
             read_file_head,
@@ -2243,8 +2627,14 @@ fn ack_open_files(state: tauri::State<'_, OpenFiles>) {
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
     // 仅允许常见外部协议，防止被用于打开本地可执行文件或内部资源。
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    // 协议名大小写不敏感（HTML 中可能出现 HTTPS://），控制字符直接拒绝。
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
         return Err("unsupported URL scheme".to_string());
+    }
+    if u.chars().any(|c| c.is_control()) {
+        return Err("URL 含控制字符".to_string());
     }
     #[cfg(target_os = "windows")]
     {
@@ -2306,15 +2696,15 @@ mod tests {
         let _ = fs::write(dir.join("sub").join("world.md"), "x");
         let _ = fs::write(dir.join("sub").join("hello.txt"), "x");
         // 大小写不敏感
-        let hits = search_filenames(dir.to_string_lossy().to_string(), "HELLO".into(), false, 100).unwrap();
+        let hits = search_filenames_sync(dir.to_string_lossy().to_string(), "HELLO".into(), false, 100).unwrap();
         assert_eq!(hits.len(), 2);
         // 隐藏目录跳过
         let _ = fs::create_dir_all(dir.join(".git"));
         let _ = fs::write(dir.join(".git").join("hello2.md"), "x");
-        let hits2 = search_filenames(dir.to_string_lossy().to_string(), "hello2".into(), false, 100).unwrap();
+        let hits2 = search_filenames_sync(dir.to_string_lossy().to_string(), "hello2".into(), false, 100).unwrap();
         assert_eq!(hits2.len(), 0);
         // show_hidden=true 时能搜到
-        let hits3 = search_filenames(dir.to_string_lossy().to_string(), "hello2".into(), true, 100).unwrap();
+        let hits3 = search_filenames_sync(dir.to_string_lossy().to_string(), "hello2".into(), true, 100).unwrap();
         assert_eq!(hits3.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2413,6 +2803,31 @@ mod tests {
     fn guard_deletable_rejects_drive_root() {
         // 盘符根 "C:\" 规范化后仅含 Prefix+RootDir，无 Normal 组件 → 必须拒删整个盘。
         assert!(guard_deletable(std::path::Path::new("C:\\")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_deletable_rejects_system_and_user_roots() {
+        // 系统安装树根本身及其内部路径一律拒绝
+        for p in [
+            r"C:\Windows",
+            r"C:\Windows\System32",
+            r"C:\Program Files",
+            r"C:\ProgramData",
+            r"C:\Users",
+        ] {
+            let path = std::path::Path::new(p);
+            if path.exists() {
+                assert!(guard_deletable(path).is_err(), "{} 必须拒绝删除", p);
+            }
+        }
+        // 用户主目录根（当前用户）同样拒绝；其子文件不受影响（见 allows_real_temp_file）
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let p = std::path::PathBuf::from(profile);
+            if p.exists() {
+                assert!(guard_deletable(&p).is_err(), "用户主目录根必须拒绝删除");
+            }
+        }
     }
 
     // ---- RB-002 大文件流式 UTF-8 边界（§5 盲区补测）----

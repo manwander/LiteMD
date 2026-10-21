@@ -7,7 +7,7 @@ import { splitIntoBlocks, estimateBlockHeight, getSplitCacheStats } from "../src
 
 function splitIntoBlocksOld(source) {
   if (!source) return [];
-  const rawBlocks = splitByBlankLinesOld(source);
+  const rawBlocks = mergeContainersOld(splitByBlankLinesOld(source));
   const blocks = [];
   for (const rb of rawBlocks) {
     if (!rb.text.trim()) continue;
@@ -21,6 +21,47 @@ function splitIntoBlocksOld(source) {
     });
   }
   return blocks;
+}
+
+// v2 语义修正：松散列表 / 引用跨空行合并（与 block-splitter mergeContainerRaws 对齐）
+function listMarkerOld(text) {
+  const first = text.split('\n')[0];
+  const m = first.match(/^([ \t]*)([-*+]|\d+\.)[ \t]/);
+  if (!m) return null;
+  return {
+    kind: /^\d/.test(m[2]) ? "ordered" : "bullet",
+    indent: m[1].replace(/\t/g, "    ").length,
+  };
+}
+function quoteAtOld(text) {
+  return /^[ \t]*>[ \t]/.test(text.split('\n')[0]);
+}
+function mergeContainersOld(raws) {
+  const out = [];
+  let prevList = null;
+  let prevQuote = false;
+  for (const rb of raws) {
+    const lm = listMarkerOld(rb.text);
+    const q = quoteAtOld(rb.text);
+    if (out.length) {
+      const prev = out[out.length - 1];
+      const indent = lm
+        ? lm.indent
+        : (rb.text.match(/^[ \t]*/)[0].replace(/\t/g, "    ").length);
+      const mergeList =
+        prevList !== null &&
+        (lm !== null ? lm.indent >= 2 || lm.kind === prevList.kind : indent >= 2);
+      if (mergeList || (prevQuote && q)) {
+        prev.end = rb.end;
+        prev.text += "\n" + rb.text;
+        continue;
+      }
+    }
+    out.push({ ...rb });
+    prevList = lm;
+    prevQuote = q;
+  }
+  return out;
 }
 
 function splitByBlankLinesOld(source) {

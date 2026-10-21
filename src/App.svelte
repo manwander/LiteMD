@@ -31,7 +31,7 @@
   import StatusBar from "./StatusBar.svelte";
   import Toast from "./Toast.svelte";
   import FileTree from "./FileTree.svelte";
-  import { renameTabPathDedup, computeActiveIdxAfterClose } from "./tabs";
+  import { renameTabsUnderPath, computeActiveIdxAfterClose } from "./tabs";
   import { resolveLowEnd, buildDegrade } from "./lowend";
   import { setDims, getDims, loadDims, saveDims } from "./image-dims";
   import type { EditRange } from "./preview/block-splitter";
@@ -95,9 +95,11 @@
     settingsFilePath,
     logFrontend,
     pathExists,
+    readFileB64,
   } from "./fs";
   import { createTreeStore } from "./filetree/store";
   import { loadFolderNode, refreshTree } from "./filetree/ops";
+  import type { FsChange } from "./filetree/watcher";
   import {
     rewriteAttachmentRefs,
     resolveAttachmentDir,
@@ -307,6 +309,10 @@ console.log("Hello LiteMD");
     deferred?: boolean;
     /** 打开/载入失败：内容未与磁盘建立关联，禁止写盘，防止欢迎页/半载内容覆盖原文件（P0 数据安全） */
     loadFailed?: boolean;
+    /** 编辑代际：异步写盘完成后据此判断编辑器是否又有新改动（P0 保存竞态） */
+    rev?: number;
+    /** 磁盘内容被外部程序修改且与本地脏内容冲突；保存前必须显式确认 */
+    externalChanged?: boolean;
   }
   let tabs: TabState[] = [];
   let activeIdx = 0;
@@ -315,6 +321,9 @@ console.log("Hello LiteMD");
   // 路径统一正斜杠（Rust 返回 \\，对话框/拖拽可能混用，避免同一文件因分隔符不同重复开标签）
   // 路径内部统一正斜杠，并去掉末尾的斜杠（避免 nodeMap 里 "D:/22" 与 "D:/22/" 变成两个 key，导致新建后刷新不到父目录）
   const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
+  // 路径前缀判定必须带分隔符边界：D:/notes 不能匹配 D:/notes2
+  const isUnderPath = (child: string, parent: string) =>
+    child === parent || child.startsWith(parent + "/");
 
   // 打开路径防御归一化：去首尾引号、去 file:// 前缀、统一正斜杠。
   // 文件关联启动 / 拖拽 / 命令行传入的路径可能带引号或 file:// 前缀，
@@ -460,8 +469,11 @@ console.log("Hello LiteMD");
     tab.savedContent = lastSaved ?? tab.savedContent;
     tab.cursorPos = view ? view.state.selection.main.head : null;
   }
+  // 载入代际：连续快速切换标签时，旧载入流程不得再写全局状态（P1-8）
+  let activateToken = 0;
   async function applyTabState(tab: TabState) {
     abortDocStream(); // 失效旧的分片流（切标签），并恢复编辑器可编辑
+    const myToken = ++activateToken;
     if (tab.deferred) {
       // 延迟载入标签：不 setDoc 空内容，直接启动磁盘分片流式载入
       currentPath = tab.path;
@@ -469,7 +481,7 @@ console.log("Hello LiteMD");
       docLength = 0;
       suppressSave = true;
       await startDocStream(tab);
-      suppressSave = false;
+      if (myToken === activateToken) suppressSave = false;
       return;
     }
     currentPath = tab.path;
@@ -485,10 +497,12 @@ console.log("Hello LiteMD");
       if (view) {
         await setDocStreaming(view, tab.content, {
           threshold: STREAM_THRESHOLD,
-          onProgress: (r) => { streamProgress = r; },
+          onProgress: (r) => { if (myToken === activateToken) streamProgress = r; },
+          cancelled: () => myToken !== activateToken,
         });
       }
     } catch (e) {
+      if (myToken !== activateToken) return; // 已被新的切换接管，不覆盖新文档状态
       loadingBigDoc = false;
       streamProgress = 0;
       suppressSave = false;
@@ -497,6 +511,7 @@ console.log("Hello LiteMD");
       status = "载入失败：" + String(e);
       return;
     }
+    if (myToken !== activateToken) return; // 旧的载入流程不得再写全局状态
     loadingBigDoc = false;
     streamProgress = 0;
     suppressSave = false;
@@ -537,10 +552,14 @@ console.log("Hello LiteMD");
     }
     activeIdx = idx;
     await applyTabState(tabs[idx]);
+    if (activeIdx !== idx) return; // 切换期间又被切走：不覆盖新标签的状态栏/标题/会话
     status = "已切换到 " + basename(tabs[idx].path);
     updateTitle();
     saveSession();
   }
+  // 正在打开中的路径：双击/拖拽/单实例转发可能在 readFile 的异步窗口内重复发起，
+  // 仅靠 tabs.find 会开出两个同路径标签（P1-6）。
+  const openingPaths = new Set<string>();
   async function openTabByPath(p: string) {
     const np = norm(p);
     const exist = tabs.findIndex((t) => t.path === np);
@@ -548,32 +567,48 @@ console.log("Hello LiteMD");
       await activateTab(exist);
       return;
     }
-    // 大文档（>8MB）：延迟标签 + 分片流式载入，避免一次性 50MB IPC 长任务（P0）
-    let size = 0;
-    try { size = await fileSize(np); } catch { size = 0; }
-    if (size > BIG_DOC_BYTES) {
-      tabs = [...tabs, { path: np, content: "", savedContent: "", dirty: false, cursorPos: null, deferred: true }];
-      await activateTab(tabs.length - 1); // → applyTabState → startDocStream
-      return;
-    }
-    // 小文档（≤8MB）直接读取；读取为真实异步间隙，无需载入遮罩
-    // （遮罩仅用于大文档流式载入，由 startDocStream/applyTabState 统一管理关闭）
-    let content: string;
+    if (openingPaths.has(np)) return;
+    openingPaths.add(np);
     try {
-      content = await readFile(np);
-    } catch (e) {
-      status = "打开失败：" + String(e);
-      return;
+      // 大文档（>8MB）：延迟标签 + 分片流式载入，避免一次性 50MB IPC 长任务（P0）
+      let size = 0;
+      try { size = await fileSize(np); } catch { size = 0; }
+      const reopened = tabs.findIndex((t) => t.path === np);
+      if (reopened >= 0) {
+        await activateTab(reopened);
+        return;
+      }
+      if (size > BIG_DOC_BYTES) {
+        tabs = [...tabs, { path: np, content: "", savedContent: "", dirty: false, cursorPos: null, deferred: true }];
+        await activateTab(tabs.length - 1); // → applyTabState → startDocStream
+        return;
+      }
+      // 小文档（≤8MB）直接读取；读取为真实异步间隙，无需载入遮罩
+      // （遮罩仅用于大文档流式载入，由 startDocStream/applyTabState 统一管理关闭）
+      let content: string;
+      try {
+        content = await readFile(np);
+      } catch (e) {
+        status = "打开失败：" + String(e);
+        return;
+      }
+      const raced = tabs.findIndex((t) => t.path === np);
+      if (raced >= 0) {
+        await activateTab(raced);
+        return;
+      }
+      // 注意：此处不关闭遮罩——大文档的耗时主要在分片流式载入（applyTabState→
+      // setDocStreaming），由它在载入结束时统一关闭并展示进度。
+      tabs = [...tabs, { path: np, content, savedContent: content, dirty: false, cursorPos: null }];
+      await activateTab(tabs.length - 1);
+      settings.lastFile = np;
+      settings.recentFiles = [np, ...settings.recentFiles.filter((f) => norm(f) !== np)].slice(0, 5);
+      saveSession();
+      status = "已打开 " + basename(np);
+      updateTitle();
+    } finally {
+      openingPaths.delete(np);
     }
-    // 注意：此处不关闭遮罩——大文档的耗时主要在分片流式载入（applyTabState→
-    // setDocStreaming），由它在载入结束时统一关闭并展示进度。
-    tabs = [...tabs, { path: np, content, savedContent: content, dirty: false, cursorPos: null }];
-    await activateTab(tabs.length - 1);
-    settings.lastFile = np;
-    settings.recentFiles = [np, ...settings.recentFiles.filter((f) => norm(f) !== np)].slice(0, 5);
-    saveSession();
-    status = "已打开 " + basename(np);
-    updateTitle();
   }
   const isDirtyTab = (t: TabState) => t.dirty || t.content !== t.savedContent;
 
@@ -717,7 +752,12 @@ console.log("Hello LiteMD");
       doCloseTab(path);
       return;
     }
-    if (idx === activeIdx) syncTabState(tab);
+    if (idx === activeIdx) {
+      // 关闭前必须先把预览编辑的待回写 DOM 同步进编辑器，否则 800ms 防抖窗口内的
+      // 输入不会被计入脏状态，标签会被当作「未修改」直接关闭。
+      if (previewEditMode) flushPreviewEdit();
+      syncTabState(tab);
+    }
     if (!isDirtyTab(tab)) {
       doCloseTab(path);
       return;
@@ -734,15 +774,32 @@ console.log("Hello LiteMD");
       // 「当前激活标签 / currentPath」的隐式耦合。旧实现里 save() 在
       // suppressSave / lastSaved===null / loadFailed 时会静默早退（不抛错），
       // 随后仍无条件 doCloseTab → 用户点「保存并关闭」却被无保存关闭，丢失改动。
-      if (idx === activeIdx) syncTabState(tab); // 激活标签：先拉编辑器最新全文进 tab.content
+      if (idx === activeIdx) {
+        if (previewEditMode) flushPreviewEdit();
+        syncTabState(tab); // 激活标签：先拉编辑器最新全文进 tab.content
+      }
       if (tab.loadFailed) {
         // 载入失败：内容与磁盘无关联，绝不写盘覆盖，等同「不保存关闭」
         doCloseTab(p);
       } else {
+        if (tab.externalChanged) {
+          const ok = await askConfirm({
+            title: "文件已被外部修改",
+            message: `${basename(p)} 在 LiteMD 之外被修改。\n继续保存将覆盖外部修改，是否继续？`,
+            confirmText: "覆盖保存",
+            danger: true,
+          });
+          if (!ok) {
+            closeQ = abortAll();
+            status = "已取消关闭（外部修改未被覆盖）";
+            return;
+          }
+        }
+        const text = tab.content;
+        const gen = tab.rev ?? 0;
         try {
-          await writeFile(tab.path, tab.content);
-          tab.savedContent = tab.content;
-          tab.dirty = false;
+          await writeFileQueued(tab.path, text);
+          commitTabSaved(tab, tab.path, text, gen);
           doCloseTab(p); // 仅确认写盘成功后才关闭
         } catch (e) {
           ioFail("保存并关闭", e); // 失败则保留标签，让用户重试或选择「不保存关闭」
@@ -904,19 +961,51 @@ console.log("Hello LiteMD");
 
     // 树内重命名/移动后：更新已打开标签的路径（供 FileTree handlers.onTabRenamed 使用）
     function updateTabPath(oldPath: string, newPath: string) {
+      const op = norm(oldPath);
       const np = norm(newPath);
-      const { tabs: nextTabs, activeIdx: nextActive } = renameTabPathDedup(tabs, oldPath, newPath, activeIdx);
+      // 文件夹移动/重命名时必须批量重映射其下所有标签；旧的精确匹配会让子文件标签
+      // 继续指向旧路径，之后保存会写到已不存在的位置。
+      const oldActivePath = currentPath ? norm(currentPath) : null;
+      const { tabs: nextTabs, activeIdx: nextActive } = renameTabsUnderPath(tabs, op, np, activeIdx);
       tabs = nextTabs;
-      // 仅当被改名的标签成为激活标签时，同步当前路径与最近文件（避免覆盖其它激活标签）
-      if (nextActive >= 0 && tabs[nextActive] && norm(tabs[nextActive].path) === np) {
-        currentPath = np;
-        settings.lastFile = np;
-      }
       activeIdx = nextActive;
+      if (oldActivePath && isUnderPath(oldActivePath, op)) {
+        currentPath = np + oldActivePath.slice(op.length);
+        settings.lastFile = currentPath;
+      }
       saveSession();
       updateTitle();
       // 附件文件夹联动：重命名 / 移动 .md 时一并处理其 {filename}_attachment（异步，不阻塞 UI）
       if (/\.md$/i.test(newPath)) void linkAttachmentOnRename(oldPath, newPath);
+    }
+
+    // 文件树删除成功后：关闭其下所有标签（P0-3）。
+    // 已删除路径上的「保存并关闭」会把文件原地复活，因此脏标签改为一次性确认：
+    // 放弃修改并关闭，或保留标签但禁止写盘（可另存为抢救）。
+    async function removeTabsUnderPath(path: string) {
+      const np = norm(path);
+      const affected = tabs.filter((t) => isUnderPath(t.path, np));
+      if (!affected.length) return;
+      const dirty = affected.filter((t) => isDirtyTab(t) && !t.deferred);
+      if (dirty.length) {
+        const names = dirty.slice(0, 5).map((t) => basename(t.path)).join("、")
+          + (dirty.length > 5 ? ` 等 ${dirty.length} 个` : "");
+        const ok = await askConfirm({
+          title: "文件已被删除",
+          message: `${names} 已被删除，但有未保存的修改。\n继续关闭将放弃这些修改。`,
+          confirmText: "放弃修改并关闭",
+          danger: true,
+        });
+        if (!ok) {
+          // 保留标签供「另存为」抢救；标记 loadFailed 阻止后续保存把文件复活
+          for (const t of affected) t.loadFailed = true;
+          status = "文件已删除：标签已保留，可使用「另存为」恢复内容";
+          return;
+        }
+      }
+      for (const t of [...affected]) doCloseTab(t.path);
+      saveSession();
+      updateTitle();
     }
 
     // 重命名 / 移动 .md 时，对附件目录做同样操作：
@@ -934,28 +1023,51 @@ console.log("Hello LiteMD");
           await renamePath(oldAtt, newAtt);
         }
       } catch (e) {
+        // 目录没搬成功就改写引用会得到一批死链，直接中止联动并提示
         logError("附件文件夹联动失败：" + String(e));
+        showToast("附件文件夹联动失败：" + String(e), "error", 4000);
+        return;
       }
       // 2) 仅目录名变化（重命名场景）才改写文档内引用；纯移动目录名不变，相对引用仍有效
       if (oldName !== newName) {
+        const np = norm(mdNew);
+        const tab = tabs.find((t) => t.path === np);
+        if (tab && tabs[activeIdx] === tab && previewEditMode) flushPreviewEdit();
         try {
-          const text = await readFile(mdNew);
+          // 基准必须取「内存中的最新内容」而不是磁盘：否则磁盘旧版本会覆盖
+          // 用户尚未保存的修改（P0-2）。非激活标签在切走时已同步过全文。
+          const text = tab
+            ? (tabs[activeIdx] === tab && view ? pullDoc() : tab.content)
+            : await readFile(mdNew);
           const res = rewriteAttachmentRefs(text, dirname(mdNew), [oldAtt], oldName, newName);
           if (res.count > 0) {
-            await writeFile(mdNew, res.text);
-            // 当前打开的文档：同步编辑器内容，避免预览里图裂
-            if (currentPath && norm(currentPath) === norm(mdNew) && view) {
-              suppressSave = true;
-              setDoc(view, res.text);
-              source = res.text;
-              lastSaved = res.text;
-              docDirty = false;
-              suppressSave = false;
-              updateTitle();
+            await writeFileQueued(mdNew, res.text);
+            if (tab) {
+              const isActive = tabs[activeIdx] === tab && view && currentPath && norm(currentPath) === np;
+              if (isActive && view) {
+                // 只替换差异区间，保留光标与撤销历史
+                const d = diffRange(pullDoc(), res.text);
+                if (d) {
+                  suppressSave = true;
+                  applyExternalEdit(view, d.from, d.to, d.insert);
+                  suppressSave = false;
+                }
+                source = res.text;
+                lastSaved = res.text;
+                docDirty = false;
+              }
+              tab.content = res.text;
+              tab.savedContent = res.text;
+              tab.dirty = false;
+              tab.externalChanged = false;
+              if (isActive) syncTabState(tab);
             }
+            saveSession();
+            updateTitle();
           }
         } catch (e) {
           logError("改写附件引用失败：" + String(e));
+          showToast("改写附件引用失败：" + String(e), "error", 4000);
         }
       }
     }
@@ -1064,6 +1176,131 @@ console.log("Hello LiteMD");
     return text;
   }
 
+  // ---- 写盘串行化与保存代际（P0 保存竞态）----
+  // 同一路径的手动保存 / 自动保存 / 关闭前保存必须按发起顺序落盘；否则慢磁盘上
+  // 后发请求可能先完成，旧内容覆盖新内容。写入完成后再用 rev 判断期间是否有新编辑。
+  const writeQueues = new Map<string, Promise<void>>();
+  function writeFileQueued(path: string, text: string): Promise<void> {
+    const key = norm(path);
+    const prev = writeQueues.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(() => writeFile(path, text));
+    writeQueues.set(key, next);
+    noteSelfWrite(path, text);
+    const cleanup = () => {
+      if (writeQueues.get(key) === next) writeQueues.delete(key);
+    };
+    void next.then(cleanup, cleanup);
+    return next;
+  }
+  async function flushPendingWrites(): Promise<void> {
+    while (writeQueues.size) {
+      await Promise.all([...writeQueues.values()].map((p) => p.catch(() => {})));
+    }
+  }
+  /** 写盘成功后提交保存状态；若 await 期间又有编辑（rev 变化），保持脏标记并续排自动保存 */
+  function commitTabSaved(tab: TabState, path: string, text: string, gen: number): void {
+    if (!tabs.includes(tab)) return;
+    const changedAfterCapture = (tab.rev ?? 0) !== gen;
+    tab.savedContent = text;
+    tab.externalChanged = false;
+    tab.dirty = changedAfterCapture;
+    if (!changedAfterCapture) tab.content = text;
+    const isActive = tabs[activeIdx] === tab && currentPath === path;
+    if (isActive) {
+      lastSaved = text;
+      source = text;
+      docDirty = changedAfterCapture;
+      updateTitle();
+      if (changedAfterCapture) queueAutoSave();
+    }
+  }
+
+  // ---- 外部变更协调（P1-1）----
+  // 文件监视器报告磁盘变化后：干净标签自动重载，脏标签标记冲突并暂停自动保存，
+  // 避免「外部工具改了文件 → 应用内保存静默覆盖」。
+  // 自身写盘也会触发监视事件，用最近写入登记表区分（原子写落盘后内容应等于登记值）。
+  const recentSelfWrites = new Map<string, string>();
+  function noteSelfWrite(path: string, text: string): void {
+    const key = norm(path);
+    recentSelfWrites.set(key, text);
+    setTimeout(() => {
+      if (recentSelfWrites.get(key) === text) recentSelfWrites.delete(key);
+    }, 3000);
+  }
+  let fsChangeTimer: ReturnType<typeof setTimeout> | null = null;
+  const fsChangePending = new Set<string>();
+  function queueFsReconcile(path: string): void {
+    const np = norm(path);
+    if (!np) return;
+    fsChangePending.add(np);
+    if (fsChangeTimer) clearTimeout(fsChangeTimer);
+    fsChangeTimer = setTimeout(() => {
+      fsChangeTimer = null;
+      const batch = [...fsChangePending];
+      fsChangePending.clear();
+      void reconcileExternalChanges(batch);
+    }, 400);
+  }
+  async function reconcileExternalChanges(paths: string[]): Promise<void> {
+    for (const p of paths) {
+      const tab = tabs.find((t) => t.path === p);
+      if (!tab || tab.deferred || tab.loadFailed) continue;
+      let disk: string;
+      try {
+        disk = await readFile(tab.path);
+      } catch {
+        // 外部删除：保留标签与内存内容，标记冲突；保存会重新创建但需确认
+        if (tabs.includes(tab) && !tab.externalChanged) {
+          tab.externalChanged = true;
+          showToast(`${basename(tab.path)} 已被外部删除，保存将重新创建该文件`, "info", 4500);
+        }
+        continue;
+      }
+      if (recentSelfWrites.get(p) === disk || disk === tab.savedContent) {
+        tab.externalChanged = false;
+        continue;
+      }
+      if (disk === tab.content) {
+        // 磁盘与内存一致（例如自己的写盘事件晚到）：对齐基线即可
+        tab.savedContent = disk;
+        tab.externalChanged = false;
+        tab.dirty = false;
+        if (tabs[activeIdx] === tab) {
+          lastSaved = disk;
+          source = disk;
+          docDirty = false;
+          updateTitle();
+        }
+        continue;
+      }
+      if (isDirtyTab(tab)) {
+        if (!tab.externalChanged) {
+          tab.externalChanged = true;
+          showToast(`${basename(tab.path)} 已被外部修改：保存前会要求确认，自动保存已暂停`, "info", 5200);
+        }
+        continue;
+      }
+      // 干净标签：直接重载磁盘内容（光标位置不还原，避免打断阅读）
+      tab.content = disk;
+      tab.savedContent = disk;
+      tab.dirty = false;
+      tab.externalChanged = false;
+      if (tabs[activeIdx] === tab && view) {
+        suppressSave = true;
+        setDoc(view, disk);
+        suppressSave = false;
+        source = disk;
+        lastSaved = disk;
+        docDirty = false;
+        cancelOpenPreview();
+        scheduleOpenPreview(disk);
+        scheduleStats(disk);
+        updateTitle();
+        saveSession();
+      }
+    }
+  }
+
   // 编辑器文档变化（每击键）：只做 O(1) 标记 + 累计脏区间 + 重新排防抖，不读全文、不做字符串比较
   // 脏区间以「上次推送的 previewSource」为坐标基准，供预览增量切块（splitFast）使用
   let pendingEdit: EditRange | null = null;
@@ -1075,6 +1312,8 @@ console.log("Hello LiteMD");
   let streamProgress = 0;
   function onEditorDocChange(fromA: number, toA: number, fromB: number, toB: number) {
     docDirty = true;
+    const curTab = tabs[activeIdx];
+    if (curTab) curTab.rev = (curTab.rev ?? 0) + 1;
     // 文档身份已变，立即释放上一版本的 50MB 字符串副本，避免常驻两份
     docMemo = null;
     if (view) docLength = view.state.doc.length;
@@ -1450,6 +1689,7 @@ console.log("Hello LiteMD");
     let unlistenOpenFiles: (() => void) | null = null;
     let unlistenMoved: (() => void) | null = null;
     let unlistenResized: (() => void) | null = null;
+    let unlistenFs: (() => void) | null = null;
     let bootReady = false;
     let pendingOpenFiles: string[] = [];
 
@@ -1490,6 +1730,15 @@ console.log("Hello LiteMD");
       }).then((unlisten) => {
         if (disposed) { unlisten(); return; }
         unlistenOpenFiles = unlisten;
+      }).catch(() => {});
+
+      // 外部变更协调（P1-1）：监视器事件按路径防抖，重载干净标签 / 标记脏冲突
+      listen<FsChange>("fs-change", (e) => {
+        const list = e.payload?.paths?.length ? e.payload.paths : [e.payload?.path];
+        for (const p of list) if (p) queueFsReconcile(p);
+      }).then((unlisten) => {
+        if (disposed) { unlisten(); return; }
+        unlistenFs = unlisten;
       }).catch(() => {});
 
       // ---- 启动前先消费 Rust 端待打开文件，避免欢迎页先渲染再被替换（q15）----
@@ -1536,6 +1785,8 @@ console.log("Hello LiteMD");
         dirty: boolean; cursorPos: number | null; deferred?: boolean;
       };
       const restoredEarly: RestoredItem[] = [];
+      // 大文档的未保存内容不写入 localStorage；恢复时只能回退磁盘，必须显式告知用户
+      const sessionLostDirty: string[] = [];
       for (const p of openPathsForRestore) {
         const np = norm(p);
         if (restoredEarly.some((r) => r.path === np)) continue;
@@ -1545,6 +1796,7 @@ console.log("Hello LiteMD");
         let dirty = s ? s.dirty : false;
         if (content === "") content = null;
         if (content === null) {
+          if (s && s.dirty) sessionLostDirty.push(np);
           try {
             let sz = 0;
             try { sz = await fileSize(np); } catch { sz = 0; }
@@ -1680,6 +1932,12 @@ console.log("Hello LiteMD");
         }
       }
 
+      if (sessionLostDirty.length > 0) {
+        const msg = `${sessionLostDirty.length} 个大文档的未保存修改超出会话缓存上限，已从磁盘重新读取`;
+        logWarn(msg + "：" + sessionLostDirty.join("、"));
+        showToast(msg, "info", 6000);
+      }
+
       configPath = await settingsFilePath();
       if (!disposed) hlReady = true;
       // 同步调度器：心跳内部有启动延迟（30s）与 enabled/间隔门控，此处无条件 start
@@ -1735,6 +1993,8 @@ console.log("Hello LiteMD");
       unlistenMoved?.();
       unlistenOpenFiles?.();
       unlistenResized?.();
+      unlistenFs?.();
+      if (fsChangeTimer) { clearTimeout(fsChangeTimer); fsChangeTimer = null; }
       if (windowBusyTimer) clearTimeout(windowBusyTimer);
       if (memTimer) { clearInterval(memTimer); memTimer = null; }
       perfObservers.forEach((o) => { try { o.disconnect(); } catch { /* ignore */ } });
@@ -1789,20 +2049,58 @@ console.log("Hello LiteMD");
       void syncCancel().then(() => showToast("已请求取消同步", "info"));
       return false;
     }
-    if (!settings.sync.folders.some((f) => f.enabled)) {
+    const folders = settings.sync.folders.filter((f) => f.enabled);
+    if (!folders.length) {
       showToast("尚未配置启用的同步文件夹（设置 → 同步）", "info");
       return false;
     }
+    // 同步前把预览编辑的待回写内容并入编辑器，避免同步读到防抖前的旧内容
+    if (previewEditMode) flushPreviewEdit();
+    const cur = tabs[activeIdx];
+    if (cur && !cur.deferred && !cur.loadFailed) syncTabState(cur);
+    saveSession();
     syncBusy = true;
     syncProgress = "";
     const openDirty = tabs.filter((t) => isDirtyTab(t)).map((t) => t.path);
     try {
-      const summary = await syncRun(buildSyncConfig(settings, openDirty), {
-        mode,
-        onEvent: (ev) => {
-          syncProgress = ev.total ? `${ev.done}/${ev.total}` : "";
-        },
-      });
+      // 旧配置可能没有 folderId：补生成，避免后端因缺失而回退到「第一个文件夹」
+      let idsChanged = false;
+      for (const f of folders) {
+        if (!f.id) {
+          f.id = await syncFolderId(f.localRoot);
+          idsChanged = true;
+        }
+      }
+      if (idsChanged) persist();
+      const cfg = buildSyncConfig(settings, openDirty);
+      const summary: SyncSummary = {
+        uploaded: 0, downloaded: 0, deletedLocal: 0, deletedRemote: 0,
+        conflicts: [], skipped: [], errors: [], protectedDeletes: 0,
+        dryRun: false, cancelled: false,
+      };
+      for (const folder of folders) {
+        // 每个启用文件夹单独执行一轮：folderId 必须显式传入，
+        // 否则后端会把同步写到第一个启用的目录（多文件夹场景直接错目录）
+        const one = await syncRun(cfg, {
+          folderId: folder.id,
+          mode,
+          onEvent: (ev) => {
+            syncProgress = ev.total ? `${ev.done}/${ev.total}` : "";
+          },
+        });
+        summary.uploaded += one.uploaded;
+        summary.downloaded += one.downloaded;
+        summary.deletedLocal += one.deletedLocal;
+        summary.deletedRemote += one.deletedRemote;
+        summary.protectedDeletes += one.protectedDeletes;
+        summary.conflicts.push(...one.conflicts);
+        summary.skipped.push(...one.skipped);
+        summary.errors.push(...one.errors);
+        if (one.cancelled) {
+          summary.cancelled = true;
+          break;
+        }
+      }
       lastSyncSummary = summary;
       syncConflicts = summary.conflicts.length;
       settings.sync.lastSyncAt = Date.now();
@@ -2119,6 +2417,12 @@ console.log("Hello LiteMD");
     status = "已退出预览编辑，恢复 markdown 编辑";
   }
   function onPreviewEditInput() {
+    // 脏标记必须与输入同步置位：若只在 800ms 防抖 flush 时置脏，
+    // 期间关闭/切换标签会被判定为「未修改」而直接丢弃最后一段输入。
+    docDirty = true;
+    const curTab = tabs[activeIdx];
+    if (curTab) curTab.rev = (curTab.rev ?? 0) + 1;
+    queueSessionSave();
     if (previewEditTimer) clearTimeout(previewEditTimer);
     previewEditTimer = setTimeout(flushPreviewEdit, 800);
     // 工具栏点击标题/列表/插入表格/插入图片等通过 previewExec 触发回写后,
@@ -2190,7 +2494,8 @@ console.log("Hello LiteMD");
       status = "正在切换文档，已暂存本次编辑（自动保存恢复后生效）";
       return;
     }
-    if (tabs[activeIdx]?.loadFailed) {
+    const tab = tabs[activeIdx];
+    if (tab?.loadFailed) {
       // P0 数据安全：该文件打开/载入失败，编辑器内容与磁盘无关联，禁止写盘覆盖原文件
       status = "文件加载失败，已禁止保存（原文件未被修改）";
       logError("保存被拦截：文件加载失败 " + (currentPath ?? ""));
@@ -2204,36 +2509,48 @@ console.log("Hello LiteMD");
     }
     const text = pullDoc();
     // P0 数据安全：编辑器内容与 lastSaved 完全一致时为 no-op，避免无谓的磁盘写入
-    if (text === lastSaved) {
+    if (text === lastSaved && !tab?.externalChanged) {
       docDirty = false;
       updateTitle();
       return;
     }
+    if (tab?.externalChanged) {
+      const ok = await askConfirm({
+        title: "文件已被外部修改",
+        message: `${basename(currentPath)} 在 LiteMD 之外被修改。\n继续保存将覆盖外部修改，是否继续？`,
+        confirmText: "覆盖保存",
+        danger: true,
+      });
+      if (!ok) {
+        status = "已取消保存（外部修改未被覆盖）";
+        return;
+      }
+    }
+    const path = currentPath;
+    const gen = tab?.rev ?? 0;
     try {
-      await writeFile(currentPath, text);
+      await writeFileQueued(path, text);
     } catch (e) {
       // H-1：普通写盘失败（磁盘满 / 文件被占用 / 权限）是可恢复错误，绝不能冒泡到
       // 全局 unhandledrejection → 全屏「致命错误」页劫持用户的全部未保存文档。
       ioFail("保存", e);
       return;
     }
-    source = text;
-    lastSaved = text;
-    docDirty = false;
-    const tab = tabs[activeIdx];
-    if (tab) {
-      tab.content = text;
-      tab.savedContent = text;
-      tab.dirty = false;
+    if (tab) commitTabSaved(tab, path, text, gen);
+    else {
+      source = text;
+      lastSaved = text;
+      docDirty = false;
     }
-    status = "已保存 " + basename(currentPath);
-    logOp("保存文件: " + currentPath);
+    status = "已保存 " + basename(path);
+    logOp("保存文件: " + path);
     updateTitle();
     saveSession();
     syncScheduler.notifySaved();
   }
 
   async function saveAs() {
+    if (previewEditMode) flushPreviewEdit();
     if (suppressSave) {
       status = "正在切换文档，已禁止另存为（自动保存恢复后生效）";
       return;
@@ -2243,7 +2560,7 @@ console.log("Hello LiteMD");
     const np = norm(p);
     const text = pullDoc();
     try {
-      await writeFile(np, text);
+      await writeFileQueued(np, text);
     } catch (e) {
       ioFail("另存为", e);
       return;
@@ -2255,6 +2572,7 @@ console.log("Hello LiteMD");
       dupTab.content = text;
       dupTab.savedContent = text;
       dupTab.dirty = false;
+      dupTab.externalChanged = false;
       const curPath = currentPath!;
       doCloseTab(curPath);
       const newDup = tabs.findIndex((t) => t.path === np);
@@ -2272,23 +2590,96 @@ console.log("Hello LiteMD");
       tab.content = text;
       tab.savedContent = text;
       tab.dirty = false;
+      tab.externalChanged = false;
     }
+    currentPath = np;
+    source = text;
+    lastSaved = text;
+    docDirty = false;
     settings.lastFile = np;
     saveSession();
     status = "已保存 " + basename(np);
     updateTitle();
+    syncScheduler.notifySaved();
   }
 
   // ---------- 导出：Markdown / PDF / HTML ----------
+  const EXPORT_MIME: Record<string, string> = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    bmp: "image/bmp",
+    avif: "image/avif",
+    svg: "image/svg+xml",
+  };
+
+  /** 把相对图片引用按笔记目录解析成绝对路径（处理 ./ 与 ../，兼容 / 与 \） */
+  function joinNotePath(dir: string, rel: string): string {
+    const sep = dir.includes("\\") ? "\\" : "/";
+    const stack = dir.replace(/[\\/]+$/, "").split(/[\\/]/);
+    for (const part of rel.replace(/\\/g, "/").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (stack.length > 1) stack.pop();
+        continue;
+      }
+      stack.push(part);
+    }
+    return stack.join(sep);
+  }
+
+  // 导出 HTML 内嵌本地图片：相对路径在导出件所在目录会全部断链，
+  // 改为 data: URL（外链/已内嵌/协议地址保持原样）。上限 200 张、单张 20MB。
+  async function inlineExportImages(
+    html: string,
+    noteDir: string,
+  ): Promise<{ html: string; embedded: number; failed: number }> {
+    if (!/<img[\s>]/i.test(html)) return { html, embedded: 0, failed: 0 };
+    const doc = new DOMParser().parseFromString(`<div id="__litemd_root">${html}</div>`, "text/html");
+    const root = doc.getElementById("__litemd_root");
+    if (!root) return { html, embedded: 0, failed: 0 };
+    let embedded = 0;
+    let failed = 0;
+    const imgs = Array.from(root.querySelectorAll("img")).slice(0, 200);
+    for (const img of imgs) {
+      const src = img.getAttribute("src") || "";
+      // 外链 / data: / asset: / 协议相对与锚点：保持原样
+      if (!src || /^(?:[a-z][a-z0-9+.\-]*:|\/\/|#)/i.test(src)) continue;
+      let clean = src.split(/[?#]/)[0];
+      try {
+        clean = decodeURIComponent(clean);
+      } catch {
+        /* 非法百分号编码：按原串处理 */
+      }
+      const ext = clean.split(".").pop()?.toLowerCase() || "";
+      const mime = EXPORT_MIME[ext];
+      if (!mime) {
+        failed++;
+        continue;
+      }
+      try {
+        const b64 = await readFileB64(joinNotePath(noteDir, clean), 20 * 1024 * 1024);
+        img.setAttribute("src", `data:${mime};base64,${b64}`);
+        embedded++;
+      } catch {
+        failed++;
+      }
+    }
+    return { html: root.innerHTML, embedded, failed };
+  }
+
   async function exportMarkdown() {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
+    const text = pullDoc(); // 对话框期间切换标签不会导出错文件
     const p = await pickSaveFile();
     if (!p) return;
     try {
-      await writeFile(p, pullDoc());
+      await writeFile(p, text);
       status = "已导出 " + basename(p);
     } catch (e) {
       ioFail("导出 Markdown", e);
@@ -2300,11 +2691,12 @@ console.log("Hello LiteMD");
       status = "请先保存文件再导出";
       return;
     }
+    const text = pullDoc();
     const p = await pickSavePdfFile();
     if (!p) return;
     const finalPath = /\.pdf$/i.test(p) ? p : p + ".pdf";
     try {
-      await exportPdf(finalPath, pullDoc());
+      await exportPdf(finalPath, text);
       status = "已导出 " + basename(finalPath);
       logOp("导出PDF: " + finalPath);
     } catch (e) {
@@ -2317,18 +2709,24 @@ console.log("Hello LiteMD");
       status = "请先保存文件再导出";
       return;
     }
+    const srcPath = currentPath;
+    const text = pullDoc();
     const p = await pickSaveFile();
     if (!p) return;
-    const title = basename(currentPath);
+    const title = basename(srcPath);
+    const noteDir = srcPath.replace(/[\\/][^\\/]+$/, "") || srcPath;
     const m = md ?? (await initMd()); // 导出前确保解析器就绪（首导触发动态加载）
     // H-6：渲染导出正文期间关闭 asset:// 转换，图片保留相对引用（否则导出件图全断）。
     let bodyHtml = "";
     exportingHtml = true;
     try {
-      bodyHtml = safeRender(m, pullDoc());
+      bodyHtml = safeRender(m, text);
     } finally {
       exportingHtml = false;
     }
+    // P1：相对图片改为 data: URL，导出的单文件 HTML 离开笔记目录也能显示图片
+    const inlined = await inlineExportImages(bodyHtml, noteDir);
+    bodyHtml = inlined.html;
     const full = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2349,7 +2747,10 @@ ${bodyHtml}
 </html>`;
     try {
       await exportHtml(p, full);
-      status = "已导出 " + basename(p);
+      status =
+        "已导出 " + basename(p) +
+        (inlined.embedded ? `（内嵌 ${inlined.embedded} 张图片）` : "") +
+        (inlined.failed ? `，${inlined.failed} 张图片未能内嵌` : "");
       logOp("导出HTML: " + p);
     } catch (e) {
       ioFail("导出 HTML", e);
@@ -2395,16 +2796,29 @@ ${bodyHtml}
         // P0 数据安全：载入失败/从未建立保存基准（lastSaved=null）时禁止自动写盘，
         // 防止欢迎页或半载内容覆盖原文件
         if (curTab?.loadFailed || lastSaved === null) return;
+        // 外部修改冲突时自动保存必须让位，交由用户手动确认，避免静默覆盖别人的修改
+        if (curTab?.externalChanged) {
+          status = "检测到外部修改，已暂停自动保存";
+          return;
+        }
         const text = pullDoc();
         if (text === lastSaved) return;
+        const path = currentPath;
+        const gen = curTab?.rev ?? 0;
         try {
-          await writeFile(currentPath, text);
-          source = text;
-          lastSaved = text;
-          docDirty = false;
-          status = "已自动保存";
-          updateTitle();
-          syncScheduler.notifySaved();
+          await writeFileQueued(path, text);
+          if (curTab) commitTabSaved(curTab, path, text, gen);
+          else {
+            source = text;
+            lastSaved = text;
+            docDirty = false;
+          }
+          if (tabs[activeIdx] === curTab && currentPath === path) {
+            status = "已自动保存";
+            updateTitle();
+            saveSession();
+            syncScheduler.notifySaved();
+          }
         } catch (e) {
           status = "自动保存失败：" + String(e);
         }
@@ -3098,17 +3512,29 @@ ${bodyHtml}
       const root = settings.lastFolder ?? (currentPath ? dirname(currentPath) : null)!;
       try {
         const files = await listMdFiles(root);
-        let filesChanged = 0, totalMigrated = 0, totalFailed = 0;
+        let filesChanged = 0, totalMigrated = 0, totalFailed = 0, skippedDirty = 0;
         const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
         for (const f of files) {
           try {
+            const openTab = tabs.find((t) => norm(t.path) === norm(f));
+            // 正在编辑且未保存的文件不参与迁移：读写交错会吞掉用户未保存的修改
+            if (openTab && isDirtyTab(openTab)) {
+              skippedDirty++;
+              continue;
+            }
             const content = await readFile(f);
             const res = await migrateNoteContent(content, f);
             totalFailed += res.failed;
             if (res.count > 0) {
-              await writeFile(f, res.text);
+              // 与自动保存共用同一路径写队列，避免迁移写入与保存写入乱序
+              await writeFileQueued(f, res.text);
               filesChanged++;
               totalMigrated += res.count;
+              if (openTab) {
+                openTab.content = res.text;
+                openTab.savedContent = res.text;
+                openTab.dirty = false;
+              }
               if (view && currentPath && norm(f) === norm(currentPath)) {
                 suppressSave = true;
                 setDoc(view, res.text);
@@ -3121,7 +3547,7 @@ ${bodyHtml}
             }
           } catch { totalFailed++; }
         }
-        status = `批量迁移完成：${filesChanged} 个文件，成功 ${totalMigrated} 张${totalFailed ? `，失败 ${totalFailed} 张` : ""}`;
+        status = `批量迁移完成：${filesChanged} 个文件，成功 ${totalMigrated} 张${totalFailed ? `，失败 ${totalFailed} 张` : ""}${skippedDirty ? `，跳过 ${skippedDirty} 个编辑中文件` : ""}`;
       } catch (e) { status = "批量迁移失败：" + String(e); }
     }
 
@@ -3240,6 +3666,19 @@ ${bodyHtml}
     }
   }
 
+  // 菜单/工具栏点击统一入口：与 run() 相同地兜住同步异常与 Promise rejection，
+  // 避免可恢复的 IPC 失败冒泡到全局 unhandledrejection 触发全屏「致命错误」页
+  function cmd(fn: () => unknown): void {
+    try {
+      const r = fn();
+      if (r && typeof (r as Promise<unknown>).then === "function") {
+        (r as Promise<unknown>).catch((err) => ioFail("操作", err));
+      }
+    } catch (err) {
+      ioFail("操作", err);
+    }
+  }
+
   function run(e: KeyboardEvent, fn: () => unknown) {
     e.preventDefault();
     // H-1：快捷键 handler 可能是 async（save/open/export…）。同步异常与未处理的
@@ -3261,9 +3700,13 @@ ${bodyHtml}
     // 关键修复：关闭前同步保存会话 + 设置，避免「正常启动打开过 A.md 关闭后下次启动
     // 会话丢失」的回归。persist() 有 300ms debounce，Alt+F4 会在 debounce 没到时间
     // 就关窗口，导致 settings.openTabs / lastFile 没写盘。
-    const cur = tabs[activeIdx];
-    if (cur && !cur.deferred && !cur.loadFailed) syncTabState(cur);
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
     saveSession();
+    // 等待所有已发起但尚未完成的写盘，避免进程先于写入退出导致截断
+    await flushPendingWrites();
     try {
       await saveSettings(settings);
     } catch {
@@ -3271,16 +3714,16 @@ ${bodyHtml}
       try { localStorage.setItem("litemd.settings", JSON.stringify(settings)); } catch { /* ignore */ }
     }
   }
-  function doClose() {
+  let closing = false;
+  async function doClose() {
+    if (closing) return;
+    closing = true;
     logInfo("LiteMD 关闭");
-    // saveAllBeforeExit 是异步 IPC（settings.json 写盘），需要先启动写操作
-    // 再销毁窗口。destroy() 在 Windows 上很快，所以 Promise 不 await。
-    // 如果 destroy() 已经执行完但 save 还没落地，就靠 localStorage 兜底。
-    void saveAllBeforeExit();
-    setTimeout(() => {
-      if (tauriWindow) (tauriWindow as any).destroy().catch(() => window.close());
-      else window.close();
-    }, 80);
+    // P0：先等待保存/设置真正落盘，再销毁窗口。旧实现只等 80ms，
+    // 慢磁盘上会直接掐断尚未完成的写入。
+    await saveAllBeforeExit().catch(() => {});
+    if (tauriWindow) await (tauriWindow as any).destroy().catch(() => window.close());
+    else window.close();
   }
 
   // 窗口关闭：任一标签未保存 → 三按钮对话框（保存全部并退出 / 直接退出 / 取消）
@@ -3288,14 +3731,16 @@ ${bodyHtml}
   let closeAllDirtyNames = "";
   function requestClose() {
     if (tabs.length === 0) {
-      doClose();
+      void doClose();
       return;
     }
+    // 关窗前把预览编辑的待回写内容并入编辑器，否则「看起来没改」而直接退出
+    if (previewEditMode) flushPreviewEdit();
     const cur = tabs[activeIdx];
     if (cur) syncTabState(cur);
     const dirtyTabs = tabs.filter((t) => isDirtyTab(t) && !t.loadFailed);
     if (dirtyTabs.length === 0) {
-      doClose();
+      void doClose();
       return;
     }
     closeAllDirtyNames = dirtyTabs.slice(0, 5).map((t) => basename(t.path)).join("、")
@@ -3303,34 +3748,44 @@ ${bodyHtml}
     closeAllDialog = true;
   }
   async function onCloseAllSave() {
-    closeAllDialog = false;
     // P0 数据安全：applyTabState 期间不能批量保存（编辑器里仍是旧标签/欢迎页内容）
     if (suppressSave) {
       status = "正在切换文档，已禁止批量保存（原文件未被修改）";
       return;
     }
+    if (previewEditMode) flushPreviewEdit();
+    const cur = tabs[activeIdx];
+    if (cur && !cur.deferred && !cur.loadFailed) syncTabState(cur);
+    closeAllDialog = false;
     try {
-      for (const tab of tabs) {
-        if (isDirtyTab(tab) && !tab.loadFailed) {
-          // P0 数据安全：缺保存基准的标签跳过，避免陈旧内容覆盖磁盘
-          if (!tab.savedContent) {
-            status = `已跳过 ${basename(tab.path)}（未建立保存基准）`;
-            continue;
+      for (const tab of [...tabs]) {
+        if (!isDirtyTab(tab) || tab.loadFailed || tab.deferred) continue;
+        if (tab.externalChanged) {
+          const ok = await askConfirm({
+            title: "文件已被外部修改",
+            message: `${basename(tab.path)} 在 LiteMD 之外被修改。\n继续退出将覆盖外部修改，是否继续？`,
+            confirmText: "覆盖保存并退出",
+            danger: true,
+          });
+          if (!ok) {
+            status = "已取消退出（外部修改未被覆盖）";
+            return;
           }
-          await writeFile(tab.path, tab.content);
-          tab.savedContent = tab.content;
-          tab.dirty = false;
         }
+        const text = tab.content;
+        const gen = tab.rev ?? 0;
+        await writeFileQueued(tab.path, text);
+        commitTabSaved(tab, tab.path, text, gen);
       }
     } catch (e) {
       status = "保存失败，已取消退出：" + String(e);
       return;
     }
-    doClose();
+    void doClose();
   }
   function onCloseAllNoSave() {
     closeAllDialog = false;
-    doClose();
+    void doClose();
   }
   function onCloseAllCancel() {
     closeAllDialog = false;
@@ -3378,53 +3833,53 @@ ${bodyHtml}
       {#if menuOpen}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <div class="menu-list" on:mouseleave={() => (menuOpen = false)}>
-          <div on:click={() => { menuOpen = false; openFile(); }}>
+          <div on:click={() => { menuOpen = false; cmd(openFile); }}>
             打开文件 <span>{accel("file.open")}</span>
           </div>
-          <div on:click={() => { menuOpen = false; openFolder(); }}>
+          <div on:click={() => { menuOpen = false; cmd(openFolder); }}>
             打开文件夹 <span>{accel("file.openFolder")}</span>
           </div>
           {#if settings.recentFiles.length}
             <div class="sep-line"></div>
             <div class="menu-header">最近打开</div>
             {#each settings.recentFiles as rf}
-              <div on:click={() => { menuOpen = false; openFileByPath(rf); }} title={rf}>
+              <div on:click={() => { menuOpen = false; cmd(() => openFileByPath(rf)); }} title={rf}>
                 {basename(rf)}
               </div>
             {/each}
           {/if}
           <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; save(); }}>
+          <div on:click={() => { menuOpen = false; cmd(save); }}>
             保存 <span>{accel("file.save")}</span>
           </div>
-          <div on:click={() => { menuOpen = false; saveAs(); }}>
+          <div on:click={() => { menuOpen = false; cmd(saveAs); }}>
             另存为 <span>{accel("file.saveAs")}</span>
           </div>
           <div class="menu-header">导出</div>
-          <div on:click={() => { menuOpen = false; exportMarkdown(); }}>
+          <div on:click={() => { menuOpen = false; cmd(exportMarkdown); }}>
             导出 Markdown <span>.md</span>
           </div>
-          <div on:click={() => { menuOpen = false; exportPdfDoc(); }}>
+          <div on:click={() => { menuOpen = false; cmd(exportPdfDoc); }}>
             导出 PDF <span>.pdf</span>
           </div>
-          <div on:click={() => { menuOpen = false; exportHtmlDoc(); }}>
+          <div on:click={() => { menuOpen = false; cmd(exportHtmlDoc); }}>
             导出 HTML <span>{accel("file.export")}</span>
           </div>
-          <div on:click={() => { menuOpen = false; exportBundledMd(); }}>
+          <div on:click={() => { menuOpen = false; cmd(exportBundledMd); }}>
             导出自包含 MD（图片内嵌）<span>单文件</span>
           </div>
           <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; openFolderSearch(); }}>
+          <div on:click={() => { menuOpen = false; cmd(openFolderSearch); }}>
             文件夹内查找替换 <span>Ctrl + Shift + F</span>
           </div>
           <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; migrateImages(); }}>
+          <div on:click={() => { menuOpen = false; cmd(migrateImages); }}>
             迁移图片附件 <span>绝对路径→相对</span>
           </div>
-          <div on:click={() => { menuOpen = false; doMigrateFolder(); }}>
+          <div on:click={() => { menuOpen = false; cmd(doMigrateFolder); }}>
             批量迁移文件夹图片 <span>递归</span>
           </div>
-          <div on:click={() => { menuOpen = false; doCleanupAssets(); }}>
+          <div on:click={() => { menuOpen = false; cmd(doCleanupAssets); }}>
             清理未引用附件 <span>{settings.attachmentMode === "shared" ? settings.assetsDir + "/" : "按文档目录"}</span>
           </div>
           <div class="sep-line"></div>
@@ -3438,7 +3893,7 @@ ${bodyHtml}
     <div class="tb">
       <button on:click={doUndo} title="撤销 {accel('edit.undo')}">↶</button>
       <button on:click={doRedo} title="重做 {accel('edit.redo')}">↷</button>
-      <button on:click={openFolderSearch} title="文件夹内查找替换 Ctrl+Shift+F">🔍</button>
+      <button on:click={() => cmd(openFolderSearch)} title="文件夹内查找替换 Ctrl+Shift+F">🔍</button>
       <span class="sep"></span>
       <button on:click={bold} title="加粗 {accel('format.bold')}"><b>B</b></button>
       <button on:click={italic} title="斜体 {accel('format.italic')}"><i>I</i></button>
@@ -3471,7 +3926,7 @@ ${bodyHtml}
       <button on:click={task} title="任务列表">☐</button>
       <button on:click={quote} title="引用">❝</button>
       <button on:click={link} title="插入链接 {accel('format.link')}">🔗</button>
-      <button on:click={insertImg} title="插入图片">🖼</button>
+      <button on:click={() => cmd(insertImg)} title="插入图片">🖼</button>
       <button on:click={codeBlock} title="插入代码块">{'{ }'}</button>
       <span class="sep"></span>
       <button on:click={() => alignCol("left")} title="左对齐（表格列）">⬅</button>
@@ -3517,7 +3972,7 @@ ${bodyHtml}
           prompt: askPrompt,
           pickFolder: () => pickOpenFolder(),
           onTabRenamed: updateTabPath,
-          onTabRemoved: (p) => requestCloseTab(p),
+          onTabRemoved: (p) => void removeTabsUnderPath(p),
           setHiddenPaths: (paths) => {
             settings.hiddenPaths = paths;
             persist();

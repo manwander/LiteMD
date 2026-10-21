@@ -34,15 +34,17 @@ pub struct WebDavConfig {
 
 pub struct WebDav {
     client: reqwest::Client,
-    /// 归一后的完整基 URL（含路径、以 '/' 结尾），如 http://host:8088/notes/
+    /// 归一后的完整基 URL（含路径、以 '/' 结尾），如 https://host/notes/
     base: String,
-    /// base 的路径部分（解码后，首尾带 '/'），href 反解用
+    /// base 的路径部分（'/' 分隔、首尾带 '/'），href 反解用
     base_path: String,
     credentials: Option<(String, String)>,
 }
 
 /// 把用户填的 url + 文件夹 basePath 归一成完整基 URL。
 /// 返回 (base_url 尾带斜杠, base_path 首尾带斜杠)。
+/// B 修复：仅允许 https；明文 http 只放行本机地址（localhost/127.0.0.1/[::1]，调试用），
+/// 避免 WebDAV 账号密码经明文链路传输。
 pub fn normalize_base(url: &str, folder_base_path: &str) -> Result<(String, String), String> {
     let u = url.trim();
     if u.is_empty() {
@@ -54,7 +56,7 @@ pub fn normalize_base(url: &str, folder_base_path: &str) -> Result<(String, Stri
     } else if lower.starts_with("http://") {
         "http://"
     } else {
-        return Err("URL 必须以 http:// 或 https:// 开头".into());
+        return Err("URL 必须以 https:// 开头（本机调试可用 http://localhost）".into());
     };
     let without_scheme = &u[scheme.len()..];
     let (authority, path) = match without_scheme.find('/') {
@@ -64,6 +66,9 @@ pub fn normalize_base(url: &str, folder_base_path: &str) -> Result<(String, Stri
     if authority.is_empty() {
         return Err("URL 缺少主机名".into());
     }
+    if scheme == "http://" && !is_loopback_authority(authority) {
+        return Err("WebDAV 必须使用 HTTPS（localhost 除外）：明文 http 会以明文传输账号密码".into());
+    }
     let mut merged = path.trim_end_matches('/').trim_start_matches('/').to_string();
     let extra = folder_base_path.trim().trim_matches('/');
     if !extra.is_empty() {
@@ -72,6 +77,19 @@ pub fn normalize_base(url: &str, folder_base_path: &str) -> Result<(String, Stri
         }
         merged.push_str(extra);
     }
+    // 折叠连续 '/' 并消解 "." / ".."：保证 base_path 与真实请求路径一致，
+    // 同时避免用户 URL 中的 "../" 让前缀匹配永远失效。
+    let mut segs: Vec<&str> = Vec::new();
+    for s in merged.split('/') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            _ => segs.push(s),
+        }
+    }
+    let merged = segs.join("/");
     let base_path = if merged.is_empty() {
         "/".to_string()
     } else {
@@ -79,6 +97,23 @@ pub fn normalize_base(url: &str, folder_base_path: &str) -> Result<(String, Stri
     };
     let base_url = format!("{}{}{}", scheme, authority, base_path);
     Ok((base_url, base_path))
+}
+
+/// 明文 http 白名单：本机地址（调试）。authority 可能含 userinfo / 端口 / [IPv6]。
+fn is_loopback_authority(authority: &str) -> bool {
+    // 去掉 userinfo（取最后一个 '@' 之后）
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        // [::1] 或 [::1]:8088
+        match rest.find(']') {
+            Some(i) => &rest[..i],
+            None => return false,
+        }
+    } else {
+        // host 或 host:port（无括号 host 不含 ':'）
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
 impl WebDav {
@@ -127,7 +162,11 @@ impl WebDav {
         format!("{}{}", self.base, encoded.join("/"))
     }
 
-    /// 响应 href → rel：可能是全 URL / 根相对路径 / 已编码；反解 + 解码 + 去 basePath 前缀
+    /// 响应 href → rel：可能是全 URL / 根相对路径 / 已编码；反解 + 解码 + 去 basePath 前缀。
+    /// A 修复：解码后把反斜杠（%5C 或字面 '\'）统一视为分隔符参与分析，并按「路径段」做
+    /// base 前缀匹配（/notes 不再匹配 /notes2、/notes-old）；要求 base 后紧跟 '/'（段边界）。
+    /// 逐段拒绝空段 / "." / ".." / 盘符与冒号 / 反斜杠 / Windows 非法字符；任何异常返回 None
+    /// （宁漏不错：可疑条目直接不进同步集），而不是靠字符串裁剪去猜测。
     fn href_to_rel(&self, href: &str) -> Option<String> {
         let h = href.trim();
         if h.is_empty() {
@@ -145,26 +184,39 @@ impl WebDav {
         };
         let path_part = path_part.split(['?', '#']).next().unwrap_or(path_part);
         let decoded = urlencoding::decode(path_part).ok()?.to_string();
-        let decoded_norm = decoded.trim_matches('/').to_string();
-        let base_trimmed = self.base_path.trim_matches('/').to_string();
-        let rel = if base_trimmed.is_empty() {
-            decoded_norm
-        } else if decoded_norm.eq_ignore_ascii_case(&base_trimmed) {
-            String::new()
-        } else {
-            match strip_prefix_ci(&decoded_norm, &base_trimmed) {
-                Some(rest) => rest.trim_matches('/').to_string(),
-                None => return None, // 不属于本基路径（如父目录回显）
+        // 反斜杠视为分隔符（防 "..\..\x" 绕过），但含反斜杠的远端路径整体拒绝：
+        // Windows 无对应文件名，映射过去属于猜测（且可能是穿越/别名攻击）。
+        let has_backslash = decoded.contains('\\');
+        let decoded_norm = decoded.replace('\\', "/");
+        let segs = split_path_segments(&decoded_norm)?;
+        let base_segs = split_path_segments(&self.base_path)?;
+        // base 前缀必须逐段（ASCII 大小写不敏感）完全对齐且落在段边界上
+        if segs.len() < base_segs.len() {
+            return None;
+        }
+        for (p, b) in segs.iter().zip(base_segs.iter()) {
+            if !p.eq_ignore_ascii_case(b) {
+                return None; // 不属于本基路径（含父目录回显、/notes2 等伪前缀）
             }
-        };
-        if rel.is_empty() {
+        }
+        let rel_segs = &segs[base_segs.len()..];
+        if rel_segs.is_empty() {
+            return None; // 目录自身
+        }
+        if has_backslash {
             return None;
         }
-        // 路径穿越护栏（§13 风险表）：拒绝 ".." 段与 Windows 非法字符
-        if rel.split('/').any(|s| s == "..") || rel.contains(['<', '>', ':', '"', '|', '?', '*']) {
-            return None;
+        let mut out = String::new();
+        for seg in rel_segs {
+            if !is_safe_rel_segment(seg) {
+                return None;
+            }
+            if !out.is_empty() {
+                out.push('/');
+            }
+            out.push_str(seg);
         }
-        Some(rel)
+        Some(out)
     }
 
     async fn propfind(&self, dir_rel: &str, depth: &str) -> Result<(u16, String), String> {
@@ -401,18 +453,37 @@ fn httpdate_to_unix(s: &str) -> Option<i64> {
         .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
 }
 
-/// ASCII 大小写不敏感的 strip_prefix（WebDAV 路径大小写敏感差异仅 ASCII 有意义，
-/// 非 ASCII 字符无大小写概念；避免 to_lowercase 分配且规避字符边界 panic）
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let (sb, pb) = (s.as_bytes(), prefix.as_bytes());
-    if sb.len() < pb.len() || !s.is_char_boundary(pb.len()) {
+/// 切分 URL 路径为段：允许前导/尾随 '/'，但中间空段（"a//b"）视为异常拒绝。
+/// 空路径（基路径根 "/"）返回空段列表。
+fn split_path_segments(path: &str) -> Option<Vec<&str>> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    let segs: Vec<&str> = trimmed.split('/').collect();
+    if segs.iter().any(|s| s.is_empty()) {
         return None;
     }
-    if sb[..pb.len()].eq_ignore_ascii_case(pb) {
-        Some(&s[pb.len()..])
-    } else {
-        None
+    Some(segs)
+}
+
+/// 相对路径段白名单（A/L）：拒绝空段 / "." / ".." / 绝对路径痕迹（反斜杠、冒号盘符）
+/// / Windows 非法字符；尾随空格与点（Windows 建文件时会自动去除，易造成同名互踩）同样拒绝。
+fn is_safe_rel_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg == "." || seg == ".." {
+        return false;
     }
+    if seg.contains(['\\', '<', '>', ':', '"', '|', '?', '*']) {
+        return false;
+    }
+    if seg.ends_with(' ') || seg.ends_with('.') {
+        return false;
+    }
+    // 控制字符与 DEL：文件名里出现即视为异常
+    if seg.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+        return false;
+    }
+    true
 }
 
 /// reqwest 错误 → 中文友好文案（连接/超时/拒绝）
@@ -626,8 +697,8 @@ mod tests {
 
     #[test]
     fn base_normalization() {
-        let (b, p) = normalize_base("http://182.61.58.145:8088", "/notes/").unwrap();
-        assert_eq!(b, "http://182.61.58.145:8088/notes/");
+        let (b, p) = normalize_base("https://182.61.58.145:8443", "/notes/").unwrap();
+        assert_eq!(b, "https://182.61.58.145:8443/notes/");
         assert_eq!(p, "/notes/");
         let (b, p) = normalize_base("https://host/dav/", "").unwrap();
         assert_eq!(b, "https://host/dav/");
@@ -637,13 +708,31 @@ mod tests {
         assert!(normalize_base("ftp://host/", "").is_err());
         assert!(normalize_base("", "").is_err());
         // 嵌套 basePath 拼接到 URL 自带路径
-        let (b, p) = normalize_base("http://host/dav", "/JoplinSync/").unwrap();
-        assert_eq!(b, "http://host/dav/JoplinSync/");
+        let (b, p) = normalize_base("https://host/dav", "/JoplinSync/").unwrap();
+        assert_eq!(b, "https://host/dav/JoplinSync/");
         assert_eq!(p, "/dav/JoplinSync/");
         // URL 只给根
-        let (b, p) = normalize_base("http://host/", "").unwrap();
-        assert_eq!(b, "http://host/");
+        let (b, p) = normalize_base("https://host/", "").unwrap();
+        assert_eq!(b, "https://host/");
         assert_eq!(p, "/");
+        // 连续 '/' 折叠为单斜杠（A：段匹配前提）
+        let (b, p) = normalize_base("https://host/dav//sub//", "//x//").unwrap();
+        assert_eq!(b, "https://host/dav/sub/x/");
+        assert_eq!(p, "/dav/sub/x/");
+    }
+
+    #[test]
+    fn plain_http_rejected_except_loopback() {
+        // B：明文 http 一律拒绝（Basic 认证口令会明文传输），仅本机调试地址例外
+        assert!(normalize_base("http://example.com/dav/", "").is_err());
+        assert!(normalize_base("http://182.61.58.145:8088", "/notes/").is_err());
+        assert!(normalize_base("http://localhost.evil.com/", "").is_err());
+        for url in ["http://localhost:8088", "http://127.0.0.1:8088", "http://[::1]:8088/dav"] {
+            assert!(normalize_base(url, "").is_ok(), "{} 应放行（本机调试）", url);
+        }
+        let (b, _) = normalize_base("http://localhost:8088", "/notes/").unwrap();
+        assert_eq!(b, "http://localhost:8088/notes/");
+        assert!(normalize_base("https://example.com/dav/", "").is_ok());
     }
 
     fn wd(base_url: &str) -> WebDav {
@@ -663,26 +752,56 @@ mod tests {
 
     #[test]
     fn url_encoding_chinese_space_hash_percent() {
-        let c = wd("http://host:8088/notes/");
-        assert_eq!(c.url_for("日记/2026-09.md"), "http://host:8088/notes/%E6%97%A5%E8%AE%B0/2026-09.md");
-        assert_eq!(c.url_for("my note.md"), "http://host:8088/notes/my%20note.md");
-        assert_eq!(c.url_for("a#b.md"), "http://host:8088/notes/a%23b.md");
-        assert_eq!(c.url_for("100%.md"), "http://host:8088/notes/100%25.md");
-        assert_eq!(c.url_for(""), "http://host:8088/notes/");
-        assert_eq!(c.url_for("/x.md/"), "http://host:8088/notes/x.md");
+        let c = wd("https://host:8443/notes/");
+        assert_eq!(c.url_for("日记/2026-09.md"), "https://host:8443/notes/%E6%97%A5%E8%AE%B0/2026-09.md");
+        assert_eq!(c.url_for("my note.md"), "https://host:8443/notes/my%20note.md");
+        assert_eq!(c.url_for("a#b.md"), "https://host:8443/notes/a%23b.md");
+        assert_eq!(c.url_for("100%.md"), "https://host:8443/notes/100%25.md");
+        assert_eq!(c.url_for(""), "https://host:8443/notes/");
+        assert_eq!(c.url_for("/x.md/"), "https://host:8443/notes/x.md");
     }
 
     #[test]
     fn href_reverse_resolution() {
-        let c = wd("http://host:8088/notes/");
+        let c = wd("https://host:8443/notes/");
         assert_eq!(c.href_to_rel("/notes/%E6%97%A5%E8%AE%B0/a.md").as_deref(), Some("日记/a.md"));
-        assert_eq!(c.href_to_rel("http://host:8088/notes/sub/b.md").as_deref(), Some("sub/b.md"));
+        assert_eq!(c.href_to_rel("https://host:8443/notes/sub/b.md").as_deref(), Some("sub/b.md"));
         assert_eq!(c.href_to_rel("/notes/").as_deref(), None, "目录自身");
         assert_eq!(c.href_to_rel("/other/x.md").as_deref(), None, "基外路径丢弃");
         assert_eq!(c.href_to_rel("/notes/../escape.md").as_deref(), None, "穿越拒绝");
         assert_eq!(c.href_to_rel("/notes/a?x=1").as_deref(), Some("a"), "query 剥离");
         assert_eq!(c.href_to_rel("/notes/%25E6%2597%25A5.md").as_deref(), Some("%E6%97%A5.md"), "双重编码只解一层");
         assert_eq!(c.href_to_rel("/NOTES/x.md").as_deref(), Some("x.md"), "basePath 匹配大小写不敏感");
+    }
+
+    #[test]
+    fn href_rejects_traversal_and_backslash() {
+        // A：%2e%2e（".."）与 %5C（'\'）都不得绕过护栏
+        let c = wd("https://host/notes/");
+        assert_eq!(c.href_to_rel("/notes/%2e%2e/x.md").as_deref(), None, "%2e%2e 解码为 .. 应拒绝");
+        assert_eq!(c.href_to_rel("/notes/a/%2E%2E/%2e%2e/b.md").as_deref(), None, "混合大小写 %2e 应拒绝");
+        assert_eq!(c.href_to_rel("/notes/..%5C..%5Cescape.md").as_deref(), None, "%5C 反斜杠穿越应拒绝");
+        assert_eq!(c.href_to_rel("/notes/..\\..\\escape.md").as_deref(), None, "字面反斜杠穿越应拒绝");
+        assert_eq!(c.href_to_rel("/notes/a%5Cb.md").as_deref(), None, "段内反斜杠（Windows 无对应文件名）拒绝而非猜测");
+        assert_eq!(c.href_to_rel("/notes/C:%5Cevil.md").as_deref(), None, "盘符/冒号路径拒绝");
+        assert_eq!(c.href_to_rel("/notes/./a.md").as_deref(), None, "「.」段拒绝");
+        assert_eq!(c.href_to_rel("/notes//a.md").as_deref(), None, "空段拒绝");
+        assert_eq!(c.href_to_rel("/notes/a.md.").as_deref(), None, "尾随点（Windows 会截断）拒绝");
+        assert_eq!(c.href_to_rel("/notes/..%2Fa.md").as_deref(), None, "%2F 解码出的「..」段拒绝");
+    }
+
+    #[test]
+    fn href_prefix_requires_segment_boundary() {
+        // A：base 前缀必须落在 '/' 边界，/notes 不得匹配 /notes2 / /notes-old
+        let c = wd("https://host/notes/");
+        assert_eq!(c.href_to_rel("/notes2/x.md").as_deref(), None, "/notes 不得匹配 /notes2");
+        assert_eq!(c.href_to_rel("/notes-old/x.md").as_deref(), None, "/notes 不得匹配 /notes-old");
+        assert_eq!(c.href_to_rel("/notes/sub/b.md").as_deref(), Some("sub/b.md"), "段边界后正常相对化");
+        assert_eq!(c.href_to_rel("/notes").as_deref(), None, "完全相等 = 目录自身");
+        // 根基路径（base_path="/"）下所有段都视为相对路径
+        let root = wd("https://host/");
+        assert_eq!(root.href_to_rel("/a/b.md").as_deref(), Some("a/b.md"));
+        assert_eq!(root.href_to_rel("/notes2/x.md").as_deref(), Some("notes2/x.md"));
     }
 
     const XML_FULL: &str = r#"<?xml version="1.0"?>
@@ -740,7 +859,7 @@ mod tests {
 
     #[test]
     fn percent_encode_roundtrip_via_href_to_rel() {
-        let c = wd("http://host/");
+        let c = wd("https://host/");
         let enc = urlencoding::encode("日记 a#b.md");
         assert_eq!(c.href_to_rel(&format!("/{}", enc)).as_deref(), Some("日记 a#b.md"));
     }

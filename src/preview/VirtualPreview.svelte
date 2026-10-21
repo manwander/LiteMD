@@ -10,7 +10,8 @@
   //    打字通常只改光标附近 1~3 个块，其余块零开销，滚动条位置不再随打字跳动
   // 5. 滚动事件 + rAF 节流控制可视窗口更新
   import { onMount, onDestroy } from "svelte";
-  import { splitIntoBlocks, renderBlock, type PreviewBlock, type EditRange } from "./block-splitter";
+  import { splitIntoBlocks, renderBlock, collectRefDefs, hashRange, type PreviewBlock, type EditRange } from "./block-splitter";
+  import { openExternal } from "../fs";
   import { HeightPrefixSum, computeWindow, heightScale, type WindowResult } from "./windowing";
   import type MarkdownIt from "markdown-it";
 
@@ -73,6 +74,9 @@
   let realHeights: number[] = [];   // 实测高度（0 = 未实测）
   let htmls: string[] = [];         // 渲染 HTML（"" = 未渲染）
   let renderedFlags: boolean[] = [];
+  /** 全文引用式链接定义（分块渲染时补上下文；空串 = 无定义） */
+  let refDefs = "";
+  let refDefsKey = "";
 
   // ---- 视口窗口 ----
   let container: HTMLDivElement;
@@ -113,6 +117,10 @@
     if (!_md) return; // 解析器未就绪：切块/渲染全部延后，md 就绪时响应式再次触发
     const newBlocks = splitIntoBlocks(_md, src, ed);
     const n = newBlocks.length;
+    // 引用式链接定义：只收集一次；定义变化会让所有块缓存键失效（定义可被任意块引用）
+    const defs = collectRefDefs(src);
+    refDefs = defs.length ? defs.join("\n") : "";
+    refDefsKey = refDefs ? hashRange(refDefs, 0, refDefs.length) : "";
     const newKeys: string[] = new Array(n);
     const newHeights: number[] = new Array(n);
     const newReal: number[] = new Array(n);
@@ -123,7 +131,7 @@
       const b = newBlocks[i];
       // hash / estH 由切块时一并算好（随段缓存复用），此处 O(1) 读取，
       // 免除每次 rebuild 两次全文遍历（1MB 档实测节省 ~10ms）
-      const key = b.hash;
+      const key = refDefsKey ? b.hash + "|" + refDefsKey : b.hash;
       newKeys[i] = key;
       newHeights[i] = b.estH;
       const cached = cachePeek(key);
@@ -255,7 +263,7 @@
     const block = blocks[idx];
     if (!block || !md) return; // md 未就绪时无渲染任务（rebuild 已延后）
     try {
-      const html = renderBlock(md, source, block);
+      const html = renderBlock(md, source, block, refDefs || undefined);
       htmls[idx] = html;
       renderedFlags[idx] = true;
       // 写入缓存，供下次 source 更新直接复用（LRU + 字节上限，绝不整体清空）
@@ -266,6 +274,19 @@
     } catch {
       htmls[idx] = "";
     }
+  }
+
+  // 外部链接交给系统浏览器：WebView 内直接导航会把 Tauri 应用变成网页容器，
+  // 且 target=_blank 在 Tauri 中默认被拦截（点击无反应）。仅拦截 http(s)，
+  // 站内相对链接与锚点保持默认行为。
+  function onPreviewClick(e: MouseEvent) {
+    const target = e.target as HTMLElement | null;
+    const a = target?.closest?.("a") as HTMLAnchorElement | null;
+    if (!a) return;
+    const href = a.getAttribute("href") || "";
+    if (!/^https?:\/\//i.test(href)) return;
+    e.preventDefault();
+    void openExternal(href).catch(() => {});
   }
 
   function onScroll() {
@@ -431,7 +452,9 @@
   });
 </script>
 
-<div class="virtual-preview" class:no-will-change={!useWillChange} bind:this={container} on:scroll={onScroll}>
+<!-- 点击仅在捕获到 <a> 时把外链交给系统浏览器，链接本身可键盘聚焦触发；容器无需 role -->
+<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+<div class="virtual-preview" class:no-will-change={!useWillChange} bind:this={container} on:scroll={onScroll} on:click={onPreviewClick}>
   {#if topPad > 0}
     <div class="vspacer" style="height:{topPad}px"></div>
   {/if}

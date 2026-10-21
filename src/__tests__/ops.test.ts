@@ -1,6 +1,6 @@
 // ops（目录 IO 操作）单测：mock fs 层，验证状态写入 store 的正确性
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { loadFolderNode, reloadFolder, refreshFolderOf } from "../filetree/ops";
+import { loadFolderNode, reloadFolder, refreshFolderOf, applyFsChanges } from "../filetree/ops";
 import { createTreeStore } from "../filetree/store";
 import type { DirItem } from "../fs";
 
@@ -75,6 +75,51 @@ describe("loadFolderNode", () => {
     store.setLoadState("C:/a", { loading: true, error: null });
     await loadFolderNode(store, "C:/a", false);
     expect(calls).toBe(0);
+  });
+});
+
+describe("applyFsChanges 多路径 rename", () => {
+  beforeEach(() => {
+    listDirMock.mockReset();
+  });
+
+  it("rename 同时刷新旧/新路径所在目录（跨目录移动条目立即可见）", async () => {
+    listDirMock.mockImplementation(async (dir: string) => {
+      if (dir === "C:/a") return [dirItem({ name: "x.md", path: "C:/a/x.md", is_md: true })];
+      if (dir === "C:/b") return [dirItem({ name: "x.md", path: "C:/b/x.md", is_md: true })];
+      return [];
+    });
+    const store = createTreeStore();
+    store.mutate((s) => ({ ...s, rootPaths: ["C:/a", "C:/b"] }));
+    await loadFolderNode(store, "C:/a", false);
+    await loadFolderNode(store, "C:/b", false);
+
+    listDirMock.mockClear();
+    listDirMock.mockImplementation(async (dir: string) => {
+      if (dir === "C:/a") return [];
+      if (dir === "C:/b") return [dirItem({ name: "x.md", path: "C:/b/x.md", is_md: true })];
+      return [];
+    });
+    await applyFsChanges(store, [
+      { path: "C:/a/x.md", paths: ["C:/a/x.md", "C:/b/x.md"], kind: "rename" },
+    ]);
+
+    expect(listDirMock).toHaveBeenCalledWith("C:/a", false);
+    expect(listDirMock).toHaveBeenCalledWith("C:/b", false);
+  });
+
+  it("无 paths 字段时回退到 path（兼容旧 payload）", async () => {
+    listDirMock.mockImplementation(async (dir: string) => {
+      if (dir === "C:/a") return [dirItem({ name: "x.md", path: "C:/a/x.md", is_md: true })];
+      return [];
+    });
+    const store = createTreeStore();
+    store.mutate((s) => ({ ...s, rootPaths: ["C:/a"] }));
+    await loadFolderNode(store, "C:/a", false);
+
+    listDirMock.mockClear();
+    await applyFsChanges(store, [{ path: "C:/a/x.md", kind: "remove" }]);
+    expect(listDirMock).toHaveBeenCalledWith("C:/a", false);
   });
 });
 

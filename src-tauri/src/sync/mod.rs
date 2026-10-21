@@ -109,17 +109,16 @@ impl Drop for RunningGuard {
 
 fn resolve_folder(cfg: &SyncConfigDto, fid: &str) -> Result<FolderDto, String> {
     let fid = fid.trim();
-    if !fid.is_empty() {
-        if let Some(f) = cfg.folders.iter().find(|f| f.id == fid) {
-            return Ok(f.clone());
-        }
-        return Err(format!("未找到同步文件夹 {}", fid));
+    // 多文件夹必须显式指定 ID：不再静默回退到「第一个启用的文件夹」，
+    // 否则前端遍历文件夹同步时会因缺失 ID 全部落到同一个目录。
+    if fid.is_empty() {
+        return Err("缺少同步文件夹 ID（请重新打开同步设置后再试）".into());
     }
     cfg.folders
         .iter()
-        .find(|f| f.enabled)
+        .find(|f| f.id == fid)
         .cloned()
-        .ok_or_else(|| "尚未配置同步文件夹（请在 设置→同步 中添加）".into())
+        .ok_or_else(|| format!("未找到同步文件夹 {}", fid))
 }
 
 fn build_transport(cfg: &SyncConfigDto, folder: &FolderDto) -> Result<WebDav, String> {
@@ -162,6 +161,10 @@ fn to_rel_under(root: &str, abs: &str) -> Option<String> {
     let a_lower = a.to_lowercase();
     let r = root.replace('\\', "/").trim_end_matches('/').to_lowercase();
     if a_lower.starts_with(&r) {
+        // 目录边界：/root 不能匹配 /root2（否则 open_dirty 保护失效）
+        if a_lower.len() == r.len() || a_lower.as_bytes().get(r.len()) != Some(&b'/') {
+            return None;
+        }
         // M6 修复：r.len() 是「小写规范化后根」的字节长度，可能与原始大小写串 a 的字节
         // 布局不一致（如土耳其 İ→i̇ 会让 to_lowercase 改变字节长度），直接 a[r.len()..]
         // 可能切在非字符边界而 panic；在 panic="abort" 下会崩溃整个应用。
@@ -200,7 +203,13 @@ fn load_snapshot(store: &SnapshotStore, fid: &str, folder: &FolderDto, cfg: &Syn
 /// 四步分级检查（§7.1）：network / auth / read / write
 #[tauri::command]
 pub async fn sync_check_config(config: SyncConfigDto) -> Result<CheckReport, String> {
-    let folder = resolve_folder(&config, "")?;
+    // 检查配置只做连通性验证（无写操作），取第一个启用文件夹即可
+    let folder = config
+        .folders
+        .iter()
+        .find(|f| f.enabled)
+        .cloned()
+        .ok_or_else(|| "尚未配置同步文件夹（请在 设置→同步 中添加）".to_string())?;
     let transport = build_transport(&config, &folder)?;
     let steps = transport.check().await?;
     let all_ok = steps.iter().all(|s| s.ok || s.skipped);

@@ -7,12 +7,15 @@
  * 每例先 clearSplitCache() 隔离模块级 lastSplit/段缓存。
  */
 import { describe, it, expect, beforeEach } from "vitest";
+import MarkdownIt from "markdown-it";
 import {
   splitIntoBlocks,
   clearSplitCache,
   resetLastSplit,
   hashRange,
   estimateBlockHeight,
+  collectRefDefs,
+  renderBlock,
 } from "../preview/block-splitter";
 
 describe("splitIntoBlocks 结构切分", () => {
@@ -62,6 +65,96 @@ describe("splitIntoBlocks 结构切分", () => {
     const h2 = estimateBlockHeight(bMany, many);
     expect(h1).toBeGreaterThan(0);
     expect(h2).toBeGreaterThan(h1);
+  });
+});
+
+describe("松散列表 / 引用的容器合并（与整篇渲染语义对齐）", () => {
+  beforeEach(() => clearSplitCache());
+
+  it("松散无序列表（项间空行）合并为同一块", () => {
+    const src = "- 一\n\n- 二\n\n- 三";
+    const blocks = splitIntoBlocks(null, src);
+    expect(blocks.length).toBe(1);
+    expect(blocks[0].srcBegin).toBe(0);
+    expect(blocks[0].srcEnd).toBe(src.length);
+  });
+
+  it("松散有序列表同样合并", () => {
+    expect(splitIntoBlocks(null, "1. 一\n\n2. 二").length).toBe(1);
+  });
+
+  it("列表项续段（空行后缩进 ≥2）并入上一列表块", () => {
+    expect(splitIntoBlocks(null, "- 项\n\n  续段说明").length).toBe(1);
+  });
+
+  it("不同列表类型不被误合并", () => {
+    expect(splitIntoBlocks(null, "1. 有序\n\n- 无序").length).toBe(2);
+  });
+
+  it("列表后的普通段落仍独立成块", () => {
+    expect(splitIntoBlocks(null, "- 项\n\n普通段落").length).toBe(2);
+  });
+
+  it("引用间的空行合并为同一块", () => {
+    expect(splitIntoBlocks(null, "> 一\n\n> 二").length).toBe(1);
+  });
+
+  it("引用后的普通段落仍独立成块", () => {
+    expect(splitIntoBlocks(null, "> 引用\n\n段落").length).toBe(2);
+  });
+});
+
+describe("collectRefDefs 引用定义收集", () => {
+  it("收集常见形式的引用定义", () => {
+    const src = '[a]: https://a.example\n[b]: <https://b.example> "标题"\n[c]: /rel (t)';
+    expect(collectRefDefs(src)).toEqual([
+      "[a]: https://a.example",
+      '[b]: <https://b.example> "标题"',
+      "[c]: /rel (t)",
+    ]);
+  });
+
+  it("围栏代码块内形似定义的文本不收集", () => {
+    const src = "```\n[a]: https://evil.example\n```\n\n[a]: https://good.example";
+    expect(collectRefDefs(src)).toEqual(["[a]: https://good.example"]);
+  });
+
+  it("普通文本与非法定义不收集", () => {
+    const src = "这不是定义\n[key]: \n[]: https://x\n[ok]: https://ok.example";
+    expect(collectRefDefs(src)).toEqual(["[ok]: https://ok.example"]);
+  });
+
+  it("无 ]: 的文档快速返回空数组", () => {
+    expect(collectRefDefs("# 标题\n\n正文")).toEqual([]);
+  });
+});
+
+describe("renderBlock 引用定义上下文补齐", () => {
+  // 与应用内配置一致：html:true 时原始 HTML 会透传，最终必须由 sanitize 收口
+  const md = new MarkdownIt({ html: true });
+
+  it("定义与引用不在同一块时，补 defs 后链接可正确解析", () => {
+    clearSplitCache();
+    const src = "见 [链接][ref]。\n\n其它段落。\n\n[ref]: https://example.com";
+    const blocks = splitIntoBlocks(md, src);
+    const defs = collectRefDefs(src).join("\n");
+    expect(defs).toContain("[ref]: https://example.com");
+
+    const withDefs = renderBlock(md, src, blocks[0], defs);
+    expect(withDefs).toContain('href="https://example.com"');
+
+    // 不补 defs 时引用退化为纯文本（证明补齐是必要的）
+    const withoutDefs = renderBlock(md, src, blocks[0]);
+    expect(withoutDefs).not.toContain('href="https://example.com"');
+  });
+
+  it("块内脚本经 renderBlock 渲染后仍被清洗（C-01 最后一步）", () => {
+    clearSplitCache();
+    const src = '<img src="x" onerror="alert(1)">';
+    const blocks = splitIntoBlocks(md, src);
+    const html = renderBlock(md, src, blocks[0]);
+    expect(html).not.toContain("onerror");
+    expect(html).not.toContain("alert(1)");
   });
 });
 

@@ -7,7 +7,7 @@
 
 > v2.0.0 · Rust + Tauri 2.x + Svelte 5 + CodeMirror 6
 >
-> 质量门：`tsc` 0 错误 · `svelte-check` 0 错误 0 警告 · `npm audit` 0 漏洞 · **225/225 单测通过**
+> 质量门：`tsc` 0 错误 · `svelte-check` 0 错误 0 警告 · `npm audit` 0 漏洞 · **267/267 单测通过**
 
 ---
 
@@ -45,7 +45,7 @@
 - 二级文件夹结构 + 虚拟化渲染（3000+ 文件不卡顿）；右键新建 / 删除 / 移动 / 复制 / 隐藏
 - **快捷键全可重绑定**：30 个动作、冲突检测、单条 / 全部恢复默认
 - 浅色 / 深色主题、字号 11~24px、专注模式（F11）
-- **WebDAV 同步**：多文件夹同步，冲突策略（保留双方 / 新者胜），空远端保护防误删
+- **WebDAV 同步**：多文件夹同步，冲突策略（保留双方 / 新者胜），空远端保护防误删；仅支持 HTTPS（本机调试可用 `http://localhost`）
 
 ## 性能实测
 
@@ -92,7 +92,7 @@ sudo apt install gcc-aarch64-linux-gnu   # ARM64 交叉工具链
 | 前端 | Svelte 5 + Vite 8 | 编译期优化、运行时极小 |
 | 编辑器 | CodeMirror 6 | liteSetup + 14 种语言白名单按需加载 |
 | 预览 | markdown-it + hljs | 动态 import，启动不加载解析器 |
-| 后端 | Rust，48 命令 | 文件 / 图片 / 搜索替换 / 导出 / 设置 / WebDAV 同步 |
+| 后端 | Rust，49 命令 | 文件 / 图片 / 搜索替换 / 导出 / 设置 / WebDAV 同步 |
 | 持久化 | settings.json | 临时文件 + rename 原子写入 |
 | 打包 | cargo 交叉编译 | 一条命令出三端安装包 |
 
@@ -149,16 +149,16 @@ LiteMD/
 │   │   └── VirtualPreview.svelte
 │   ├── settings.ts             # 设置模型 + 快捷键注册表（纯数据，无 Tauri 依赖）
 │   ├── settings-store.ts       # 设置持久化桥接（Tauri invoke / localStorage 回退）
-│   ├── fs.ts                   # 48 个 Tauri 命令的 invoke 桥接
+│   ├── fs.ts                   # Tauri 命令的 invoke 桥接
 │   ├── sanitize.ts             # DOMPurify 白名单收窄（预览/导出唯一安全边界）
 │   ├── highlight.ts            # highlight.js core + 语言白名单按需加载
 │   ├── lowend.ts               # 低端设备检测 + 降级矩阵
 │   ├── tabs.ts / search-panel.ts / fence-index.ts / chunk-ranges.ts
 │   ├── attachment.ts / image-dims.ts / image-worker-client.ts / preview-edit-keys.ts
 │   ├── workers/                # image-worker（OffscreenCanvas 转码）
-│   └── __tests__/              # vitest：23 个文件，225 个用例（含性能预算回归）
+│   └── __tests__/              # vitest：25 个文件，267 个用例（含性能预算回归）
 ├── src-tauri/                  # Rust 后端（Tauri 2）
-│   ├── src/lib.rs              # 48 个命令（文件/树/图片/搜索替换/导出/设置/同步）
+│   ├── src/lib.rs              # 49 个命令（文件/树/图片/搜索替换/导出/设置/同步）
 │   ├── src/sync/               # WebDAV 同步引擎（冲突策略、快照、空远端保护）
 │   ├── tauri.conf.json         # 窗口 1280×800、最小白名单 CSP、NSIS 简体中文安装器
 │   └── tests/webdav_e2e.rs     # WebDAV 端到端测试
@@ -172,7 +172,7 @@ LiteMD/
 ## 测试与质量
 
 ```bash
-npm test                                # vitest：225 用例（单元 + 性能预算回归）
+npm test                                # vitest：267 用例（单元 + 性能预算回归）
 npx svelte-check                        # Svelte/TS 诊断（0 错误 0 警告）
 npx tsc --noEmit                        # TypeScript 类型检查
 npm audit                               # 依赖漏洞扫描（0 漏洞）

@@ -12,7 +12,9 @@
     "tauri:build": "node scripts/bump-version.js && tauri build",
     "version:bump": "node scripts/bump-version.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.16.0",

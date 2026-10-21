@@ -238,6 +238,103 @@ function containerKindAt(src: string, b: number, e: number): "bullet_list_open" 
   return null;
 }
 
+/** 列表标记信息：kind 区分无序/有序（渲染容器不同），indent 为首字符列（tab 记 4） */
+interface ListMarker {
+  kind: "bullet" | "ordered";
+  indent: number;
+}
+
+/** 扫描块首行：返回列表标记与缩进；非列表项返回 null */
+function listMarkerAt(src: string, b: number, e: number): ListMarker | null {
+  let i = b;
+  let indent = 0;
+  while (i < e) {
+    const c = src.charCodeAt(i);
+    if (c === 32) indent++;
+    else if (c === 9) indent += 4;
+    else break;
+    i++;
+  }
+  if (i >= e) return null;
+  const c = src.charCodeAt(i);
+  const isWs = (d: number) => d === 32 || d === 9;
+  if (c === 45 || c === 42 || c === 43) {
+    if (i + 1 < e && isWs(src.charCodeAt(i + 1))) return { kind: "bullet", indent };
+    return null;
+  }
+  if (c >= 48 && c <= 57) {
+    let j = i;
+    while (j < e && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) j++;
+    if (j < e && src.charCodeAt(j) === 46 && j + 1 < e && isWs(src.charCodeAt(j + 1))) {
+      return { kind: "ordered", indent };
+    }
+  }
+  return null;
+}
+
+/** 块首行缩进列（非空白行） */
+function indentAt(src: string, b: number, e: number): number {
+  let i = b;
+  let indent = 0;
+  while (i < e) {
+    const c = src.charCodeAt(i);
+    if (c === 32) indent++;
+    else if (c === 9) indent += 4;
+    else break;
+    i++;
+  }
+  return indent;
+}
+
+/** 块首行是否为引用（> 后跟空白） */
+function isQuoteAt(src: string, b: number, e: number): boolean {
+  let i = b;
+  while (i < e && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9)) i++;
+  if (i >= e || src.charCodeAt(i) !== 62 || i + 1 >= e) return false;
+  const d = src.charCodeAt(i + 1);
+  return d === 32 || d === 9 || d === 10 || d === 11 || d === 12 || d === 13;
+}
+
+/**
+ * 合并「被空行拆开、但语义上仍属于同一个容器」的块：
+ *  - 松散列表：同类列表项之间隔着空行 → 仍是一个 <ul>/<ol>；
+ *  - 列表项的续段/嵌套列表：空行后缩进 ≥2 的块属于上一列表项；
+ *  - 引用中的空行：> a\n\n> b → 同一个 <blockquote>。
+ *
+ * 背景：预览按空行独立渲染（为虚拟化），若不合并，松散列表会被拆成多个
+ * 独立的 <ul>，缩进续段会脱离列表；这与整篇 markdown-it 渲染的语义不一致。
+ * 合并后块区间包含中间空行，渲染结果与整篇解析一致；未涉及列表/引用的
+ * 普通空行分段行为完全不变（不影响虚拟化粒度）。
+ */
+function mergeContainerRaws(src: string, raws: RawBlock[]): RawBlock[] {
+  if (raws.length < 2) return raws;
+  const out: RawBlock[] = [];
+  let prevList: ListMarker | null = null;
+  let prevQuote = false;
+  for (const rb of raws) {
+    const lm = listMarkerAt(src, rb.begin, rb.end);
+    const quote = isQuoteAt(src, rb.begin, rb.end);
+    if (out.length) {
+      const prev = out[out.length - 1];
+      const indent = lm ? lm.indent : indentAt(src, rb.begin, rb.end);
+      const mergeList =
+        prevList !== null &&
+        (lm !== null
+          ? lm.indent >= 2 || lm.kind === prevList.kind
+          : indent >= 2);
+      if (mergeList || (prevQuote && quote)) {
+        prev.end = rb.end;
+        // 续接块可能是不同类型的嵌套列表：外层容器类型保持不变即可
+        continue;
+      }
+    }
+    out.push({ startLine: rb.startLine, begin: rb.begin, end: rb.end });
+    prevList = lm;
+    prevQuote = quote;
+  }
+  return out;
+}
+
 /** 预览摘要：折叠空白后取前 40 字符（等价旧 text.replace(/\s+/g,' ').slice(0,40)，
  *  含前导/尾部空白折叠成的单空格） */
 function buildPreview(src: string, b: number, e: number): string {
@@ -332,7 +429,8 @@ function splitByBlankLines(src: string, lineStarts: number[]): RawBlock[] {
     }
   }
   if (curLen > 0) flush(n);
-  return result;
+  // 语义修正：合并被空行拆开的松散列表 / 引用（见 mergeContainerRaws）
+  return mergeContainerRaws(src, result);
 }
 
 // ---------------- 块分类（区间扫描，复用行边界） ----------------
@@ -692,10 +790,48 @@ function splitFast(source: string, edit: EditRange): PreviewBlock[] | null {
 }
 
 /**
+ * 收集全文的引用式链接定义（`[label]: url "title"`），用于分块渲染时补齐上下文。
+ * 分块渲染只把当前块交给 markdown-it：定义与引用不在同一块时，链接会退化成
+ * 纯文本。渲染前把这些定义临时拼在块首，即可保持与整篇渲染一致的语义。
+ * 围栏代码块内的形似定义不收集（避免注入伪造定义）。
+ */
+export function collectRefDefs(source: string): string[] {
+  const out: string[] = [];
+  if (!source.includes("]:")) return out;
+  let offset = 0;
+  let fence: string | null = null;
+  while (offset < source.length && out.length < 2000) {
+    let nl = source.indexOf("\n", offset);
+    const end = nl === -1 ? source.length : nl;
+    let lineEnd = end;
+    if (lineEnd > offset && source.charCodeAt(lineEnd - 1) === 13) lineEnd--;
+    const line = source.slice(offset, lineEnd);
+    const fm = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fm) {
+      if (!fence) fence = fm[1];
+      else if (fm[1][0] === fence[0] && fm[1].length >= fence.length) fence = null;
+    } else if (!fence) {
+      // CommonMark 引用定义：label 不可为空，目标可为 <> 包裹或裸串，可选标题
+      if (/^ {0,3}\[(?:[^\]\\]|\\.)+\]:[ \t]*(?:<[^>\n]*>|\S+)(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?[ \t]*$/.test(line)) {
+        out.push(line);
+      }
+    }
+    offset = end + 1;
+  }
+  return out;
+}
+
+/**
  * 单独渲染一个块：从 source 中取出块对应的源串，调用 md.render 单独渲染。
+ * defs 为 collectRefDefs 的结果（可为空）：非空时拼在块首补全引用定义上下文。
  * 返回该块的 HTML 字符串。
  */
-export function renderBlock(md: MarkdownItLike, source: string, block: PreviewBlock): string {
+export function renderBlock(
+  md: MarkdownItLike,
+  source: string,
+  block: PreviewBlock,
+  defs?: string,
+): string {
   // 跳过尾部空行（避免产生空 paragraph），同时去掉 leading 空行（与 markdown-it 解析一致）
   let begin = block.srcBegin;
   let end = block.srcEnd;
@@ -706,7 +842,8 @@ export function renderBlock(md: MarkdownItLike, source: string, block: PreviewBl
     end--;
   }
   if (begin >= end) return "";
-  const slice = source.slice(begin, end); // 渲染必须有子串，仅此处分配（只针对视口内块）
+  let slice = source.slice(begin, end); // 渲染必须有子串，仅此处分配（只针对视口内块）
+  if (defs) slice = defs + "\n\n" + slice;
   // C-01：预览是 {@html} 注入点，清洗必须是渲染链路的最后一步。
   // 顺序 render → postProcess（生成任务列表 checkbox）→ sanitize（统一白名单收口）。
   return sanitizeHtml(postProcessHtml(md.render(slice)));

@@ -5,10 +5,10 @@ use futures::StreamExt;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::sync::local::{scan_local, LocalEntry};
+use crate::sync::local::{matches_ignore, scan_local, LocalEntry, TMP_FILE_PREFIX};
 use crate::sync::state::{
     canon_rel, normalize_rel_key, sha256_bytes, unix_now, FileState, Snapshot, SnapshotStore,
 };
@@ -321,6 +321,19 @@ enum OutcomeTag {
     DeletedLocal,
     DeletedRemote,
     Conflict,
+    /// E/C 修复：本地文件「已打开且有未保存修改」→ 保护本地内容，跳过本动作（记冲突 + 错误）
+    OpenDirtySkipped,
+}
+
+/// I 修复：运行期会拉取远端字节的动作（统一受大小上限约束）
+fn action_fetches_remote(kind: ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::Download
+            | ActionKind::Conflict
+            | ActionKind::NewSameName
+            | ActionKind::DeleteRemoteKeepCopy
+    )
 }
 
 fn phase_name(k: ActionKind) -> &'static str {
@@ -361,6 +374,12 @@ pub async fn run_folder_sync<T: Transport>(
     let (local, mut skipped) = scan_local(local_root, &opts.ignore_patterns, opts.max_file_size)?;
     emit(SyncEvent { phase: "plan".into(), done: 0, total: 0, path: String::new() });
     let remote = transport.list_all().await?;
+    // K 修复：忽略规则必须同样作用于远端（此前只在本地扫描生效，忽略目录会被从远端
+    // 下载 / 远端删除被反向传播）；在 engine 统一过滤，保证 local/remote 两侧口径一致。
+    let remote: Vec<RemoteEntry> = remote
+        .into_iter()
+        .filter(|e| !matches_ignore(&e.path, &opts.ignore_patterns))
+        .collect();
     // 双端皆空但有快照 → 极可能配置错误，整轮中止
     if local.is_empty()
         && remote.is_empty()
@@ -387,7 +406,9 @@ pub async fn run_folder_sync<T: Transport>(
         let cap = opts.max_file_size;
         let mut kept = Vec::with_capacity(items.len());
         for it in items.into_iter() {
-            if matches!(it.kind, ActionKind::Download) {
+            // I 修复：所有会拉取远端字节的动作（下载 / 冲突 / 同名 / 删远端保留副本）统一过滤，
+            // 不再只覆盖普通 Download（强制下载与冲突副本同样受 max_file_size 约束）。
+            if action_fetches_remote(it.kind) {
                 if let Some(sz) = rsize.get(&normalize_rel_key(&it.rel)) {
                     if *sz > cap {
                         skipped.push(format!(
@@ -431,9 +452,20 @@ pub async fn run_folder_sync<T: Transport>(
     let root = local_root.to_path_buf();
     let concurrency = opts.concurrency.clamp(1, 16);
 
-    // 强制下载：先把本地全部文件移入回收站（§9 双重确认由前端完成），再全量拉取
+    // 强制下载：先把本地全部文件移入回收站（§9 双重确认由前端完成），再全量拉取。
+    // 脏标签保护：已打开且有未保存修改的文件绝不移入回收站（编辑中的内容不能被同步吞掉），
+    // 这类项在 apply_item 中降级为冲突副本（KeepBoth），本地内容与远端内容都保留。
     if opts.mode == SyncMode::ForceDownload {
         for l in &local {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if opts.open_dirty.contains(&normalize_rel_key(&l.rel)) {
+                summary
+                    .skipped
+                    .push(format!("{}（已打开且有未保存修改，强制下载已保留本地）", l.rel));
+                continue;
+            }
             let abs = l.abs.clone();
             let rel = l.rel.clone();
             let r = tokio::task::spawn_blocking(move || trash::delete(&abs).map_err(|e| e.to_string()))
@@ -486,6 +518,14 @@ pub async fn run_folder_sync<T: Transport>(
                             OutcomeTag::Conflict => {
                                 conflicts.lock().await.push(item.rel.clone());
                             }
+                            OutcomeTag::OpenDirtySkipped => {
+                                // 本地有未保存修改：不覆盖、不删除、不上传磁盘旧内容
+                                conflicts.lock().await.push(item.rel.clone());
+                                errors.lock().await.push(format!(
+                                    "{}: 文件已在编辑器中打开且有未保存修改，本轮同步已跳过该动作",
+                                    item.rel
+                                ));
+                            }
                         }
                     }
                 }
@@ -501,7 +541,8 @@ pub async fn run_folder_sync<T: Transport>(
         // 每 20 项 flush 快照（§4 断点续传）
         if processed % 20 == 0 {
             let guard = snap.lock().await;
-            let _ = store.save(folder_id, &guard);
+            // 快照落盘失败必须显式失败：静默忽略会让下一轮把已同步内容重复传输/误判
+            store.save(folder_id, &guard)?;
         }
     }
 
@@ -517,7 +558,7 @@ pub async fn run_folder_sync<T: Transport>(
         summary.errors.push("同步被取消；已完成部分已入快照，下次运行自动续传".into());
     }
     let final_snap = snap.lock().await.clone();
-    let _ = store.save(folder_id, &final_snap);
+    store.save(folder_id, &final_snap)?;
     Ok(RunReport { summary, snap: final_snap })
 }
 
@@ -535,11 +576,19 @@ async fn apply_item<T: Transport>(
             snap.lock().await.remove(&item.rel);
             Ok(vec![])
         }
-        ActionKind::Upload | ActionKind::ReUpload => do_upload(t, root, snap, item).await,
+        ActionKind::Upload | ActionKind::ReUpload => {
+            // 脏标签保护：磁盘内容是「上次保存」的旧版本，上传会把远端改成旧内容；
+            // 跳过本轮，待用户保存后再同步（下一轮快照判据自然命中）。
+            if opts.open_dirty.contains(&normalize_rel_key(&item.rel)) {
+                return Ok(vec![OutcomeTag::OpenDirtySkipped]);
+            }
+            do_upload(t, root, snap, item).await
+        }
         ActionKind::Download => {
             let key = normalize_rel_key(&item.rel);
-            if opts.open_dirty.contains(&key) && opts.mode == SyncMode::Normal {
-                // §7.6：正在编辑的脏文件不被下载覆盖 → 写冲突副本，原路径不动
+            if opts.open_dirty.contains(&key) {
+                // §7.6：正在编辑的脏文件不被下载覆盖 → 写冲突副本，原路径不动。
+                // 强制下载模式同样适用：不能因为「模式更激进」就吞掉未保存内容。
                 return do_conflict(t, root, snap, item, ConflictPolicy::KeepBoth).await;
             }
             do_download(t, root, snap, item).await
@@ -602,6 +651,10 @@ async fn apply_item<T: Transport>(
             Ok(vec![OutcomeTag::DeletedRemote, OutcomeTag::Downloaded, OutcomeTag::Conflict])
         }
         ActionKind::DeleteLocal => {
+            if opts.open_dirty.contains(&normalize_rel_key(&item.rel)) {
+                // 远端删除不得吞掉编辑器中未保存的本地内容
+                return Ok(vec![OutcomeTag::OpenDirtySkipped]);
+            }
             let abs = root.join(slash(&item.rel));
             tokio::task::spawn_blocking(move || trash::delete(&abs).map_err(|e| e.to_string()))
                 .await
@@ -833,15 +886,39 @@ async fn read_bytes(path: PathBuf) -> Result<Vec<u8>, String> {
 }
 
 async fn write_bytes_atomic(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
+    // 进程内单调序号 + 纳秒时间戳，保证同目录临时文件名唯一
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("无法确定目标目录: {}", path.display()))?
+            .to_path_buf();
+        std::fs::create_dir_all(&parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // 唯一临时文件名（同目录）：并发/同一秒写入不会互踩，且扫描端按前缀跳过
+        let tmp = parent.join(format!("{}{}-{}-{}", TMP_FILE_PREFIX, std::process::id(), seq, nanos));
+        let result = (|| -> Result<(), String> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| format!("{}: {}", tmp.display(), e))?;
+            f.write_all(&bytes).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+            f.sync_all().map_err(|e| format!("{}: {}", tmp.display(), e))?;
+            drop(f);
+            std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {}", path.display(), e))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        let tmp = path.with_extension(format!("tmp-{}", unix_now()));
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {}", tmp.display(), e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {}", path.display(), e))?;
-        Ok(())
+        result
     })
     .await
     .map_err(|e| e.to_string())?

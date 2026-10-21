@@ -39,6 +39,49 @@ export function renameTabPathDedup<T extends TabPathLike>(
 }
 
 /**
+ * 文件夹移动/重命名后，批量重映射其下所有已打开标签（P0-3）。
+ * 仅按「精确路径」匹配会让 A/b.md 在 A 被移动后继续写旧路径，保存时把文件
+ * 复活到已不存在的位置；这里按路径前缀（含分隔符边界）同步重映射。
+ * 目标路径已被其它标签占用时，保留被移动的标签、移除重复标签，与单文件逻辑一致。
+ */
+export function renameTabsUnderPath<T extends TabPathLike>(
+  tabs: T[],
+  oldPath: string,
+  newPath: string,
+  activeIdx: number
+): { tabs: T[]; activeIdx: number } {
+  const oldN = normPath(oldPath);
+  const newN = normPath(newPath);
+  const under = (p: string) => p === oldN || p.startsWith(oldN + "/");
+  const remap = new Map<string, string>();
+  for (const t of tabs) {
+    if (under(t.path)) remap.set(t.path, newN + t.path.slice(oldN.length));
+  }
+  if (remap.size === 0) return { tabs, activeIdx };
+
+  const targets = new Set(remap.values());
+  const activeTab = tabs[activeIdx];
+  const activePath = activeTab?.path;
+  const keptFrom: number[] = [];
+  const arr: T[] = [];
+  tabs.forEach((t, i) => {
+    // 目标路径上的旧标签由被移动的标签取代，避免 keyed each 出现重复 key
+    if (!remap.has(t.path) && targets.has(t.path)) return;
+    keptFrom.push(i);
+    const p = remap.get(t.path);
+    arr.push(p && p !== t.path ? ({ ...t, path: p } as T) : t);
+  });
+
+  let newActive = keptFrom.indexOf(activeIdx);
+  if (newActive < 0 && activePath) {
+    // 激活标签恰好是被替换的重复标签：定位到接管该路径的新标签
+    newActive = arr.findIndex((t) => t.path === (remap.get(activePath) ?? activePath));
+  }
+  if (newActive < 0) newActive = Math.max(0, Math.min(activeIdx, arr.length - 1));
+  return { tabs: arr, activeIdx: newActive };
+}
+
+/**
  * 关闭标签后应使用的 activeIdx（仅在移除后数组非空时调用）。
  * 背景（C-2 修复）：旧实现只在「关闭的是当前激活标签」时调整 activeIdx，
  * 漏掉了「关闭一个排在激活标签之前的干净标签」的情况——数组缩短 1 但

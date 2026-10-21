@@ -17,6 +17,13 @@ export interface DirItem {
 
 export const readFile = (path: string) => invoke<string>("read_file", { path });
 
+/** 读取二进制文件为 base64（导出 HTML 内嵌图片等；maxBytes 由后端夹在 1..=64MB） */
+export const readFileB64 = (path: string, maxBytes = 20 * 1024 * 1024) =>
+  invoke<string>("read_file_b64", { path, maxBytes });
+
+/** 用系统默认程序打开外部链接（仅 http/https，后端拒绝其他协议） */
+export const openExternal = (url: string) => invoke<void>("open_external", { url });
+
 /** 写一行前端崩溃日志到 %TEMP%/litemd-frontend.log（仅未捕获异常时调用） */
 export const logFrontend = (line: string) => invoke("log_frontend", { line });
 

@@ -132,3 +132,53 @@ describe("M-04 原始 HTML 无法持久化为可执行脚本", () => {
     expect(out).not.toContain("fetch");
   });
 });
+
+describe("内联样式白名单（布局劫持 / CSS 外链防护）", () => {
+  it("保留正常排版样式（颜色、字号、对齐）", () => {
+    const out = sanitizeHtml('<span style="color: red; font-size: 14px; text-align: center">x</span>');
+    expect(out).toContain("color: red");
+    expect(out).toContain("font-size: 14px");
+    expect(out).toContain("text-align: center");
+  });
+
+  it("剥离 position/z-index/transform 等布局覆盖属性", () => {
+    const out = sanitizeHtml(
+      '<div style="position: fixed; z-index: 9999; transform: scale(2); color: blue">x</div>'
+    );
+    expect(out).not.toContain("position");
+    expect(out).not.toContain("z-index");
+    expect(out).not.toContain("transform");
+    expect(out).toContain("color: blue");
+  });
+
+  it("剥离含 url() 的 background（外链探测），保留同元素的安全属性", () => {
+    const out = sanitizeHtml(
+      '<span style="background: url(https://evil.example/x.png); color: blue">x</span>'
+    );
+    expect(out).not.toContain("url(");
+    expect(out).not.toContain("evil.example");
+    expect(out).toContain("color: blue");
+  });
+
+  it("阻断 CSS 转义形式的 url()（u\\72l(...)）", () => {
+    const out = sanitizeHtml(
+      '<span style="background: u\\72l(https://evil.example/x.png); color: blue">x</span>'
+    );
+    expect(out).not.toContain("background");
+    expect(out).not.toContain("evil.example");
+    expect(out).toContain("color: blue");
+  });
+
+  it("剥离 expression()/javascript: 等脚本化样式值", () => {
+    const out = sanitizeHtml(
+      '<span style="width: expression(alert(1)); background-color: javascript:alert(1)">x</span>'
+    );
+    expect(out).not.toContain("expression");
+    expect(out).not.toContain("javascript:");
+  });
+
+  it("仅含危险属性时移除整条 style 属性", () => {
+    const out = sanitizeHtml('<span style="position: fixed; z-index: 9999">x</span>');
+    expect(out).not.toContain("style=");
+  });
+});

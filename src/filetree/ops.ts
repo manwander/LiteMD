@@ -290,39 +290,44 @@ export async function applyFsChanges(store: TreeStore, changes: FsChange[]): Pro
   const toDelete = new Set<string>();
 
   for (const c of changes) {
-    const p = normPath(c.path);
-    const parent = parentDir(p);
-    const isRoot = s.rootPaths.some((r) => normPath(r) === p);
+    // rename 等事件同时携带旧/新路径：两侧父目录都要刷新，否则跨目录移动后
+    // 新目录里的条目要等手动刷新才出现。
+    const eventPaths = c.paths?.length ? c.paths : [c.path];
+    for (const rawPath of eventPaths) {
+      const p = normPath(rawPath);
+      const parent = parentDir(p);
+      const isRoot = s.rootPaths.some((r) => normPath(r) === p);
 
-    // 删除/重命名事件：非根路径本身已不存在，重载它会失败并残留「无法访问」。
-    // 直接从 nodeMap 清理，由父目录刷新反映最新状态；根路径仍要重载以显示错误。
-    if (c.kind === "remove" || c.kind === "rename") {
-      if (isRoot) {
-        affected.add(p);
-      } else {
-        toDelete.add(p);
+      // 删除/重命名事件：非根路径本身已不存在，重载它会失败并残留「无法访问」。
+      // 直接从 nodeMap 清理，由父目录刷新反映最新状态；根路径仍要重载以显示错误。
+      if (c.kind === "remove" || c.kind === "rename") {
+        if (isRoot) {
+          affected.add(p);
+        } else {
+          toDelete.add(p);
+        }
+        if (s.nodeMap.get(parent)?.loaded) affected.add(parent);
+        continue;
       }
+
+      // 对于 create 事件：若父目录已加载且已包含该路径（乐观插入或已真实存在），
+      // 跳过刷新父目录——避免 watcher 延迟刷新用空列表覆盖 revealCreated 刚确认/合并的项
+      // （典型场景：新建二级及以上文件夹时，watcher 的 Create 事件 300ms 后批量到达，
+      // 此时 revealCreated 已完成父目录加载，若 watcher 的 listDir 恰好处在 Windows 通知
+      // 延迟窗口而返回空，会把刚显示的子文件夹清掉，出现「空文件夹」假象）。
+      if (c.kind === "create") {
+        const pNode = s.nodeMap.get(parent);
+        if (pNode?.loaded) {
+          const hasChild = pNode.children.some((cc) => normPath(cc.path) === p);
+          const hasFile = pNode.files.some((f) => normPath(f.path) === p);
+          if (hasChild || hasFile) continue;
+        }
+      }
+
       if (s.nodeMap.get(parent)?.loaded) affected.add(parent);
-      continue;
+      if (s.nodeMap.get(p)?.loaded) affected.add(p);
+      if (isRoot) affected.add(p);
     }
-
-    // 对于 create 事件：若父目录已加载且已包含该路径（乐观插入或已真实存在），
-    // 跳过刷新父目录——避免 watcher 延迟刷新用空列表覆盖 revealCreated 刚确认/合并的项
-    // （典型场景：新建二级及以上文件夹时，watcher 的 Create 事件 300ms 后批量到达，
-    // 此时 revealCreated 已完成父目录加载，若 watcher 的 listDir 恰好处在 Windows 通知
-    // 延迟窗口而返回空，会把刚显示的子文件夹清掉，出现「空文件夹」假象）。
-    if (c.kind === "create") {
-      const pNode = s.nodeMap.get(parent);
-      if (pNode?.loaded) {
-        const hasChild = pNode.children.some((cc) => normPath(cc.path) === p);
-        const hasFile = pNode.files.some((f) => normPath(f.path) === p);
-        if (hasChild || hasFile) continue;
-      }
-    }
-
-    if (s.nodeMap.get(parent)?.loaded) affected.add(parent);
-    if (s.nodeMap.get(p)?.loaded) affected.add(p);
-    if (isRoot) affected.add(p);
   }
 
   // 清理已删除/重命名路径的子树（含 loadState），避免后续 reload 失败或状态残留

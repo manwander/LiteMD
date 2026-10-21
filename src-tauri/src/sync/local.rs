@@ -3,6 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
+/// 同步引擎原子写临时文件前缀（写入失败/崩溃时可能残留，扫描必须跳过：
+/// 半截临时文件不得被当成本地新增内容上传）。
+pub const TMP_FILE_PREFIX: &str = ".litemd-tmp-";
+
 #[derive(Debug, Clone)]
 pub struct LocalEntry {
     /// 相对根目录路径（'/' 分隔，原样大小写）
@@ -40,6 +44,10 @@ pub fn scan_local(
                 Err(_) => continue,
             };
             let rel = rel_of(root, &path);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(TMP_FILE_PREFIX) {
+                continue;
+            }
             if meta.is_dir() {
                 if !matches_ignore(&rel, ignore) {
                     stack.push(path);
