@@ -158,6 +158,46 @@ describe("renderBlock 引用定义上下文补齐", () => {
   });
 });
 
+describe("增量快速路径 splitFast 行边界（W6 回归）", () => {
+  beforeEach(() => clearSplitCache());
+
+  /** 建立 lastSplit 后，用 edits 走快速路径；再冷启动走全量路径，二者必须等价 */
+  function expectFastEqualsFull(oldSrc: string, newSrc: string, edit: { from: number; to: number; insert: number }) {
+    clearSplitCache();
+    splitIntoBlocks(null, oldSrc);
+    const fast = splitIntoBlocks(null, newSrc, edit);
+    clearSplitCache();
+    const full = splitIntoBlocks(null, newSrc);
+    const norm = (bs: ReturnType<typeof splitIntoBlocks>) =>
+      bs.map((b) => [b.srcBegin, b.srcEnd, b.type, b.preview]);
+    expect(norm(fast)).toEqual(norm(full));
+    return fast;
+  }
+
+  it("删除换行合并两行：块不得从半行开始（旧实现会丢掉行首字符）", () => {
+    // "a\n b\nc" 删掉第一个换行 → "a b\nc"
+    const fast = expectFastEqualsFull("a\n b\nc", "a b\nc", { from: 1, to: 2, insert: 0 });
+    expect(fast[0].srcBegin).toBe(0);
+    for (const b of fast) {
+      expect(b.srcBegin === 0 || "a b\nc".charCodeAt(b.srcBegin - 1) === 10).toBe(true);
+    }
+  });
+
+  it("换行替换为普通字符（跨行内容被合并）", () => {
+    const fast = expectFastEqualsFull("a\nb\nc", "axb\nc", { from: 1, to: 2, insert: 1 });
+    expect(fast[0].srcBegin).toBe(0);
+  });
+
+  it("跨多行删除后接尾行", () => {
+    expectFastEqualsFull("a\nb\nc", "ac", { from: 1, to: 4, insert: 0 });
+    expectFastEqualsFull("a\nb\nc", "aX\nY\nZb\nc", { from: 1, to: 2, insert: 5 });
+  });
+
+  it("行首插入多行内容", () => {
+    expectFastEqualsFull("a\nb", "x\ny\na\nb", { from: 0, to: 0, insert: 4 });
+  });
+});
+
 describe("hashRange 内容键不变式", () => {
   it("同一区间多次哈希稳定", () => {
     const s = "abcdefgh";

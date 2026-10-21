@@ -1,6 +1,7 @@
 // 本地树扫描（设计方案 §5.1 步骤 1）：walk(localRoot) → 应用 ignorePatterns / maxFileSize。
 // rel 统一 '/' 分隔；Windows 大小写碰撞（a.md vs A.md）在此检测并报错。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// 同步引擎原子写临时文件前缀（写入失败/崩溃时可能残留，扫描必须跳过：
@@ -16,15 +17,17 @@ pub struct LocalEntry {
     pub mtime: i64,
 }
 
-/// 递归扫描本地树。返回 Err 仅当根目录不可读；单文件 stat 失败静默跳过。
-/// 超过 max_file_size 的文件不进入同步集（在汇总里以 skipped 呈现，见 engine）。
+/// 递归扫描本地树。返回 Err 仅当根目录不可读。
+/// 第三项为「本地存在但被有意排除」的归一路径集合（超限/符号链接/读取失败）：
+/// engine 用它对远端删除做保护——本地排除不等于本地已删除，不能反向删远端。
 pub fn scan_local(
     root: &Path,
     ignore: &[String],
     max_file_size: u64,
-) -> Result<(Vec<LocalEntry>, Vec<String>), String> {
+) -> Result<(Vec<LocalEntry>, Vec<String>, HashSet<String>), String> {
     let mut out: Vec<LocalEntry> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut omitted: HashSet<String> = HashSet::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     // 大小写碰撞检测：lowercase(rel) → 首个原样 rel
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -39,15 +42,31 @@ pub fn scan_local(
         let rd = std::fs::read_dir(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
         for entry in rd.flatten() {
             let path = entry.path();
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
             let rel = rel_of(root, &path);
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.contains(TMP_FILE_PREFIX) {
                 continue;
             }
+            // 符号链接/junction 一律不跟随：既防目录环路，也防经链接把同步根之外
+            // 的文件纳入（下载/删除会顺着链接落到根外）。
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => {
+                    omitted.insert(rel.to_lowercase());
+                    continue;
+                }
+            };
+            if ft.is_symlink() {
+                omitted.insert(rel.to_lowercase());
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => {
+                    omitted.insert(rel.to_lowercase());
+                    continue;
+                }
+            };
             if meta.is_dir() {
                 if !matches_ignore(&rel, ignore) {
                     stack.push(path);
@@ -55,6 +74,7 @@ pub fn scan_local(
                 continue;
             }
             if !meta.is_file() {
+                omitted.insert(rel.to_lowercase());
                 continue;
             }
             if matches_ignore(&rel, ignore) {
@@ -62,6 +82,7 @@ pub fn scan_local(
             }
             if meta.len() > max_file_size {
                 skipped.push(format!("{}（超过大小上限）", rel));
+                omitted.insert(rel.to_lowercase());
                 continue;
             }
             let key = rel.to_lowercase();
@@ -89,7 +110,7 @@ pub fn scan_local(
         ));
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok((out, skipped))
+    Ok((out, skipped, omitted))
 }
 
 fn rel_of(root: &Path, abs: &Path) -> String {
@@ -193,13 +214,15 @@ mod tests {
         std::fs::write(root.join("sub/b.bin"), vec![0u8; 5000]).unwrap();
         std::fs::write(root.join("sub/.git/config"), "x").unwrap();
         let big = 1024u64;
-        let (entries, skipped) = scan_local(root, &["**/.git/**".to_string()], big).unwrap();
+        let (entries, skipped, omitted) = scan_local(root, &["**/.git/**".to_string()], big).unwrap();
         let rels: Vec<_> = entries.iter().map(|e| e.rel.as_str()).collect();
         assert!(rels.contains(&"a.md"));
         assert!(!rels.contains(&"sub/b.bin"), "超限文件不应进入同步集");
-        // 5000 > 1024 → 应进 skipped
+        // 5000 > 1024 → 应进 skipped，同时记入 omitted（保护远端不被误删）
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].starts_with("sub/b.bin"));
+        assert!(omitted.contains("sub/b.bin"));
+        assert!(!omitted.contains("a.md"), "正常同步的文件不应进 omitted");
         assert!(!rels.iter().any(|r| r.contains(".git")));
         // 注：大小写碰撞（a.md vs A.md）在 Windows 真实文件系统上无法构造（NTFS 不区分大小写），
         // 由 scan_local 的 seen-map 检测逻辑保证；该分支在 Linux CI 或手工构造快照时生效。

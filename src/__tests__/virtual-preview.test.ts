@@ -53,4 +53,25 @@ describe("VirtualPreview 外链点击", () => {
     loc!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     expect(openExternal).toHaveBeenCalledTimes(1);
   });
+
+  it("协议相对链接 //host 提升为 https 并交给系统浏览器（W12）", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    mount(VirtualPreview, {
+      target,
+      props: {
+        md: new MarkdownIt(),
+        source: "[协议相对](//example.org/path)",
+      },
+    });
+    await settle();
+
+    const a = target.querySelector("a");
+    expect(a).toBeTruthy();
+    expect(a!.getAttribute("href")).toBe("https://example.org/path");
+    const evt = new MouseEvent("click", { bubbles: true, cancelable: true });
+    a!.dispatchEvent(evt);
+    expect(evt.defaultPrevented).toBe(true);
+    expect(openExternal).toHaveBeenCalledWith("https://example.org/path");
+  });
 });

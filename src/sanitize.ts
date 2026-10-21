@@ -162,7 +162,13 @@ function ensureHooks(): void {
     // 内联样式走白名单：DOMPurify 默认放行 style 属性，但 CSS 可外链/覆盖布局
     if (el.hasAttribute("style")) sanitizeStyleAttr(el);
     if (el.tagName === "A") {
-      const href = el.getAttribute("href") || "";
+      let href = el.getAttribute("href") || "";
+      // W12：协议相对链接（//host/path）在桌面 WebView 中会解析为 file://host，
+      // 语义错误且点击无反应。统一提升为 https 外链。
+      if (/^\/\/[^/]/.test(href)) {
+        href = "https:" + href;
+        el.setAttribute("href", href);
+      }
       // 仅对「外部 http(s) 链接」加 target=_blank + rel=noopener，
       // 避免给站内相对链接（local.md）/ 锚点（#x）也强加新窗口，破坏应用内导航。
       if (/^https?:\/\//i.test(href)) {

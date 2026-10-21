@@ -5,6 +5,7 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::header::HeaderMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::sync::transport::{CheckStep, RemoteEntry, Transport, UploadResult};
@@ -19,6 +20,9 @@ const PROPFIND_BODY: &str = concat!(
 /// 列举护栏：最多 5000 次 PROPFIND、5 万条目，防选错根目录把服务器打爆
 const MAX_PROPFIND_REQUESTS: usize = 5000;
 const MAX_ENTRIES: usize = 50_000;
+/// 单文件下载硬上限：防止服务器谎报/缺失 Content-Length 或分块传输时把内存打爆
+/// （业务上限仍由 engine 的 max_file_size 控制，这里是最后一道防线）。
+const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WebDavConfig {
@@ -39,6 +43,8 @@ pub struct WebDav {
     /// base 的路径部分（'/' 分隔、首尾带 '/'），href 反解用
     base_path: String,
     credentials: Option<(String, String)>,
+    /// 首次上传前是否已尝试创建基目录（本轮内只尝试一次）
+    base_ready: AtomicBool,
 }
 
 /// 把用户填的 url + 文件夹 basePath 归一成完整基 URL。
@@ -146,7 +152,13 @@ impl WebDav {
         } else {
             Some((cfg.username.clone(), cfg.password.clone()))
         };
-        Ok(Self { client, base, base_path, credentials })
+        Ok(Self {
+            client,
+            base,
+            base_path,
+            credentials,
+            base_ready: AtomicBool::new(false),
+        })
     }
 
     /// rel（解码、'/' 分隔、无前导斜杠）→ 完整 URL，逐段百分号编码
@@ -219,6 +231,46 @@ impl WebDav {
         Some(out)
     }
 
+    /// href 是否正好指向本次 PROPFIND 的目录本身（Depth:1 必然回显目录自身）。
+    /// 用于区分「服务端正常的目录回显」与「无法解析的可疑条目」。
+    fn href_is_dir_self(&self, href: &str, dir_rel: &str) -> bool {
+        let h = href.trim();
+        if h.is_empty() {
+            return false;
+        }
+        let path_part = if let Some(i) = h.find("://") {
+            let rest = &h[i + 3..];
+            match rest.find('/') {
+                Some(j) => &rest[j..],
+                None => "/",
+            }
+        } else {
+            h
+        };
+        let path_part = path_part.split(['?', '#']).next().unwrap_or(path_part);
+        let decoded = match urlencoding::decode(path_part) {
+            Ok(d) => d.to_string(),
+            Err(_) => return false,
+        };
+        let segs = match split_path_segments(&decoded.replace('\\', "/")) {
+            Some(s) => s,
+            None => return false,
+        };
+        let mut expected = match split_path_segments(&self.base_path) {
+            Some(s) => s,
+            None => return false,
+        };
+        match split_path_segments(dir_rel) {
+            Some(s) => expected.extend(s),
+            None => return false,
+        }
+        segs.len() == expected.len()
+            && segs
+                .iter()
+                .zip(expected.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+
     async fn propfind(&self, dir_rel: &str, depth: &str) -> Result<(u16, String), String> {
         let url = self.url_for(dir_rel);
         let mut req = self
@@ -250,6 +302,21 @@ impl WebDav {
     /// 递归建父目录链：对 rel 的每个祖先目录 MKCOL；任何失败都忽略
     /// （已存在 405 / 成功 201 / 服务器限制均交由随后的 PUT 结果裁决）。
     async fn mkdir_all(&self, rel: &str) {
+        // 基目录本身也要创建：配置检查明确提示「首次同步自动创建」，而多数 WebDAV
+        // 服务器的 PUT 不会自动建中间集合，基路径不存在时首个上传会直接 409。
+        // 每轮只尝试一次；根路径 MKCOL 返回 405/403 属正常，忽略即可。
+        if !self.base_ready.load(Ordering::Relaxed) {
+            let req = self.with_auth(
+                self.client
+                    .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &self.base),
+            );
+            if let Ok(resp) = req.send().await {
+                let s = resp.status().as_u16();
+                if (200..300).contains(&s) || s == 405 {
+                    self.base_ready.store(true, Ordering::Relaxed);
+                }
+            }
+        }
         let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
         let mut cur = String::new();
         for seg in segs.iter().take(segs.len().saturating_sub(1)) {
@@ -351,7 +418,15 @@ impl Transport for WebDav {
             }
             let (status, text) = self.propfind(&dir, "1").await?;
             match status {
-                404 | 409 => continue, // 基路径不存在 → 空远端（fail-safe 兜底）
+                // 仅根路径不存在可视为「空远端」；子目录 404/409 表示列举过程不完整，
+                // 若静默跳过，其下所有文件都会被当成「远端已删除」而误删本地。
+                404 | 409 if dir.is_empty() => continue,
+                404 | 409 => {
+                    return Err(format!(
+                        "PROPFIND {} 返回 {}：远端目录不存在或不可读，已中止本轮同步（未做任何删除）",
+                        dir, status
+                    ));
+                }
                 401 | 403 => return Err(format!("认证失败（{}）", status)),
                 207 | 200 => {} // 200：部分非标准服务器也返回体（§7.2 降级）
                 s => return Err(format!("PROPFIND {} 返回 {}", dir, s)),
@@ -360,7 +435,15 @@ impl Transport for WebDav {
             for e in entries {
                 let rel = match self.href_to_rel(&e.href) {
                     Some(r) => r,
-                    None => continue,
+                    // 目录自身回显：服务端对 Depth:1 的常规返回，跳过
+                    None if self.href_is_dir_self(&e.href, &dir) => continue,
+                    // 其它无法解析的 href 不能静默丢弃：漏掉一个文件就会被判为删除
+                    None => {
+                        return Err(format!(
+                            "远端返回了无法解析的条目路径（{}），已中止本轮同步（未做任何删除）",
+                            e.href
+                        ));
+                    }
                 };
                 if rel == dir.trim_matches('/') {
                     continue; // 目录自身回显
@@ -386,7 +469,7 @@ impl Transport for WebDav {
     async fn download(&self, rel: &str) -> Result<Vec<u8>, String> {
         let url = self.url_for(rel);
         let req = self.with_auth(self.client.get(&url));
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| format!("GET {}: {}", rel, friendly_reqwest_err(&e)))?;
@@ -397,7 +480,27 @@ impl Transport for WebDav {
         if status != 200 {
             return Err(format!("GET {} 返回 {}", rel, status));
         }
-        Ok(resp.bytes().await.map_err(|e| format!("GET {} 读取响应失败: {}", rel, e))?.to_vec())
+        if resp.content_length().is_some_and(|n| n > MAX_DOWNLOAD_BYTES) {
+            return Err(format!(
+                "GET {} 远端文件过大（超过 {} 字节上限），已拒绝下载",
+                rel, MAX_DOWNLOAD_BYTES
+            ));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("GET {} 读取响应失败: {}", rel, e))?
+        {
+            if out.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+                return Err(format!(
+                    "GET {} 响应超过 {} 字节上限，已中止下载",
+                    rel, MAX_DOWNLOAD_BYTES
+                ));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     async fn upload(&self, rel: &str, bytes: Vec<u8>) -> Result<UploadResult, String> {

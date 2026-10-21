@@ -188,32 +188,88 @@ fn sync_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("无法定位应用数据目录: {}", e))
 }
 
-fn load_snapshot(store: &SnapshotStore, fid: &str, folder: &FolderDto, cfg: &SyncConfigDto) -> Snapshot {
-    store.load(fid).unwrap_or_else(|| {
-        Snapshot::new(FolderMeta {
-            local_root: folder.local_root.clone(),
-            url: cfg.account.url.clone(),
-            base_path: folder.base_path.clone(),
-        })
+fn fresh_snapshot(folder: &FolderDto, cfg: &SyncConfigDto) -> Snapshot {
+    Snapshot::new(FolderMeta {
+        local_root: folder.local_root.clone(),
+        url: cfg.account.url.clone(),
+        base_path: folder.base_path.clone(),
     })
+}
+
+fn norm_local_root(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+fn load_snapshot(store: &SnapshotStore, fid: &str, folder: &FolderDto, cfg: &SyncConfigDto) -> Snapshot {
+    let Some(s) = store.load(fid) else {
+        return fresh_snapshot(folder, cfg);
+    };
+    // 快照必须属于同一「本地根 + 账号 + 基路径」。复用文件夹 ID 或修改 URL 后沿用旧
+    // 基线，会把另一个远端的删除/变更当成本轮事实传播，造成误删。
+    let same = norm_local_root(&s.folder.local_root) == norm_local_root(&folder.local_root)
+        && s.folder.url.trim_end_matches('/') == cfg.account.url.trim_end_matches('/')
+        && s.folder.base_path.trim_matches('/') == folder.base_path.trim_matches('/');
+    if same {
+        s
+    } else {
+        fresh_snapshot(folder, cfg)
+    }
+}
+
+/// 仅接受后端派生的 12 位十六进制 ID；其余（含路径分隔符/上级目录）一律重新派生，
+/// 防止被篡改的 settings.json 把快照写到应用数据目录之外。
+fn safe_folder_id(raw: &str, local_root: &str) -> String {
+    let t = raw.trim();
+    if t.len() == 12 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        t.to_ascii_lowercase()
+    } else {
+        derive_folder_id(local_root)
+    }
 }
 
 // ---------------- Tauri 命令 ----------------
 
-/// 四步分级检查（§7.1）：network / auth / read / write
+/// 四步分级检查（§7.1）：network / auth / read / write。
+/// 逐个检查所有启用文件夹（基路径不同权限可能不同），多文件夹时在消息前加目录标签。
 #[tauri::command]
 pub async fn sync_check_config(config: SyncConfigDto) -> Result<CheckReport, String> {
-    // 检查配置只做连通性验证（无写操作），取第一个启用文件夹即可
-    let folder = config
-        .folders
-        .iter()
-        .find(|f| f.enabled)
-        .cloned()
-        .ok_or_else(|| "尚未配置同步文件夹（请在 设置→同步 中添加）".to_string())?;
-    let transport = build_transport(&config, &folder)?;
-    let steps = transport.check().await?;
+    let folders: Vec<FolderDto> = config.folders.iter().filter(|f| f.enabled).cloned().collect();
+    if folders.is_empty() {
+        return Err("尚未配置同步文件夹（请在 设置→同步 中添加）".to_string());
+    }
+    let multi = folders.len() > 1;
+    let mut steps = Vec::new();
+    for folder in &folders {
+        let label = folder_label(folder);
+        let transport = build_transport(&config, folder)?;
+        match transport.check().await {
+            Ok(mut folder_steps) => {
+                if multi {
+                    for st in &mut folder_steps {
+                        st.message = format!("[{}] {}", label, st.message);
+                    }
+                }
+                steps.append(&mut folder_steps);
+            }
+            // 单个文件夹网络异常不应让整次检查变成一条无上下文的错误
+            Err(e) => steps.push(CheckStep {
+                name: "network".into(),
+                ok: false,
+                skipped: false,
+                message: format!("[{}] {}", label, e),
+            }),
+        }
+    }
     let all_ok = steps.iter().all(|s| s.ok || s.skipped);
     Ok(CheckReport { steps, all_ok })
+}
+
+fn folder_label(folder: &FolderDto) -> String {
+    Path::new(folder.local_root.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| folder.base_path.trim_end_matches('/').to_string())
 }
 
 /// 执行一轮同步。mode: "normal"|"forceUpload"|"forceDownload"；dryRun 返回计划不执行。
@@ -251,11 +307,7 @@ pub async fn sync_run(
     let opts = build_opts(&config, &folder, mode);
     let dir = sync_dir(&app)?;
     let store = SnapshotStore::new(dir);
-    let fid = if !folder.id.trim().is_empty() {
-        folder.id.trim().to_string()
-    } else {
-        derive_folder_id(&folder.local_root)
-    };
+    let fid = safe_folder_id(&folder.id, &folder.local_root);
     let snap = load_snapshot(&store, &fid, &folder, &config);
     let local_root = Path::new(&folder.local_root);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -290,4 +342,24 @@ pub fn sync_cancel() {
 #[tauri::command]
 pub fn sync_folder_id(local_root: String) -> String {
     derive_folder_id(&local_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_folder_id_rejects_path_traversal() {
+        let derived = derive_folder_id("E:\\notes");
+        assert_eq!(safe_folder_id("../../evil", "E:\\notes"), derived);
+        assert_eq!(safe_folder_id("", "E:\\notes"), derived);
+        assert_eq!(safe_folder_id("x/y", "E:\\notes"), derived);
+        assert_eq!(safe_folder_id("ABCDEF012345", "ignored"), "abcdef012345");
+    }
+
+    #[test]
+    fn local_root_normalized_for_snapshot_match() {
+        assert_eq!(norm_local_root("E:\\Notes\\"), norm_local_root("e:/notes"));
+        assert_ne!(norm_local_root("E:\\Notes"), norm_local_root("E:\\Notes2"));
+    }
 }

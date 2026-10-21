@@ -278,15 +278,20 @@
 
   // 外部链接交给系统浏览器：WebView 内直接导航会把 Tauri 应用变成网页容器，
   // 且 target=_blank 在 Tauri 中默认被拦截（点击无反应）。仅拦截 http(s)，
-  // 站内相对链接与锚点保持默认行为。
+  // 站内相对链接与锚点保持默认行为。W12：协议相对 //host 视为 https 外链。
   function onPreviewClick(e: MouseEvent) {
     const target = e.target as HTMLElement | null;
     const a = target?.closest?.("a") as HTMLAnchorElement | null;
     if (!a) return;
     const href = a.getAttribute("href") || "";
-    if (!/^https?:\/\//i.test(href)) return;
+    const external = /^https?:\/\//i.test(href)
+      ? href
+      : /^\/\/[^/]/.test(href)
+        ? "https:" + href
+        : null;
+    if (!external) return;
     e.preventDefault();
-    void openExternal(href).catch(() => {});
+    void openExternal(external).catch(() => {});
   }
 
   function onScroll() {

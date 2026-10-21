@@ -81,6 +81,13 @@ describe("C-01 外链加安全属性（防 window.opener 劫持）", () => {
     expect(out).not.toContain('target="_blank"');
     expect(out).toContain('href="local.md"');
   });
+
+  it("协议相对 //host 提升为 https 外链（W12）", () => {
+    const out = sanitizeHtml('<a href="//example.org/p">link</a>');
+    expect(out).toContain('href="https://example.org/p"');
+    expect(out).toContain('target="_blank"');
+    expect(out).toContain('rel="noopener noreferrer"');
+  });
 });
 
 describe("C-01/M-04 任务列表 input 降级", () => {

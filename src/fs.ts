@@ -180,6 +180,8 @@ export interface FolderSearchResult {
 export interface FolderReplaceResult {
   filesChanged: number;
   count: number;
+  /** 因过大或编码无法识别而跳过的文件数 */
+  skipped: number;
 }
 
 /** 在当前文件夹下所有 .md 中查找（字面子串，可选大小写敏感；结果上限 2000 条） */

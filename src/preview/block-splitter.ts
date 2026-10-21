@@ -630,29 +630,38 @@ function splitFast(source: string, edit: EditRange): PreviewBlock[] | null {
 
   const prevRaws = prev.raws;
 
-  // 行边界：复用旧 lineStarts，仅重扫插入区（O(变化)而非 O(全文)）。
-  // 旧 [0, from) 的行首不变；旧 [to, oldLen) 的行首整体 +delta；插入区重新 indexOf。
+  // 行边界：复用旧 lineStarts，仅重扫「编辑起点所在行 → 原编辑终点所在行尾」的新文本。
+  // W6 修复：旧实现把编辑点之后的旧行首一律 +delta；若编辑删除了换行符，这些位置
+  // 在新文本中已不是行首（会切出半行、丢字符）。行首有效性只取决于「其前一个字符是 \n」：
+  //   1. from 所在行（含）之前的行首原样保留；
+  //   2. 从该行首扫到原 to 所在行的行尾，所有新换行后的位置重新生成；
+  //   3. 仅平移原 to 所在行之后的行首（其前导换行必然未被替换）。
   const prevLS = prev.lineStarts;
+  const oldLen = prev.source.length;
   const lineStarts: number[] = [];
   let pi = 0;
   while (pi < prevLS.length && prevLS[pi] <= edit.from) {
     lineStarts.push(prevLS[pi]);
     pi++;
   }
-  // 编辑点所在行的行首（可能 < from，需回溯到最后一个 ≤ from 的行首，上面循环已保证；
-  // 行首恰等于 edit.from 的行在编辑后仍存在，必须保留，否则该行与下一行被错误合并）
-  let p = source.indexOf("\n", lineStarts.length ? Math.max(lineStarts[lineStarts.length - 1], edit.from) : edit.from);
-  const insertEnd = edit.from + edit.insert;
-  while (p !== -1 && p < insertEnd) {
-    lineStarts.push(p + 1);
-    p = source.indexOf("\n", p + 1);
+  // 编辑点所在行首（from 为行首时即为 from 本身）
+  const lineStart0 = lineStarts.length ? lineStarts[lineStarts.length - 1] : 0;
+  // 原 to 所在行的行尾换行；-1 表示 to 落在最后一行
+  const oldTailNl = edit.to >= oldLen ? -1 : prev.source.indexOf("\n", edit.to);
+  const scanEnd = oldTailNl === -1 ? source.length : oldTailNl + delta;
+  for (let p = source.indexOf("\n", lineStart0); p !== -1 && p <= scanEnd; p = source.indexOf("\n", p + 1)) {
+    const v = p + 1;
+    if (lineStarts[lineStarts.length - 1] !== v) lineStarts.push(v);
   }
-  // 旧 [to, ...) 的行首平移 delta；跳过落在被替换区 [from, to) 内的旧行首；
-  // 衔接处去重（插入内容以换行结尾时可能与平移后的旧行首重合）
-  while (pi < prevLS.length && prevLS[pi] < edit.to) pi++;
+  // 跳过会被替换区吞掉前导换行的旧行首（from < L <= 旧行尾换行）
+  const skipThrough = oldTailNl === -1 ? oldLen : oldTailNl;
+  while (pi < prevLS.length && prevLS[pi] <= skipThrough) pi++;
   for (; pi < prevLS.length; pi++) {
     const v = prevLS[pi] + delta;
-    if (lineStarts.length === 0 || lineStarts[lineStarts.length - 1] !== v) lineStarts.push(v);
+    // 防御：仅接受确实是行首的位置（delta 与真实文本不一致时宁可少一个行界，
+    // 也不能把半个字符位置当行首——splitByBlankLines 会据此切块）
+    if (v <= 0 || v > source.length || source.charCodeAt(v - 1) !== 10) continue;
+    if (lineStarts[lineStarts.length - 1] !== v) lineStarts.push(v);
   }
   if (lineStarts.length === 0 || lineStarts[0] !== 0) lineStarts.unshift(0);
 

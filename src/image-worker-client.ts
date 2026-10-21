@@ -14,15 +14,17 @@ export type { ImageProcessOptions, ImageWorkerSuccess as ImageProcessResult } fr
 
 let worker: Worker | null = null;
 let workerFailed = false;
+let nextId = 1;
 
 type Pending = { resolve: (r: ImageProcessResult) => void; reject: (e: Error) => void };
-// H2 修复：Worker 按消息顺序处理并按序回信，用 FIFO 队列把每个响应正确关联回它自己的
-// 请求，取代旧「每调用各挂一个 message 监听」写法——多张图并发收编时旧实现会让首个响应
-// 同时触发所有监听器，导致 B 拿到 A 的字节。
-const pending: Pending[] = [];
+// H2/S9 修复：旧实现假设「回复顺序 === 请求顺序」，但 Worker 内是 async 处理且图片大小各异，
+// 并发时后发的小图可能先回；FIFO 队首会拿错响应。改为请求 id → pending 映射，按 id 精确关联；
+// 响应可能乱序，绝不能用 shift() 取队首。
+const pending = new Map<number, Pending>();
 
 function failPendingAll(err: Error): void {
-  while (pending.length) pending.shift()!.reject(err);
+  for (const job of pending.values()) job.reject(err);
+  pending.clear();
 }
 
 function terminateWorker(): void {
@@ -37,12 +39,14 @@ function getWorker(): Worker | null {
   if (worker) return worker;
   try {
     const w = new Worker(new URL("./workers/image-worker.ts", import.meta.url), { type: "module" });
-    // 监听器只挂一次，随 Worker 生命周期存在；响应按 FIFO 分发给对应请求。
+    // 监听器只挂一次，随 Worker 生命周期存在；响应按请求 id 分发给对应请求。
     w.addEventListener("message", (e: MessageEvent<ImageWorkerResponse>) => {
-      const job = pending.shift();
-      if (!job) return;
       const d = e.data as ImageWorkerResponse;
-      if (d && "error" in d && typeof d.error === "string") {
+      if (!d || typeof d.id !== "number") return;
+      const job = pending.get(d.id);
+      if (!job) return; // 已被 messageerror/超时清理的迟到响应
+      pending.delete(d.id);
+      if ("error" in d && typeof d.error === "string") {
         job.reject(new Error(d.error));
       } else {
         job.resolve(d as ImageProcessResult);
@@ -55,7 +59,10 @@ function getWorker(): Worker | null {
       workerFailed = true;
     });
     w.addEventListener("messageerror", () => {
-      pending.shift()?.reject(new Error("worker-messageerror"));
+      // 无法反序列化的消息：无法判断属于哪个请求，终止 Worker 并让全部请求回退，避免悬挂。
+      failPendingAll(new Error("worker-messageerror"));
+      terminateWorker();
+      workerFailed = true;
     });
     worker = w;
     return worker;
@@ -85,8 +92,15 @@ export function processImageInWorker(
       reject(new Error("worker-unavailable"));
       return;
     }
-    pending.push({ resolve, reject });
-    const req: ImageWorkerRequest = { blob, opts };
-    w.postMessage(req);
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    const req: ImageWorkerRequest = { id, blob, opts };
+    try {
+      w.postMessage(req);
+    } catch (err) {
+      // Blob 结构化克隆失败等：清理登记，避免该 Promise 永久悬挂。
+      pending.delete(id);
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
   });
 }

@@ -285,29 +285,54 @@ pub fn build_plan(
         }
     }
 
-    // fail-safe（§5.3）
+    // fail-safe（§5.3）：删除保护必须是双向的——只防本地删除时，「本地目录被清空 /
+    // 误挂空盘」会把删除传播到远端，同样属于不可逆的数据丢失。
     let mut protected = 0usize;
     if opts.fail_safe && !snap.files.is_empty() {
-        if remote.is_empty() && !local.is_empty() {
+        let drop_kinds = |items: &mut Vec<PlanItem>, kinds: &[ActionKind]| -> usize {
             let before = items.len();
-            items.retain(|i| i.kind != ActionKind::DeleteLocal);
-            protected += before - items.len();
+            items.retain(|i| !kinds.contains(&i.kind));
+            before - items.len()
+        };
+        if remote.is_empty() && !local.is_empty() {
+            let n = drop_kinds(&mut items, &[ActionKind::DeleteLocal]);
+            if n > 0 {
+                protected += n;
+                notes.push(format!(
+                    "故障保护：远端为空（疑似配置错误或服务器异常），本轮跳过 {} 项本地删除",
+                    n
+                ));
+            }
         }
-        let dl = items.iter().filter(|i| i.kind == ActionKind::DeleteLocal).count();
+        if local.is_empty() && !remote.is_empty() {
+            let n = drop_kinds(&mut items, &[ActionKind::DeleteRemote, ActionKind::DeleteRemoteKeepCopy]);
+            if n > 0 {
+                protected += n;
+                notes.push(format!(
+                    "故障保护：本地为空（疑似目录被清空或挂载异常），本轮跳过 {} 项远端删除",
+                    n
+                ));
+            }
+        }
         let threshold = std::cmp::max(20, snap.files.len() * 30 / 100);
+        let dl = items.iter().filter(|i| i.kind == ActionKind::DeleteLocal).count();
         if dl > threshold {
             items.retain(|i| i.kind != ActionKind::DeleteLocal);
+            protected += dl;
             notes.push(format!(
                 "故障保护：本轮拟删除本地文件 {} 项，超过阈值 {}，已全部跳过（请检查同步配置）",
                 dl, threshold
             ));
         }
-    }
-    if protected > 0 {
-        notes.push(format!(
-            "故障保护：远端为空（疑似配置错误或服务器异常），本轮跳过 {} 项本地删除",
-            protected
-        ));
+        let dr = items.iter().filter(|i| i.kind == ActionKind::DeleteRemote).count();
+        if dr > threshold {
+            items.retain(|i| i.kind != ActionKind::DeleteRemote);
+            protected += dr;
+            notes.push(format!(
+                "故障保护：本轮拟删除远端文件 {} 项，超过阈值 {}，已全部跳过（请检查本地目录是否完整）",
+                dr, threshold
+            ));
+        }
     }
     (items, notes, protected)
 }
@@ -334,6 +359,15 @@ fn action_fetches_remote(kind: ActionKind) -> bool {
             | ActionKind::NewSameName
             | ActionKind::DeleteRemoteKeepCopy
     )
+}
+
+/// 打开且脏的标签永远走双保留：NewerWins 不能以 mtime 为由丢弃编辑器里的未保存内容。
+fn conflict_policy_for(opts: &EngineOptions, rel: &str) -> ConflictPolicy {
+    if opts.open_dirty.contains(&normalize_rel_key(rel)) {
+        ConflictPolicy::KeepBoth
+    } else {
+        opts.policy
+    }
 }
 
 fn phase_name(k: ActionKind) -> &'static str {
@@ -371,7 +405,16 @@ pub async fn run_folder_sync<T: Transport>(
         return Err(format!("本地同步文件夹不存在：{}", local_root.display()));
     }
     emit(SyncEvent { phase: "scan".into(), done: 0, total: 0, path: local_root.display().to_string() });
-    let (local, mut skipped) = scan_local(local_root, &opts.ignore_patterns, opts.max_file_size)?;
+    // 目录扫描是同步文件 I/O（最多 2 万目录）：放入阻塞线程池，避免占住 Tokio worker
+    // 导致取消/进度事件/其他 IPC 一起卡住。
+    let (local, mut skipped, omitted_local) = {
+        let root = local_root.to_path_buf();
+        let ignore = opts.ignore_patterns.clone();
+        let cap = opts.max_file_size;
+        tokio::task::spawn_blocking(move || scan_local(&root, &ignore, cap))
+            .await
+            .map_err(|e| e.to_string())??
+    };
     emit(SyncEvent { phase: "plan".into(), done: 0, total: 0, path: String::new() });
     let remote = transport.list_all().await?;
     // K 修复：忽略规则必须同样作用于远端（此前只在本地扫描生效，忽略目录会被从远端
@@ -392,14 +435,45 @@ pub async fn run_folder_sync<T: Transport>(
                 .into(),
         );
     }
+    // 强制下载会把「远端没有的本地文件」全部移入回收站；远端为空时这等于清空本地，
+    // 必须视为配置错误直接中止（否则一次错误的 URL 就能让本地目录凭空消失）。
+    if opts.mode == SyncMode::ForceDownload
+        && opts.fail_safe
+        && remote.is_empty()
+        && !local.is_empty()
+    {
+        return Err(
+            "强制下载已中止：远端列表为空而本地仍有文件，疑似服务器地址/基路径配置错误"
+                .into(),
+        );
+    }
 
     let label = default_copy_label();
-    let (items, notes, protected) = build_plan(&local, &remote, &snap, &opts, &label);
+    let (items, mut notes, mut protected) = build_plan(&local, &remote, &snap, &opts, &label);
+
+    // 本地扫描有意排除的文件（超过大小上限 / 符号链接 / stat 失败）仍然真实存在于磁盘：
+    // 若直接按「本地没有」推导，会把远端对应文件当作本地已删而删除。这里整轮抑制其删除。
+    let mut items = items;
+    if !omitted_local.is_empty() {
+        let before = items.len();
+        items.retain(|i| {
+            !(matches!(i.kind, ActionKind::DeleteRemote | ActionKind::DeleteRemoteKeepCopy)
+                && omitted_local.contains(&normalize_rel_key(&i.rel)))
+        });
+        let n = before - items.len();
+        if n > 0 {
+            protected += n;
+            notes.push(format!(
+                "保护：{} 个本地文件因大小/类型/读取失败未纳入同步，本轮跳过其对应的 {} 项远端删除",
+                omitted_local.len(),
+                n
+            ));
+        }
+    }
 
     // M5 修复：下载执行前未知远端体积，恶意/超大远端对象会被整体读入内存（并发 ≤16）
     // 造成内存耗尽。PROPFIND 列表已带回每个对象的 size，这里据此过滤超限的下载项：
     // 仅跳过下载，不影响上传、也不会因远端「看似消失」而误删本地副本。
-    let mut items = items;
     if opts.max_file_size > 0 {
         let rsize: std::collections::HashMap<String, u64> =
             remote.iter().map(|e| (normalize_rel_key(&e.path), e.size)).collect();
@@ -452,31 +526,9 @@ pub async fn run_folder_sync<T: Transport>(
     let root = local_root.to_path_buf();
     let concurrency = opts.concurrency.clamp(1, 16);
 
-    // 强制下载：先把本地全部文件移入回收站（§9 双重确认由前端完成），再全量拉取。
-    // 脏标签保护：已打开且有未保存修改的文件绝不移入回收站（编辑中的内容不能被同步吞掉），
-    // 这类项在 apply_item 中降级为冲突副本（KeepBoth），本地内容与远端内容都保留。
-    if opts.mode == SyncMode::ForceDownload {
-        for l in &local {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            if opts.open_dirty.contains(&normalize_rel_key(&l.rel)) {
-                summary
-                    .skipped
-                    .push(format!("{}（已打开且有未保存修改，强制下载已保留本地）", l.rel));
-                continue;
-            }
-            let abs = l.abs.clone();
-            let rel = l.rel.clone();
-            let r = tokio::task::spawn_blocking(move || trash::delete(&abs).map_err(|e| e.to_string()))
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Err(e) = r {
-                errors.lock().await.push(format!("本地移入回收站失败 {}: {}", rel, e));
-            }
-        }
-        snap.lock().await.files.clear();
-    }
+    // 强制下载的本地清理必须在「远端内容已成功落盘」之后进行（见下方 post-loop），
+    // 否则下载中途失败会先破坏本地、又拿不到远端内容。下载本身用原子覆盖写，
+    // 同名文件无需先移入回收站；只有「远端不存在的本地文件」才需要清理。
 
     let mut stream = futures::stream::iter(items.into_iter().map(|item| {
         let t = transport;
@@ -546,6 +598,59 @@ pub async fn run_folder_sync<T: Transport>(
         }
     }
 
+    // 强制下载收尾：远端内容已全部落盘，此时才清理本地多余文件。
+    // 任一动作失败或用户取消时一律不做破坏性清理，宁可留下多余文件也不能清空本地。
+    if opts.mode == SyncMode::ForceDownload {
+        let action_failed = !errors.lock().await.is_empty();
+        if cancel.load(Ordering::Relaxed) {
+            summary.skipped.push("强制下载被取消：本地多余文件未做清理".into());
+        } else if action_failed {
+            summary
+                .skipped
+                .push("强制下载存在失败项：本轮已保留本地多余文件（未做清理）".into());
+        } else {
+            let remote_keys: HashSet<String> =
+                remote.iter().map(|e| normalize_rel_key(&e.path)).collect();
+            let local_keys: HashSet<String> =
+                local.iter().map(|e| normalize_rel_key(&e.rel)).collect();
+            let mut s = snap.lock().await;
+            for l in &local {
+                let key = normalize_rel_key(&l.rel);
+                if remote_keys.contains(&key) {
+                    continue; // 已在远端：内容已由下载原子覆盖（或按脏标签保护保留）
+                }
+                if opts.open_dirty.contains(&key) {
+                    summary
+                        .skipped
+                        .push(format!("{}（已打开且有未保存修改，强制下载已保留本地）", l.rel));
+                    continue;
+                }
+                let abs = l.abs.clone();
+                let rel = l.rel.clone();
+                let r = tokio::task::spawn_blocking(move || trash::delete(&abs).map_err(|e| e.to_string()))
+                    .await;
+                match r {
+                    Ok(Ok(())) => {
+                        del_local.fetch_add(1, Ordering::Relaxed);
+                        s.remove(&l.rel);
+                    }
+                    Ok(Err(e)) => summary.errors.push(format!("本地移入回收站失败 {}: {}", rel, e)),
+                    Err(e) => summary.errors.push(format!("本地移入回收站失败 {}: {}", rel, e)),
+                }
+            }
+            // 强制下载以远端列表为准：两侧都不存在的陈旧快照条目一并清理
+            let stale: Vec<String> = s
+                .files
+                .keys()
+                .filter(|k| !remote_keys.contains(*k) && !local_keys.contains(*k))
+                .cloned()
+                .collect();
+            for k in stale {
+                s.files.remove(&k);
+            }
+        }
+    }
+
     summary.uploaded = uploaded.load(Ordering::Relaxed);
     summary.downloaded = downloaded.load(Ordering::Relaxed);
     summary.deleted_local = del_local.load(Ordering::Relaxed);
@@ -571,6 +676,11 @@ async fn apply_item<T: Transport>(
     opts: &EngineOptions,
     item: &PlanItem,
 ) -> Result<Vec<OutcomeTag>, String> {
+    if !rel_is_safe(&item.rel)
+        || item.copy_rel.as_deref().is_some_and(|c| !rel_is_safe(c))
+    {
+        return Err(format!("拒绝不安全的同步相对路径：{}", item.rel));
+    }
     match item.kind {
         ActionKind::SnapPurge => {
             snap.lock().await.remove(&item.rel);
@@ -582,7 +692,14 @@ async fn apply_item<T: Transport>(
             if opts.open_dirty.contains(&normalize_rel_key(&item.rel)) {
                 return Ok(vec![OutcomeTag::OpenDirtySkipped]);
             }
-            do_upload(t, root, snap, item).await
+            do_upload(
+                t,
+                root,
+                snap,
+                item,
+                opts.mode == SyncMode::ForceUpload || item.kind == ActionKind::ReUpload,
+            )
+            .await
         }
         ActionKind::Download => {
             let key = normalize_rel_key(&item.rel);
@@ -591,7 +708,7 @@ async fn apply_item<T: Transport>(
                 // 强制下载模式同样适用：不能因为「模式更激进」就吞掉未保存内容。
                 return do_conflict(t, root, snap, item, ConflictPolicy::KeepBoth).await;
             }
-            do_download(t, root, snap, item).await
+            do_download(t, root, snap, item, opts.mode == SyncMode::ForceDownload).await
         }
         ActionKind::NewSameName => {
             // #3：下载远端字节比对哈希；相同认领，不同按策略冲突
@@ -614,24 +731,43 @@ async fn apply_item<T: Transport>(
                 );
                 return Ok(vec![]); // 认领，不传输
             }
-            do_conflict(t, root, snap, item, opts.policy).await
+            let policy = conflict_policy_for(opts, &item.rel);
+            do_conflict(t, root, snap, item, policy).await
         }
-        ActionKind::Conflict => do_conflict(t, root, snap, item, opts.policy).await,
+        ActionKind::Conflict => {
+            let policy = conflict_policy_for(opts, &item.rel);
+            do_conflict(t, root, snap, item, policy).await
+        }
         ActionKind::DeleteRemote => {
+            // 打开且脏的标签持有磁盘上已不存在的未保存内容：不得把远端唯一副本删掉，
+            // 等用户保存/确认后再同步。
+            if opts.open_dirty.contains(&normalize_rel_key(&item.rel)) {
+                return Ok(vec![OutcomeTag::OpenDirtySkipped]);
+            }
             t.delete(&item.rel).await?;
             snap.lock().await.remove(&item.rel);
             Ok(vec![OutcomeTag::DeletedRemote])
         }
         ActionKind::DeleteRemoteKeepCopy => {
-            // #8 删改冲突：远端内容落盘为冲突副本 + 删除远端原件（等价双保留）
-            let copy = item
+            if opts.open_dirty.contains(&normalize_rel_key(&item.rel)) {
+                return Ok(vec![OutcomeTag::OpenDirtySkipped]);
+            }
+            // #8 删改冲突：远端内容落盘为冲突副本 + 删除远端原件（双保留）。
+            // 副本必须先上传成功再删原件——否则远端内容只剩本地单点，删原件后一旦
+            // 下一轮同步前本地出问题就永久丢失。
+            let base = item
                 .copy_rel
                 .clone()
-                .or_else(|| Some(conflict_copy_name(&item.rel, &default_copy_label())))
-                .ok_or("缺副本路径")?;
-            let copy = unique_copy_name(root, &copy).await;
+                .unwrap_or_else(|| conflict_copy_name(&item.rel, &default_copy_label()));
             let bytes = t.download(&item.rel).await?;
+            // 失败重试幂等：同名副本已存在且内容一致时复用，避免每轮堆一个副本
+            let reuse = tokio::fs::read(root.join(slash(&base)))
+                .await
+                .map(|b| b == bytes)
+                .unwrap_or(false);
+            let copy = if reuse { base } else { unique_copy_name(root, &base).await };
             write_bytes_atomic(root.join(slash(&copy)), &bytes).await?;
+            let up_copy = t.upload(&copy, bytes.clone()).await?;
             t.delete(&item.rel).await?;
             let mut s = snap.lock().await;
             s.remove(&item.rel);
@@ -642,8 +778,8 @@ async fn apply_item<T: Transport>(
                     hash: sha256_bytes(&bytes),
                     size: st.0,
                     mtime: st.1,
-                    remote_etag: None,
-                    remote_mtime: None,
+                    remote_etag: up_copy.etag,
+                    remote_mtime: up_copy.last_modified,
                     synced_at: unix_now(),
                     path: canon_rel(&copy),
                 },
@@ -670,11 +806,14 @@ async fn do_upload<T: Transport>(
     root: &Path,
     snap: &tokio::sync::Mutex<Snapshot>,
     item: &PlanItem,
+    force: bool,
 ) -> Result<Vec<OutcomeTag>, String> {
     let bytes = read_bytes(root.join(slash(&item.rel))).await?;
     let hash = sha256_bytes(&bytes);
     let st = stat_of(root, &item.rel).await?;
-    {
+    // 强制上传（ForceUpload / ReUpload）必须真正推送：远端可能已被删除或篡改，
+    // 而快照哈希与本地一致（无 etag 服务器每轮保守重传），不能因此跳过。
+    if !force {
         // 哈希与快照一致（如仅 touch 了 mtime）→ 不重复上传，刷新本地元数据即可
         let mut s = snap.lock().await;
         let old = s.get(&item.rel).cloned();
@@ -710,11 +849,13 @@ async fn do_download<T: Transport>(
     root: &Path,
     snap: &tokio::sync::Mutex<Snapshot>,
     item: &PlanItem,
+    force_write: bool,
 ) -> Result<Vec<OutcomeTag>, String> {
     let bytes = t.download(&item.rel).await?;
     let hash = sha256_bytes(&bytes);
-    // 与快照哈希一致（无 etag 服务器每轮"保守已变"）→ 不写盘，只刷新远端元数据
-    {
+    // 与快照哈希一致（无 etag 服务器每轮"保守已变"）→ 不写盘，只刷新远端元数据。
+    // 强制下载例外：本地文件可能已被用户删除/移动，必须以远端内容为准重建。
+    if !force_write {
         let mut s = snap.lock().await;
         let old = s.get(&item.rel).cloned();
         if let Some(old) = old {
@@ -782,6 +923,27 @@ async fn do_conflict<T: Transport>(
             },
         );
         return Ok(vec![]);
+    }
+
+    if !local_exists {
+        // 本地文件已消失（用户移动/删除/尚未落盘）：远端是唯一副本，直接恢复到原路径。
+        // 绝不能以空字节上传覆盖远端原文件（旧实现会把远端清空）。
+        write_bytes_atomic(local_path.clone(), &remote_bytes).await?;
+        let st = stat_of(root, &item.rel).await?;
+        let mut s = snap.lock().await;
+        s.upsert(
+            &item.rel,
+            FileState {
+                hash: remote_hash,
+                size: st.0,
+                mtime: st.1,
+                remote_etag: item.remote_etag.clone(),
+                remote_mtime: item.remote_mtime,
+                synced_at: unix_now(),
+                path: canon_rel(&item.rel),
+            },
+        );
+        return Ok(vec![OutcomeTag::Downloaded]);
     }
 
     match policy {
@@ -874,6 +1036,28 @@ async fn do_conflict<T: Transport>(
 }
 
 // ---------------- IO 小工具 ----------------
+
+/// 纵深防御：所有落盘/删除路径只接受「非空、'/'-分隔、无 . / .. / 盘符冒号 / 反斜杠」
+/// 的相对路径。远端路径已由 WebDAV 层逐段校验，本地扫描天然安全；这里再兜一层，
+/// 防止未来新增路径来源或快照被篡改时 root.join(绝对路径) 直接逃出同步根。
+fn rel_is_safe(rel: &str) -> bool {
+    if rel.is_empty() || rel.contains('\\') {
+        return false;
+    }
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return false;
+    }
+    // Windows 盘符/UNC 前缀（"C:x" 的 is_absolute() 为 false，但 join 会替换根）
+    #[cfg(windows)]
+    if p.components()
+        .next()
+        .is_some_and(|c| matches!(c, std::path::Component::Prefix(_)))
+    {
+        return false;
+    }
+    rel.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
 
 fn slash(rel: &str) -> PathBuf {
     PathBuf::from(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
@@ -969,6 +1153,7 @@ mod tests {
         files: StdMutex<HashMap<String, Vec<u8>>>,
         mtimes: StdMutex<HashMap<String, i64>>,
         fail_list: StdMutex<bool>,
+        fail_download: StdMutex<bool>,
     }
     impl MockTransport {
         fn put_raw(&self, rel: &str, bytes: &[u8], mtime: i64) {
@@ -999,6 +1184,9 @@ mod tests {
                 .collect())
         }
         async fn download(&self, rel: &str) -> Result<Vec<u8>, String> {
+            if *self.fail_download.lock().unwrap() {
+                return Err(format!("mock 下载失败 {}", rel));
+            }
             self.files.lock().unwrap().get(rel).cloned().ok_or_else(|| format!("mock 404 {}", rel))
         }
         async fn upload(&self, rel: &str, bytes: Vec<u8>) -> Result<UploadResult, String> {
@@ -1171,6 +1359,24 @@ mod tests {
         let (plan, notes, _) = build_plan(&local, &remote, &snap, &EngineOptions::default(), "L");
         assert!(notes.iter().any(|n| n.contains("超过阈值")));
         assert!(!plan.iter().any(|p| p.kind == ActionKind::DeleteLocal));
+    }
+
+    #[test]
+    fn rel_path_guard_rejects_traversal_and_absolute() {
+        assert!(rel_is_safe("a/b.md"));
+        assert!(rel_is_safe("日记/2026.md"));
+        assert!(!rel_is_safe("../x.md"));
+        assert!(!rel_is_safe("a/../../x.md"));
+        assert!(!rel_is_safe("/etc/passwd"));
+        assert!(!rel_is_safe("C:\\Windows\\x"));
+        #[cfg(windows)]
+        {
+            assert!(!rel_is_safe("C:/Windows/x"));
+            assert!(!rel_is_safe("C:relative-drive.md"));
+        }
+        assert!(!rel_is_safe("a//b.md"));
+        assert!(!rel_is_safe("a/./b.md"));
+        assert!(!rel_is_safe(""));
     }
 
     #[test]
@@ -1355,5 +1561,221 @@ mod tests {
         assert!(!dir.path().join("gone-remote.md").exists());
         assert!(snap2.get("gone-local.md").is_none() && snap2.get("gone-remote.md").is_none());
         assert!(snap2.get("keep.md").is_some(), "未变文件快照保留");
+    }
+
+    #[test]
+    fn fail_safe_blocks_remote_deletes_when_local_empty() {
+        let snap = snap_with(vec![fs_("a.md", "h", 1, 1, "e", 1)]);
+        let local: Vec<LocalEntry> = vec![];
+        let remote = vec![re("a.md", "x", 900)];
+        let opts = EngineOptions::default();
+        let (plan, notes, protected) = build_plan(&local, &remote, &snap, &opts, "L");
+        assert!(
+            !plan.iter().any(|p| matches!(p.kind, ActionKind::DeleteRemote | ActionKind::DeleteRemoteKeepCopy)),
+            "本地为空时不得把删除传播到远端"
+        );
+        assert!(protected > 0);
+        assert!(notes.iter().any(|n| n.contains("本地为空")));
+        // 关闭保护后才允许删远端
+        let (plan2, _, _) = build_plan(&local, &remote, &snap, &EngineOptions { fail_safe: false, ..Default::default() }, "L");
+        assert!(plan2.iter().any(|p| p.kind == ActionKind::DeleteRemoteKeepCopy));
+    }
+
+    #[tokio::test]
+    async fn delete_remote_keep_copy_uploads_copy_before_deleting_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = MockTransport::default();
+        t.put_raw("gone.md", b"REMOTE NEW", 900);
+        let snap = snap_with(vec![fs_("gone.md", "sha256:old", 3, 100, "\"e0\"", 100)]);
+        // 关闭 fail-safe 以单独验证 #8 双保留（本地为空本身由 fail_safe 测试覆盖）
+        let opts = EngineOptions { fail_safe: false, ..Default::default() };
+        let (summary, snap2) = e2e(dir.path(), &t, snap, opts).await;
+        assert_eq!(summary.deleted_remote, 1);
+        let copy = snap2
+            .files
+            .values()
+            .find(|f| f.path.contains("冲突副本"))
+            .expect("应有冲突副本快照条目");
+        assert_eq!(std::fs::read(dir.path().join(&copy.path)).unwrap(), b"REMOTE NEW");
+        assert_eq!(
+            t.snapshot().get(&copy.path).map(|v| v.as_slice()),
+            Some(&b"REMOTE NEW"[..]),
+            "副本必须已上传到远端（不能只存在本地）"
+        );
+        assert!(!t.snapshot().contains_key("gone.md"), "远端原件应删除");
+        assert!(copy.remote_etag.is_some(), "副本上传后应记录 etag");
+        // 下一轮收敛
+        let (s2, _) = e2e(dir.path(), &t, snap2, EngineOptions::default()).await;
+        assert_eq!(
+            s2.deleted_remote + s2.uploaded + s2.downloaded + s2.conflicts.len(),
+            0,
+            "删改冲突应一轮收敛: {:?}",
+            s2
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_wins_runtime_guard_keeps_open_dirty_local() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dirty.md"), "LOCAL UNSAVED BASIS").unwrap();
+        let t = MockTransport::default();
+        let remote_lm = unix_now() + 10_000;
+        t.put_raw("dirty.md", b"REMOTE NEWER", remote_lm);
+        let snap = Arc::new(tokio::sync::Mutex::new(snap_with(vec![fs_(
+            "dirty.md",
+            "sha256:old",
+            4,
+            100,
+            "\"old\"",
+            100,
+        )])));
+        let opts = EngineOptions {
+            policy: ConflictPolicy::NewerWins,
+            open_dirty: ["dirty.md".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let item = PlanItem {
+            rel: "dirty.md".into(),
+            kind: ActionKind::Conflict,
+            copy_rel: Some(conflict_copy_name("dirty.md", "L")),
+            remote_etag: None,
+            remote_mtime: Some(remote_lm),
+        };
+        let tags = apply_item(&t, dir.path(), &snap, &opts, &item).await.unwrap();
+        assert!(tags.iter().any(|t| matches!(*t, OutcomeTag::Conflict)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dirty.md")).unwrap(),
+            "LOCAL UNSAVED BASIS",
+            "NewerWins 绝不能丢弃打开且未保存的本地内容"
+        );
+        assert_eq!(t.snapshot()["dirty.md"], b"LOCAL UNSAVED BASIS".to_vec(), "本地版仍上传为原件");
+        assert!(
+            t.snapshot().values().any(|b| b == b"REMOTE NEWER"),
+            "远端内容必须保留为副本"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_remote_skipped_when_open_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = MockTransport::default();
+        t.put_raw("only-remote.md", b"remote content", 100);
+        let snap = Arc::new(tokio::sync::Mutex::new(snap_with(vec![fs_(
+            "only-remote.md",
+            "sha256:old",
+            3,
+            100,
+            "\"e0\"",
+            100,
+        )])));
+        let opts = EngineOptions {
+            open_dirty: ["only-remote.md".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let item = PlanItem {
+            rel: "only-remote.md".into(),
+            kind: ActionKind::DeleteRemote,
+            copy_rel: None,
+            remote_etag: None,
+            remote_mtime: None,
+        };
+        let tags = apply_item(&t, dir.path(), &snap, &opts, &item).await.unwrap();
+        assert!(matches!(tags[0], OutcomeTag::OpenDirtySkipped));
+        assert!(t.snapshot().contains_key("only-remote.md"), "远端唯一副本不得被删除");
+        assert!(snap.lock().await.get("only-remote.md").is_some(), "快照条目保留");
+    }
+
+    #[tokio::test]
+    async fn force_download_aborts_when_remote_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("precious.md"), "precious").unwrap();
+        let t = MockTransport::default();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(store_dir.path().to_path_buf());
+        let r = run_folder_sync(
+            &t,
+            dir.path(),
+            Snapshot::new(crate::sync::state::FolderMeta {
+                local_root: "x".into(),
+                url: "y".into(),
+                base_path: "/".into(),
+            }),
+            &store,
+            "fid",
+            EngineOptions { mode: SyncMode::ForceDownload, ..Default::default() },
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert!(r.is_err(), "远端为空时强制下载必须中止");
+        assert_eq!(std::fs::read_to_string(dir.path().join("precious.md")).unwrap(), "precious");
+    }
+
+    #[tokio::test]
+    async fn force_download_failure_keeps_local_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.md"), "old").unwrap();
+        std::fs::write(dir.path().join("extra.md"), "extra").unwrap();
+        let t = MockTransport::default();
+        t.put_raw("keep.md", b"new", 100);
+        *t.fail_download.lock().unwrap() = true;
+        let opts = EngineOptions { mode: SyncMode::ForceDownload, ..Default::default() };
+        let (summary, _) = e2e(
+            dir.path(),
+            &t,
+            Snapshot::new(crate::sync::state::FolderMeta {
+                local_root: "x".into(),
+                url: "y".into(),
+                base_path: "/".into(),
+            }),
+            opts,
+        )
+        .await;
+        assert!(!summary.errors.is_empty());
+        assert!(dir.path().join("extra.md").exists(), "下载失败时不得清理本地多余文件");
+        assert_eq!(std::fs::read_to_string(dir.path().join("keep.md")).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn oversized_local_file_does_not_trigger_remote_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = vec![b'x'; 4096];
+        std::fs::write(dir.path().join("big.bin"), &content).unwrap();
+        // 另有一个正常本地文件，确保本地集合非空（否则会先命中「本地为空」故障保护，
+        // 测不到 omitted 这条独立保护路径）
+        std::fs::write(dir.path().join("ok.md"), "ok").unwrap();
+        let t = MockTransport::default();
+        t.put_raw("big.bin", &content, 100);
+        let hash = sha256_bytes(&content);
+        let snap = snap_with(vec![fs_("big.bin", &hash, 4096, 100, &hash, 100)]);
+        let opts = EngineOptions { max_file_size: 1024, ..Default::default() };
+        let (summary, _) = e2e(dir.path(), &t, snap, opts).await;
+        assert_eq!(summary.deleted_remote, 0, "本地文件仅因超限被排除，远端不得被删");
+        assert!(t.snapshot().contains_key("big.bin"), "远端文件必须保留");
+        assert!(dir.path().join("big.bin").exists(), "本地文件必须保留");
+        assert!(summary.protected_deletes > 0);
+        assert!(summary.errors.iter().any(|e| e.contains("未纳入同步")));
+    }
+
+    #[tokio::test]
+    async fn force_download_restores_local_file_despite_matching_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = MockTransport::default();
+        t.put_raw("a.md", b"content", 100);
+        let hash = sha256_bytes(b"content");
+        let snap = snap_with(vec![fs_("a.md", &hash, 7, 100, &hash, 100)]);
+        let (summary, _) = e2e(
+            dir.path(),
+            &t,
+            snap,
+            EngineOptions { mode: SyncMode::ForceDownload, ..Default::default() },
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "content",
+            "快照哈希相同但本地文件缺失时，强制下载必须重建文件"
+        );
+        assert_eq!(summary.downloaded, 1);
     }
 }

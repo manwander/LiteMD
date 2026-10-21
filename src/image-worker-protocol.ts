@@ -15,13 +15,16 @@ export interface ImageProcessOptions {
   format: ImageFormat;
 }
 
-/** 客户端 postMessage 的载荷：{ blob, opts }（opts 嵌套，勿扁平化） */
+/** 客户端 postMessage 的载荷：{ id, blob, opts }（opts 嵌套，勿扁平化） */
 export interface ImageWorkerRequest {
+  /** 请求序号：Worker 必须原样回传，客户端据此关联并发响应（响应可能乱序） */
+  id: number;
   blob: Blob;
   opts: ImageProcessOptions;
 }
 
 export interface ImageWorkerSuccess {
+  id: number;
   bytes: Uint8Array;
   format: ImageFormat;
   width: number;
@@ -29,6 +32,7 @@ export interface ImageWorkerSuccess {
 }
 
 export interface ImageWorkerError {
+  id: number;
   error: string;
 }
 

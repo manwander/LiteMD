@@ -84,7 +84,7 @@
     message = "";
     try {
       const res = await replaceInFolder(folder, query, replacement, caseSensitive);
-      message = `已替换 ${res.count} 处（${res.filesChanged} 个文件）`;
+      message = `已替换 ${res.count} 处（${res.filesChanged} 个文件）${res.skipped ? `，跳过 ${res.skipped} 个无法识别编码或过大的文件` : ""}`;
       // M-03 防线②：磁盘已变，通知父级重新拉取已打开标签的内容
       if (res.filesChanged > 0) dispatch("replaced", { folder });
       await doSearch(); // 替换后刷新结果

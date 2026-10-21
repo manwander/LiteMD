@@ -154,6 +154,75 @@ fn decode_text(bytes: &[u8]) -> Result<String, String> {
     Err(UNKNOWN_ENCODING_ERR.to_string())
 }
 
+// 保存时保持原文件编码：否则用 UTF-8 写回 GBK/UTF-16 文件会让其他编辑器打开乱码。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextEncoding {
+    Utf8,
+    Utf8Bom,
+    Utf16Le,
+    Utf16Be,
+    Gbk,
+}
+
+fn detect_text_encoding(bytes: &[u8]) -> TextEncoding {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return TextEncoding::Utf8Bom;
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return TextEncoding::Utf16Le;
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return TextEncoding::Utf16Be;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return TextEncoding::Utf8;
+    }
+    if !GBK.decode(bytes).2 {
+        return TextEncoding::Gbk;
+    }
+    // 无法识别：按 UTF-8 写回，保持旧行为（内容仍是合法 UTF-8，不会被二次损坏）
+    TextEncoding::Utf8
+}
+
+fn encode_text(text: &str, enc: TextEncoding) -> Vec<u8> {
+    match enc {
+        TextEncoding::Utf8 => text.as_bytes().to_vec(),
+        TextEncoding::Utf8Bom => {
+            let mut out = Vec::with_capacity(text.len() + 3);
+            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
+        TextEncoding::Utf16Le => {
+            let mut out = Vec::with_capacity(text.len() * 2 + 2);
+            out.extend_from_slice(&[0xFF, 0xFE]);
+            for u in text.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out
+        }
+        TextEncoding::Utf16Be => {
+            let mut out = Vec::with_capacity(text.len() * 2 + 2);
+            out.extend_from_slice(&[0xFE, 0xFF]);
+            for u in text.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+            out
+        }
+        TextEncoding::Gbk => {
+            let (encoded, _, had_errors) = GBK.encode(text);
+            // 新内容含 GBK 无法表示的字符（如 emoji）：退回 UTF-8，避免写入替换符损坏内容
+            if had_errors { text.as_bytes().to_vec() } else { encoded.into_owned() }
+        }
+    }
+}
+
+/// 写入前探测既有文件的编码；文件不存在/无法读取时返回 None（按 UTF-8 写）。
+fn existing_encoding(path: &Path) -> Option<TextEncoding> {
+    let bytes = fs::read(path).ok()?;
+    Some(detect_text_encoding(&bytes))
+}
+
 // ---- 文件读写 ----
 // ---- 轻量前端崩溃日志：仅记录未捕获异常，供排障回传（平时无日志、不影响体验）----
 #[tauri::command]
@@ -184,8 +253,16 @@ fn log_frontend(line: String) {
     }
 }
 
+// 重 IO 命令统一走 spawn_blocking：同步命令会在 Tauri 主线程/事件循环上执行，
+// 大盘文件读写或大目录删除会冻结窗口（文件树、预览、输入全部卡住）。
 #[tauri::command]
-fn read_file(path: String) -> Result<String, String> {
+async fn read_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || read_file_sync(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn read_file_sync(path: String) -> Result<String, String> {
     let validated = validate_path(&path)?;
     // 多编码支持：UTF-8/UTF-16/GBK（见 decode_text）
     let bytes = fs::read(validated).map_err(|e| e.to_string())?;
@@ -193,16 +270,30 @@ fn read_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String) -> Result<(), String> {
+async fn write_file(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_file_sync(path, content))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn write_file_sync(path: String, content: String) -> Result<(), String> {
     let validated = validate_path(&path)?;
-    // 原子写盘：崩溃/磁盘满不会把原文件截断
-    atomic_write(&validated, content.as_bytes())
+    // 保持原文件编码（GBK/UTF-16 文档保存后仍可被原编辑器正确打开）；
+    // 新文件或编码无法识别时用 UTF-8。原子写盘：崩溃/磁盘满不会把原文件截断。
+    let enc = existing_encoding(&validated).unwrap_or(TextEncoding::Utf8);
+    atomic_write(&validated, &encode_text(&content, enc))
 }
 
 // 二进制读取（base64 返回）：供前端读取附件等非文本文件；max_bytes 夹在 1..=64MB，
 // 超过文件大小时明确报错，避免经 IPC 拉取巨量数据打爆内存。
 #[tauri::command]
-fn read_file_b64(path: String, max_bytes: usize) -> Result<String, String> {
+async fn read_file_b64(path: String, max_bytes: usize) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || read_file_b64_sync(path, max_bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn read_file_b64_sync(path: String, max_bytes: usize) -> Result<String, String> {
     use base64::Engine;
     let p = validate_path(&path)?;
     let max = max_bytes.clamp(1, 64 * 1024 * 1024);
@@ -268,17 +359,20 @@ async fn read_file_head(path: String, bytes: usize) -> Result<ReadHead, String> 
         if buf.starts_with(&[0xFF, 0xFE]) || buf.starts_with(&[0xFE, 0xFF]) {
             return Err("大文件分片仅支持 UTF-8 编码（检测到 UTF-16 BOM，请先转换为 UTF-8）".to_string());
         }
+        // UTF-8 BOM 与 read_file/decode_text 行为对齐：从正文中去掉，避免编辑器开头出现
+        // 不可见的 U+FEFF；head_bytes 仍计入 BOM，续读偏移才不会错位。
+        let skip = if buf.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
         // 严格校验头片字节：error_len() 为 Some 说明存在非法字节（非 UTF-8 文件）；
         // 为 None 说明只是尾部完整多字节字符被截断，回退到字符边界（utf8_boundary）。
-        let end = match std::str::from_utf8(&buf) {
-            Ok(_) => buf.len(),
-            Err(e) if e.error_len().is_none() => utf8_boundary(&buf),
+        let end = match std::str::from_utf8(&buf[skip..]) {
+            Ok(_) => buf.len() - skip,
+            Err(e) if e.error_len().is_none() => utf8_boundary(&buf[skip..]),
             Err(_) => {
                 return Err("大文件分片仅支持 UTF-8 编码（文件包含非法字节，请先转换为 UTF-8）".to_string())
             }
         };
-        let head = String::from_utf8(buf[..end].to_vec()).map_err(|e| e.to_string())?;
-        Ok(ReadHead { head, head_bytes: end as u64, total })
+        let head = String::from_utf8(buf[skip..skip + end].to_vec()).map_err(|e| e.to_string())?;
+        Ok(ReadHead { head, head_bytes: (skip + end) as u64, total })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -583,7 +677,15 @@ fn search_filenames_sync(
             if hidden && !show_hidden {
                 continue;
             }
-            if p.is_dir() {
+            // 不跟随符号链接：避免链接环递归，也避免搜索越出用户选择的根目录
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
                 walk(&p, q, show_hidden, limit, depth + 1, out);
             } else if name.to_lowercase().contains(q) {
                 out.push(p.to_string_lossy().to_string());
@@ -832,7 +934,13 @@ fn guard_deletable(path: &Path) -> Result<(), String> {
 /// 回收站不可用时（网络盘 / 部分 U 盘 / 权限受限）返回带 `TRASH_UNAVAILABLE:` 前缀的
 /// 错误，由前端识别并二次确认后，才允许调用 `delete_path_permanent` 永久删除。
 #[tauri::command]
-fn delete_path(path: String) -> Result<(), String> {
+async fn delete_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_path_sync(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn delete_path_sync(path: String) -> Result<(), String> {
     // H2 修复：删除前先经 validate_path 词法规范化并拒绝 .. 穿越（旧实现直接用裸路径）。
     let path = validate_path(&path)?;
     if !path.exists() {
@@ -844,7 +952,13 @@ fn delete_path(path: String) -> Result<(), String> {
 
 /// 永久删除（不可恢复）。仅在回收站不可用且用户二次确认后由前端调用。
 #[tauri::command]
-fn delete_path_permanent(path: String) -> Result<(), String> {
+async fn delete_path_permanent(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_path_permanent_sync(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn delete_path_permanent_sync(path: String) -> Result<(), String> {
     // H2 修复：同样先规范化并拒绝 .. 穿越，再做根/浅层守卫。
     let path = validate_path(&path)?;
     if !path.exists() {
@@ -858,17 +972,37 @@ fn delete_path_permanent(path: String) -> Result<(), String> {
     }
 }
 
-// 递归复制文件夹
+// 递归复制文件夹。
+// 安全：不跟随符号链接（目录链接成环会导致无限递归/栈溢出）；一旦遇到链接直接报错，
+// 让 move_path 在任何删除发生前中止，避免「复制不完整 + 删除源」造成数据丢失。
+// 深度上限是第二道防线（Windows junction 等 reparse point 未必被 file_type 识别为 symlink）。
+const MAX_COPY_DEPTH: usize = 64;
+
 fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    copy_dir_recursive_at(src, dest, 0)
+}
+
+fn copy_dir_recursive_at(src: &std::path::Path, dest: &std::path::Path, depth: usize) -> Result<(), String> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(format!("目录层级过深（>{MAX_COPY_DEPTH}），已中止复制：{}", src.display()));
+    }
     fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
         let s = entry.path();
         let d = dest.join(entry.file_name());
-        if s.is_dir() {
-            copy_dir_recursive(&s, &d)?;
-        } else {
+        let ft = entry.file_type().map_err(|e| format!("{}: {}", s.display(), e))?;
+        if ft.is_symlink() {
+            return Err(format!(
+                "目录包含符号链接，已拒绝递归复制（避免环路/复制不完整）：{}",
+                s.display()
+            ));
+        }
+        if ft.is_dir() {
+            copy_dir_recursive_at(&s, &d, depth + 1)?;
+        } else if ft.is_file() {
             fs::copy(&s, &d).map_err(|e| e.to_string())?;
         }
+        // 其它类型（设备/管道等）跳过
     }
     Ok(())
 }
@@ -892,7 +1026,13 @@ fn guard_not_into_self(src: &std::path::Path, dest_dir: &str) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn move_path(src: String, dest_dir: String) -> Result<String, String> {
+async fn move_path(src: String, dest_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || move_path_sync(src, dest_dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn move_path_sync(src: String, dest_dir: String) -> Result<String, String> {
     // 安全：源与目标目录均过路径校验，与 read/write 一致，杜绝 ../ 穿越
     let src = validate_path(&src)?;
     let dest_dir_s = validate_path(&dest_dir)?.to_string_lossy().to_string();
@@ -902,28 +1042,35 @@ fn move_path(src: String, dest_dir: String) -> Result<String, String> {
     guard_not_into_self(&src, &dest_dir_s)?;
     let dest = resolve_dest(&src, &dest_dir_s)?;
     // 同盘 rename 最快；跨盘符会失败，退回「复制 + 删除」。
-    // 注意：copy 成功但 remove 失败会留下两份内容，必须把 dest 回滚并把错误抛给前端。
+    // 删除源失败时源目录可能已被部分删除，此时绝不能删 dest：那会让两边都不完整。
+    // 保留目标副本并把「部分完成」如实报告给前端，由用户决定重试删除或清理源。
     match fs::rename(&src, &dest) {
         Ok(()) => Ok(dest.to_string_lossy().to_string()),
         Err(_) => {
             if src.is_dir() {
-                copy_dir_recursive(&src, &dest)?;
+                if let Err(e) = copy_dir_recursive(&src, &dest) {
+                    // 复制不完整：清掉半成品目标，源保持原样
+                    let _ = fs::remove_dir_all(&dest);
+                    return Err(e);
+                }
                 if let Err(e) = fs::remove_dir_all(&src) {
-                    // ISSUE-012 修复：回滚失败时记录日志，便于排查数据不一致
-                    if let Err(re) = fs::remove_dir_all(&dest) {
-                        eprintln!("[move_path] 回滚失败: src={}, dest={}, 删除源失败: {}, 回滚dest失败: {}",
-                            src.display(), dest.display(), e, re);
-                    }
-                    return Err(format!("已复制到目标，但删除源失败：{}", e));
+                    return Err(format!(
+                        "已复制到目标，但删除源目录失败：{}。目标副本已保留：{}，请手动清理源或重试。",
+                        e,
+                        dest.display()
+                    ));
                 }
             } else {
-                fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+                if let Err(e) = fs::copy(&src, &dest) {
+                    let _ = fs::remove_file(&dest);
+                    return Err(e.to_string());
+                }
                 if let Err(e) = fs::remove_file(&src) {
-                    if let Err(re) = fs::remove_file(&dest) {
-                        eprintln!("[move_path] 回滚失败: src={}, dest={}, 删除源失败: {}, 回滚dest失败: {}",
-                            src.display(), dest.display(), e, re);
-                    }
-                    return Err(format!("已复制到目标，但删除源失败：{}", e));
+                    return Err(format!(
+                        "已复制到目标，但删除源文件失败：{}。目标副本已保留：{}，请手动清理源或重试。",
+                        e,
+                        dest.display()
+                    ));
                 }
             }
             Ok(dest.to_string_lossy().to_string())
@@ -932,7 +1079,13 @@ fn move_path(src: String, dest_dir: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn copy_path(src: String, dest_dir: String) -> Result<String, String> {
+async fn copy_path(src: String, dest_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || copy_path_sync(src, dest_dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn copy_path_sync(src: String, dest_dir: String) -> Result<String, String> {
     // 安全：源与目标目录均过路径校验，与 read/write 一致，杜绝 ../ 穿越
     let src = validate_path(&src)?;
     let dest_dir_s = validate_path(&dest_dir)?.to_string_lossy().to_string();
@@ -942,9 +1095,15 @@ fn copy_path(src: String, dest_dir: String) -> Result<String, String> {
     guard_not_into_self(&src, &dest_dir_s)?;
     let dest = resolve_dest(&src, &dest_dir_s)?;
     if src.is_dir() {
-        copy_dir_recursive(&src, &dest)?;
+        if let Err(e) = copy_dir_recursive(&src, &dest) {
+            let _ = fs::remove_dir_all(&dest);
+            return Err(e);
+        }
     } else {
-        fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+        if let Err(e) = fs::copy(&src, &dest) {
+            let _ = fs::remove_file(&dest);
+            return Err(e.to_string());
+        }
     }
     Ok(dest.to_string_lossy().to_string())
 }
@@ -1284,16 +1443,33 @@ async fn import_asset_raw(request: tauri::ipc::Request<'_>) -> Result<String, St
 }
 
 // ---- 递归列出文件夹下所有 .md 文件路径（用于整夹批量迁移）----
+// 不跟随符号链接（成环会无限递归），并设深度上限兜底 junction/reparse point。
+const MAX_SCAN_DEPTH: usize = 64;
+
 fn collect_md_paths(dir: &std::path::Path, out: &mut Vec<String>) {
+    collect_md_paths_at(dir, out, 0);
+}
+
+fn collect_md_paths_at(dir: &std::path::Path, out: &mut Vec<String>, depth: usize) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_dir() {
-            collect_md_paths(&p, out);
-        } else if is_md_ext(&p) {
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_md_paths_at(&p, out, depth + 1);
+        } else if ft.is_file() && is_md_ext(&p) {
             out.push(p.to_string_lossy().to_string());
         }
     }
@@ -1335,9 +1511,12 @@ struct FolderSearchResult {
 const SEARCH_MAX: usize = 2000;
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct FolderReplaceResult {
     files_changed: usize,
     count: usize,
+    /// 因过大/编码无法识别而被跳过的文件数（前端明确提示，避免「替换成功」假象）
+    skipped: usize,
 }
 
 // 字节级 ASCII 大小写折叠查找（非 ASCII 字节要求精确相等，中文不受影响），
@@ -1427,9 +1606,10 @@ fn search_in_folder_sync(folder: String, query: String, case_sensitive: bool) ->
         if size > 32 * 1024 * 1024 {
             continue;
         }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        // 多编码：GBK/UTF-16 文档同样可被搜索（此前只读 UTF-8，直接跳过）
+        let content = match fs::read(&path).ok().and_then(|b| decode_text(&b).ok()) {
+            Some(c) => c,
+            None => continue,
         };
         for (i, line) in content.lines().enumerate() {
             let hit = if case_sensitive {
@@ -1477,7 +1657,7 @@ fn replace_in_folder_sync(
     case_sensitive: bool,
 ) -> Result<FolderReplaceResult, String> {
     if query.is_empty() {
-        return Ok(FolderReplaceResult { files_changed: 0, count: 0 });
+        return Ok(FolderReplaceResult { files_changed: 0, count: 0, skipped: 0 });
     }
     let root = PathBuf::from(&folder);
     if !root.is_dir() {
@@ -1487,10 +1667,11 @@ fn replace_in_folder_sync(
     collect_md_paths(&root, &mut files);
 
     // 原子回滚：先将所有目标文件 copy 为 .bak（保留原件直至替换成功），全部成功后统一删除 bak。
-    // 任意一步失败则从 bak 恢复全部已修改的文件，并一并清理 .bak，绝不残留备份文件。
+    // 任意一步失败则从 bak 恢复已修改的文件；恢复失败时保留 .bak 并在错误里给出路径。
     let mut bak_paths: Vec<(PathBuf, PathBuf)> = Vec::new(); // (orig, bak)
     let mut files_changed = 0usize;
     let mut total = 0usize;
+    let mut skipped = 0usize;
 
     // 备份文件名唯一：旧的固定 `<name>.md.bak` 在两次替换并发/上次残留时会互相覆盖
     let unique_bak = |path: &Path| -> PathBuf {
@@ -1511,6 +1692,7 @@ fn replace_in_folder_sync(
     for path in &files {
         if let Ok(m) = fs::metadata(path) {
             if m.len() > MAX_REPLACE_FILE {
+                skipped += 1;
                 continue;
             }
         }
@@ -1525,23 +1707,66 @@ fn replace_in_folder_sync(
         bak_paths.push((PathBuf::from(path), bak_path));
     }
 
-    // 第二步：执行替换
-    for (orig, _bak) in &bak_paths {
-        let content = match fs::read_to_string(orig) {
+    // 第二步：执行替换（解码/编码均保持原文件编码）
+    let mut written: Vec<usize> = Vec::new();
+    for (idx, (orig, _bak)) in bak_paths.iter().enumerate() {
+        let bytes = match fs::read(orig) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let content = match decode_text(&bytes) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         let (new_text, count) = replace_literal(&content, &query, &replacement, case_sensitive);
         if count > 0 {
-            if let Err(e) = atomic_write(orig, new_text.as_bytes()) {
-                // 写入失败：全部从 bak 恢复，并清理所有 .bak（D-6：不留残留备份）
-                for (o, b) in &bak_paths {
+            let enc = detect_text_encoding(&bytes);
+            if let Err(e) = atomic_write(orig, &encode_text(&new_text, enc)) {
+                // 写入失败：从 bak 恢复已修改文件；只有恢复成功才删除对应 .bak，
+                // 恢复失败必须保留备份并把路径报告给用户（绝不静默丢数据）
+                let mut restore_failures: Vec<String> = Vec::new();
+                for &w in &written {
+                    let (o, b) = &bak_paths[w];
                     // 直接覆盖复制（copy 会截断目标），避免先删后复制失败导致原件彻底丢失
-                    let _ = fs::copy(b, o);
-                    let _ = fs::remove_file(b);
+                    match fs::copy(b, o) {
+                        Ok(_) => {
+                            let _ = fs::remove_file(b);
+                        }
+                        Err(re) => restore_failures.push(format!(
+                            "{}（备份已保留：{}）：{}",
+                            o.display(),
+                            b.display(),
+                            re
+                        )),
+                    }
                 }
-                return Err(format!("写入文件 {} 失败：{}（已回滚至替换前状态）", orig.display(), e));
+                // 尚未写入的文件无需恢复，直接清理其备份
+                for (i, (_o, b)) in bak_paths.iter().enumerate() {
+                    if !written.contains(&i) {
+                        let _ = fs::remove_file(b);
+                    }
+                }
+                if restore_failures.is_empty() {
+                    return Err(format!(
+                        "写入文件 {} 失败：{}（已回滚至替换前状态）",
+                        orig.display(),
+                        e
+                    ));
+                }
+                return Err(format!(
+                    "写入文件 {} 失败：{}；以下文件回滚失败，备份已保留：{}",
+                    orig.display(),
+                    e,
+                    restore_failures.join("；")
+                ));
             }
+            written.push(idx);
             files_changed += 1;
             total += count;
         }
@@ -1552,25 +1777,50 @@ fn replace_in_folder_sync(
         let _ = fs::remove_file(bak);
     }
 
-    Ok(FolderReplaceResult { files_changed, count: total })
+    Ok(FolderReplaceResult { files_changed, count: total, skipped })
 }
 
-// 递归收集 dir 下所有 .md 的文本内容（用于孤儿引用检测）
-fn collect_md_contents(dir: &std::path::Path, out: &mut Vec<String>) {
+// 递归收集 dir 下所有 .md 的文本内容（用于孤儿引用检测）。
+// 返回值：true=全部笔记都成功读取并解码；false=存在不可读/不可解码的笔记（或深度截断），
+// 此时「引用集合」必然不完整，调用方必须放弃本轮孤儿判定，否则会把仍被引用的附件当孤儿。
+fn collect_md_contents(dir: &std::path::Path, out: &mut Vec<String>) -> bool {
+    collect_md_contents_at(dir, out, 0)
+}
+
+fn collect_md_contents_at(dir: &std::path::Path, out: &mut Vec<String>, depth: usize) -> bool {
+    if depth > MAX_SCAN_DEPTH {
+        return false;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return false,
     };
+    let mut complete = true;
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_dir() {
-            collect_md_contents(&p, out);
-        } else if is_md_ext(&p) {
-            if let Ok(c) = fs::read_to_string(&p) {
-                out.push(c);
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if !collect_md_contents_at(&p, out, depth + 1) {
+                complete = false;
+            }
+        } else if ft.is_file() && is_md_ext(&p) {
+            // 多编码：GBK/UTF-16 笔记中的引用必须参与判定，否则其附件会被误判为孤儿
+            match fs::read(&p).ok().and_then(|b| decode_text(&b).ok()) {
+                Some(c) => out.push(c),
+                None => complete = false,
             }
         }
     }
+    complete
 }
 
 // ---- 孤儿附件清理：递归遍历目录下每一处附件文件夹，删除未被任何 .md 引用的文件 ----
@@ -1585,7 +1835,13 @@ fn collect_md_contents(dir: &std::path::Path, out: &mut Vec<String>) {
 // 由前端 tauri://drag-drop 事件触发；仅在 dragDropEnabled=true 时可用（Windows 平台限制：
 // 原生 OLE 拖拽处理器与 WebView 内部 HTML5 拖拽互斥，内拖已改用 Pointer Events 规避）。
 #[tauri::command]
-fn import_files(src_paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, String> {
+async fn import_files(src_paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || import_files_sync(src_paths, dest_dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn import_files_sync(src_paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, String> {
     let dest = validate_path(&dest_dir).map_err(|e| e.to_string())?;
     if !dest.is_dir() {
         return Err(format!("目标不是文件夹: {}", dest.to_string_lossy()));
@@ -1674,16 +1930,35 @@ fn collect_orphans_recursive(
     assets_name: &str,
     orphans: &mut Vec<String>,
 ) {
-    // 当前目录下若存在附件文件夹，则以 dir 下的 .md 为引用依据收集一轮
+    collect_orphans_recursive_at(root, dir, assets_name, orphans, 0);
+}
+
+fn collect_orphans_recursive_at(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    assets_name: &str,
+    orphans: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    // 当前目录下若存在附件文件夹，则以 dir 下的 .md 为引用依据收集一轮。
+    // 附件文件夹本身是符号链接时跳过：否则会把根目录之外的附件当成孤儿列出。
     let assets_dir = dir.join(assets_name);
-    if assets_dir.is_dir() {
+    let assets_is_real_dir = fs::symlink_metadata(&assets_dir)
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if assets_is_real_dir {
         // 精确匹配文件名在 Markdown 图片引用或 HTML img src 中是否出现。
         // 模式：`assets_name/file.ext` 或 `assets_name\file.ext`，斜杠反斜杠均匹配。
         // Markdown:  ![alt](assets_name/file.ext)  — 用 r##...## 包裹含引号的正则
         // HTML:      <img src="assets_name/file.ext"> — 同上
         let assets_escaped = regex::escape(assets_name);
         let mut md_contents: Vec<String> = Vec::new();
-        collect_md_contents(dir, &mut md_contents);
+        // 引用扫描不完整时（笔记不可读/编码无法识别/深度截断）绝不能输出孤儿：
+        // 漏读的引用会让仍在使用中的附件被误删。
+        let scan_complete = collect_md_contents(dir, &mut md_contents);
         let all_content = md_contents.join("\n");
 
         if let Ok(entries) = fs::read_dir(&assets_dir) {
@@ -1707,7 +1982,7 @@ fn collect_orphans_recursive(
                     all_content.contains(&ref_slash) || all_content.contains(&ref_back)
                 };
                 // 仅收集未引用项；删除由 cleanup_orphans_with 负责（绝对不在此处 remove_file）
-                if !truly_referenced {
+                if scan_complete && !truly_referenced {
                     let rel = p
                         .strip_prefix(root)
                         .map(|r| r.to_string_lossy().replace('\\', "/"))
@@ -1717,12 +1992,19 @@ fn collect_orphans_recursive(
             }
         }
     }
-    // 递归进入子目录（跳过附件文件夹本身）
+    // 递归进入子目录（跳过附件文件夹本身与符号链接）
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() && p.file_name().and_then(|n| n.to_str()) != Some(assets_name) {
-                collect_orphans_recursive(root, &p, assets_name, orphans);
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() && p.file_name().and_then(|n| n.to_str()) != Some(assets_name) {
+                collect_orphans_recursive_at(root, &p, assets_name, orphans, depth + 1);
             }
         }
     }
@@ -1730,7 +2012,13 @@ fn collect_orphans_recursive(
 
 // ---- 导出 HTML（前端已拼好完整文档，这里只负责落盘）----
 #[tauri::command]
-fn export_html(path: String, html: String) -> Result<(), String> {
+async fn export_html(path: String, html: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || export_html_sync(path, html))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn export_html_sync(path: String, html: String) -> Result<(), String> {
     // 安全：导出写盘必须过路径校验，与 write_file 一致（Q-14）
     let path = validate_path(&path)?;
     atomic_write(&path, html.as_bytes())
@@ -1882,16 +2170,23 @@ impl PdfLayout {
         self.baseline += line_h;
     }
 
-    fn save(self, path: &str) -> Result<(), String> {
-        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        self.doc
-            .save(&mut std::io::BufWriter::new(file))
-            .map_err(|e| e.to_string())
+    fn save(self, path: &Path) -> Result<(), String> {
+        // 先完整生成到内存，再走 atomic_write：避免写到一半失败/崩溃把已有的同名 PDF
+        // 截断成损坏文件（与 write_file / 导出 HTML 的落盘语义一致）。
+        let mut buf: Vec<u8> = Vec::new();
+        self.doc.save(&mut buf).map_err(|e| e.to_string())?;
+        atomic_write(path, &buf)
     }
 }
 
 #[tauri::command]
-fn export_pdf(path: String, markdown: String) -> Result<(), String> {
+async fn export_pdf(path: String, markdown: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || export_pdf_sync(path, markdown))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn export_pdf_sync(path: String, markdown: String) -> Result<(), String> {
     // 安全：导出写盘必须过路径校验（Q-14）
     let path = validate_path(&path)?;
     let font = get_cjk_font().ok_or_else(|| "未找到可用的中文字体（如微软雅黑/黑体）".to_string())?;
@@ -2109,7 +2404,7 @@ fn export_pdf(path: String, markdown: String) -> Result<(), String> {
     }
     flush(&mut lt, &style, &mut buf, skip_depth);
 
-    lt.save(&path.to_string_lossy())
+    lt.save(&path)
 }
 
 // ---- 导出「自包含 Markdown」：把文档内本地图片内嵌为 base64 data URI，输出单文件 .md ----
@@ -2130,7 +2425,13 @@ struct BundleStats {
     embedded: usize,
     failed: usize,
     skipped: usize,
+    /// 已内嵌图片的原始字节总数（限制导出文件体积，防止把内存/IPC 打爆）
+    embedded_bytes: u64,
 }
+
+/// 单张图片上限 20MB；整篇累计原始字节上限 96MB（base64 后约 128MB）
+const MAX_EMBED_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_EMBED_TOTAL_BYTES: u64 = 96 * 1024 * 1024;
 
 /// 由扩展名推断 MIME（base64 data URI 的媒体类型）
 fn mime_for_ext(ext: &str) -> &'static str {
@@ -2194,32 +2495,30 @@ fn is_external_ref(url: &str) -> bool {
     false
 }
 
-/// 把引用解析为绝对路径（相对 base_dir 拼接；绝对路径原样），并词法归一化（消解 .. / .）。
-/// 归一化后路径为空（如纯 ".." 逃逸）返回 None，调用方按失败处理。
+/// 把引用解析为绝对路径，并限制在笔记目录内。
+/// 安全：绝对路径、盘符相对路径、`..` 越界、符号链接/junction 逃逸一律拒绝——
+/// 导出的自包含文件可能被分享，绝不能把目录外的任意文件 base64 进去。
 fn resolve_image_path(ref_url: &str, base_dir: &Path) -> Option<PathBuf> {
     let u = ref_url.trim();
-    let p = PathBuf::from(u);
-    let abs = if p.is_absolute() {
-        p
-    } else {
-        base_dir.join(u)
-    };
-    let mut norm = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                if !norm.pop() {
-                    return None;
-                }
-            }
-            std::path::Component::CurDir => {}
-            other => norm.push(other.as_os_str()),
-        }
-    }
-    if norm.as_os_str().is_empty() {
+    if u.is_empty() {
         return None;
     }
-    Some(norm)
+    // URL 形态（http/data/file/...）交给 is_external_ref 处理；这里只接受相对文件路径
+    if u.starts_with('/') || u.starts_with('\\') || Path::new(u).is_absolute() {
+        return None;
+    }
+    // Windows 盘符相对路径（C:foo）既不是绝对路径也能跳出 base_dir
+    let b = u.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return None;
+    }
+    let base = base_dir.canonicalize().ok()?;
+    // canonicalize 同时消解 `..`、符号链接与 junction，且要求文件真实存在
+    let real = base.join(u).canonicalize().ok()?;
+    if !real.starts_with(&base) {
+        return None;
+    }
+    Some(real)
 }
 
 /// 尝试内嵌单个图片引用：本地文件存在则读字节并 base64；否则返回 None（保留原引用）。
@@ -2235,6 +2534,28 @@ fn embed_one(url: &str, base_dir: &Path, stats: &mut BundleStats) -> Option<Stri
             return None;
         }
     };
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = mime_for_ext(&ext);
+    // 只内嵌真正的图片：恶意/误写的 `![](../../secret.env)` 不得被读入并 base64 进导出件
+    if mime == "application/octet-stream" {
+        stats.failed += 1;
+        return None;
+    }
+    let len = match fs::metadata(&path) {
+        Ok(m) if m.is_file() => m.len(),
+        _ => {
+            stats.failed += 1;
+            return None;
+        }
+    };
+    if len > MAX_EMBED_FILE_BYTES || stats.embedded_bytes.saturating_add(len) > MAX_EMBED_TOTAL_BYTES {
+        stats.failed += 1;
+        return None;
+    }
     let bytes = match fs::read(&path) {
         Ok(b) => b,
         Err(_) => {
@@ -2242,15 +2563,10 @@ fn embed_one(url: &str, base_dir: &Path, stats: &mut BundleStats) -> Option<Stri
             return None;
         }
     };
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let mime = mime_for_ext(&ext);
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     stats.embedded += 1;
+    stats.embedded_bytes = stats.embedded_bytes.saturating_add(bytes.len() as u64);
     Some(format!("data:{};base64,{}", mime, b64))
 }
 
@@ -2263,6 +2579,43 @@ fn extract_img_url(inner: &str) -> String {
         }
     }
     s.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// 围栏代码块（``` / ~~~）的字节区间：其中的 `![x](...)` 是示例代码，不能被改写。
+fn fenced_code_ranges(markdown: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    // (起始字节, 围栏字符, 围栏长度)
+    let mut open: Option<(usize, char, usize)> = None;
+    let mut offset = 0usize;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(c) = trimmed.chars().next() {
+            if c == '`' || c == '~' {
+                let count = trimmed.chars().take_while(|&x| x == c).count();
+                if count >= 3 {
+                    match open {
+                        None => open = Some((offset, c, count)),
+                        Some((start, oc, olen)) => {
+                            // 闭合围栏：同字符、长度不短于开启、其后只有空白
+                            if c == oc && count >= olen && trimmed[count..].trim().is_empty() {
+                                ranges.push((start, offset + line.len()));
+                                open = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        offset += line.len();
+    }
+    if let Some((start, _, _)) = open {
+        ranges.push((start, markdown.len()));
+    }
+    ranges
+}
+
+fn in_ranges(ranges: &[(usize, usize)], pos: usize) -> bool {
+    ranges.iter().any(|&(s, e)| pos >= s && pos < e)
 }
 
 /// 纯函数：把 markdown 文本中所有本地图片引用内嵌为 base64 data URI，返回新文本。
@@ -2279,10 +2632,15 @@ fn bundle_markdown_sync(markdown: &str, base_dir: &Path, stats: &mut BundleStats
     }
 
     // 2) 行内图片 ![alt](url) / ![alt](url "标题") / ![alt](<url>)
+    // 围栏代码块内是示例代码，原样保留（每次 pass 后文本长度会变，故按当前文本重算区间）
+    let fenced = fenced_code_ranges(&out);
     let img_re = Regex::new(r"!\[([^\]]*)\]\(([^)]*)\)").unwrap();
     out = img_re
         .replace_all(&out, |c: &regex::Captures| {
             let full = c.get(0).unwrap().as_str();
+            if in_ranges(&fenced, c.get(0).unwrap().start()) {
+                return full.to_string();
+            }
             let alt = &c[1];
             let url = extract_img_url(&c[2]);
             if let Some(data) = embed_one(&url, base_dir, stats) {
@@ -2294,10 +2652,14 @@ fn bundle_markdown_sync(markdown: &str, base_dir: &Path, stats: &mut BundleStats
         .to_string();
 
     // 3) 引用式图片 ![alt][id] / ![alt][]（id 省略时取 alt 作 id）
+    let fenced = fenced_code_ranges(&out);
     let refimg_re = Regex::new(r"!\[([^\]]*)\]\[([^\]]*)\]").unwrap();
     out = refimg_re
         .replace_all(&out, |c: &regex::Captures| {
             let full = c.get(0).unwrap().as_str();
+            if in_ranges(&fenced, c.get(0).unwrap().start()) {
+                return full.to_string();
+            }
             let alt = &c[1];
             let id_raw = &c[2];
             let id = if id_raw.is_empty() {
@@ -2318,11 +2680,15 @@ fn bundle_markdown_sync(markdown: &str, base_dir: &Path, stats: &mut BundleStats
         .to_string();
 
     // 4) HTML <img src="..."> / <img src='...'>
+    let fenced = fenced_code_ranges(&out);
     let html_re =
         Regex::new(r#"(?i)<img\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>"#).unwrap();
     out = html_re
         .replace_all(&out, |c: &regex::Captures| {
             let full = c.get(0).unwrap().as_str();
+            if in_ranges(&fenced, c.get(0).unwrap().start()) {
+                return full.to_string();
+            }
             let before = &c[1];
             let q = &c[2];
             let url = &c[3];
@@ -2339,7 +2705,19 @@ fn bundle_markdown_sync(markdown: &str, base_dir: &Path, stats: &mut BundleStats
 }
 
 #[tauri::command]
-fn export_bundled_markdown(
+async fn export_bundled_markdown(
+    save_path: String,
+    markdown: String,
+    base_dir: String,
+) -> Result<BundleResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_bundled_markdown_sync(save_path, markdown, base_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn export_bundled_markdown_sync(
     save_path: String,
     markdown: String,
     base_dir: String,
@@ -2350,6 +2728,7 @@ fn export_bundled_markdown(
         embedded: 0,
         failed: 0,
         skipped: 0,
+        embedded_bytes: 0,
     };
     let bundled = bundle_markdown_sync(&markdown, &base, &mut stats);
     atomic_write(&save, bundled.as_bytes())?;
@@ -2738,7 +3117,7 @@ mod tests {
         let existing = dir.join("note.md");
         let _ = fs::write(&existing, "keep");
 
-        let imported = import_files(
+        let imported = import_files_sync(
             vec![src.join("note.md").to_string_lossy().to_string()],
             dir.to_string_lossy().to_string(),
         )

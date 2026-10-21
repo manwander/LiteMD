@@ -69,23 +69,29 @@ describe("图片 Worker 请求/响应契约（C-1 / H2 FIFO 关联）", () => {
     const w = FakeWorker.last!;
     expect(w.posted[0]).toMatchObject({ blob });
     expect(w.posted[0].opts).toBeDefined();
+    expect(typeof w.posted[0].id).toBe("number");
     // 关键断言：Worker 端读 e.data.opts.maxEdge —— 必须拿得到有限值（C-1 回归）
     expect(Number.isFinite(w.posted[0].opts.maxEdge)).toBe(true);
     expect(w.posted[0].opts.maxEdge).toBe(1600);
-    w.emit("message", { data: { bytes: new Uint8Array([1, 2, 3]), format: "png", width: 10, height: 20 } });
+    w.emit("message", {
+      data: { id: w.posted[0].id, bytes: new Uint8Array([1, 2, 3]), format: "png", width: 10, height: 20 },
+    });
     const res = await p;
     expect(res.width).toBe(10);
   });
 
-  it("并发两请求按 FIFO 各拿回自己的字节（H2 关联修复）", async () => {
+  it("并发请求乱序回信时按 id 各拿回自己的字节（S9 关联修复）", async () => {
     const { processImageInWorker } = await freshClient();
     const a = processImageInWorker({ size: 1 } as unknown as Blob, { maxEdge: 100, quality: 1, lossless: true, format: "png" });
     const b = processImageInWorker({ size: 2 } as unknown as Blob, { maxEdge: 200, quality: 1, lossless: true, format: "png" });
     const fw = FakeWorker.last!;
     expect(fw.posted.length).toBe(2);
-    // 按序回信：先回 a 的结果（bytes=[7]），再回 b 的结果（bytes=[9]）
-    fw.emit("message", { data: { bytes: new Uint8Array([7]), format: "png", width: 1, height: 1 } });
-    fw.emit("message", { data: { bytes: new Uint8Array([9]), format: "png", width: 1, height: 1 } });
+    const idA = fw.posted[0].id;
+    const idB = fw.posted[1].id;
+    expect(idA).not.toBe(idB);
+    // 故意逆序回信：后发的 b 先完成（Worker 内异步处理，顺序无保证）
+    fw.emit("message", { data: { id: idB, bytes: new Uint8Array([9]), format: "png", width: 1, height: 1 } });
+    fw.emit("message", { data: { id: idA, bytes: new Uint8Array([7]), format: "png", width: 1, height: 1 } });
     const [ra, rb] = await Promise.all([a, b]);
     expect(Array.from(ra.bytes)).toEqual([7]);
     expect(Array.from(rb.bytes)).toEqual([9]);
@@ -95,8 +101,18 @@ describe("图片 Worker 请求/响应契约（C-1 / H2 FIFO 关联）", () => {
     const { processImageInWorker } = await freshClient();
     const p = processImageInWorker({ size: 1 } as unknown as Blob, { maxEdge: 1000, quality: 1, lossless: true, format: "png" });
     const w = FakeWorker.last!;
-    w.emit("message", { data: { error: "boom" } });
+    w.emit("message", { data: { id: w.posted[0].id, error: "boom" } });
     await expect(p).rejects.toThrow("boom");
+  });
+
+  it("未知 id 的迟到响应被忽略，不影响在途请求", async () => {
+    const { processImageInWorker } = await freshClient();
+    const p = processImageInWorker({ size: 1 } as unknown as Blob, { maxEdge: 1000, quality: 1, lossless: true, format: "png" });
+    const w = FakeWorker.last!;
+    w.emit("message", { data: { id: 999999, bytes: new Uint8Array([5]), format: "png", width: 1, height: 1 } });
+    w.emit("message", { data: { id: w.posted[0].id, bytes: new Uint8Array([6]), format: "png", width: 1, height: 1 } });
+    const res = await p;
+    expect(Array.from(res.bytes)).toEqual([6]);
   });
 });
 

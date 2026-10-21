@@ -15,6 +15,49 @@ function resolveNodeKey(nodeMap: Map<string, FileTreeNode>, path: string): strin
   return null;
 }
 
+/** 每个 (store, 目录) 的加载代际：只有最后发起的 listDir 结果允许落地。
+ *  否则「手动刷新 / watcher 刷新 / 展开加载」交错时，先发后到的旧结果会覆盖新结果
+ *  （例如外部删除文件后，旧枚举把已删除项复活）。 */
+const loadEpochs = new WeakMap<TreeStore, Map<string, number>>();
+
+function beginLoad(store: TreeStore, path: string): number {
+  let m = loadEpochs.get(store);
+  if (!m) {
+    m = new Map();
+    loadEpochs.set(store, m);
+  }
+  const next = (m.get(path) ?? 0) + 1;
+  m.set(path, next);
+  return next;
+}
+
+function isLatestLoad(store: TreeStore, path: string, epoch: number): boolean {
+  return loadEpochs.get(store)?.get(path) === epoch;
+}
+
+/** 路径 p 是否等于 root 或位于其下 */
+function isSameOrUnder(p: string, root: string): boolean {
+  const np = normPath(p);
+  const nr = normPath(root);
+  return np === nr || np.startsWith(nr + "/");
+}
+
+/** 删除某路径及其整棵子树的缓存（nodeMap + loadState） */
+function deleteSubtree(store: TreeStore, path: string): void {
+  const np = normPath(path);
+  store.mutate((st) => {
+    const nodeMap = new Map(st.nodeMap);
+    const loadState = new Map(st.loadState);
+    for (const k of Array.from(nodeMap.keys())) {
+      if (isSameOrUnder(k, np)) nodeMap.delete(k);
+    }
+    for (const k of Array.from(loadState.keys())) {
+      if (isSameOrUnder(k, np)) loadState.delete(k);
+    }
+    return { ...st, nodeMap, loadState };
+  });
+}
+
 /** 从 listDir 原始结果构造 files / children。
  * 合并旧节点中的「乐观子节点」——这些节点由新建/移动乐观插入、尚在 Windows 通知延迟窗口内
  * 未被 listDir 枚举到；若不保留，watcher 的 reloadFolder 会把刚新建的项覆盖掉（B-01）。 */
@@ -85,10 +128,12 @@ export async function loadFolderNode(
   const ls = store.get().loadState.get(np);
   if (!force && ls?.loading) return;
 
+  const epoch = beginLoad(store, np);
   store.setLoadState(np, { loading: true, error: null });
 
   try {
     const rawItems = await listDir(np, showHidden);
+    if (!isLatestLoad(store, np, epoch)) return; // 已有更新的加载请求，丢弃本次结果
     const { files, children } = buildNodeContent(store, np, rawItems);
 
     store.mutate((st) => {
@@ -110,6 +155,7 @@ export async function loadFolderNode(
       };
     });
   } catch (e) {
+    if (!isLatestLoad(store, np, epoch)) return; // 旧请求的失败同样不得覆盖新状态
     store.mutate((st) => {
       const nodeMap = new Map(st.nodeMap);
       if (!nodeMap.has(np)) {
@@ -140,18 +186,34 @@ export async function refreshFolderOf(store: TreeStore, path: string, showHidden
   await reloadFolder(store, parent, showHidden);
 }
 
-/** 刷新整个树：重置缓存并重新列举所有根层 */
+/** 刷新整个树：清空缓存后重新列举所有根层，并重载此前已展开的各级目录。
+ *  旧实现只重载根层，二级及以下已加载目录继续显示陈旧内容（外部新增/删除不可见）。 */
 export async function refreshTree(store: TreeStore, showHidden: boolean): Promise<void> {
-  const roots = store.get().rootPaths;
+  const s0 = store.get();
+  const roots = [...s0.rootPaths];
   if (!roots.length) return;
+  // 先快照「当前已加载」的目录（含根），按路径长度升序保证父目录先于子目录重载
+  const loadedBefore = [...new Set([
+    ...roots.map(normPath),
+    ...[...s0.nodeMap.entries()].filter(([, n]) => n.loaded).map(([p]) => normPath(p)),
+  ])].sort((a, b) => a.length - b.length);
+
   store.clearLoadState();
+  // 删除所有根下的节点缓存：彻底丢弃磁盘上已不存在的目录，避免刷新后仍残留旧节点
+  store.mutate((st) => {
+    const nodeMap = new Map(st.nodeMap);
+    for (const k of Array.from(nodeMap.keys())) {
+      if (roots.some((r) => isSameOrUnder(k, r))) nodeMap.delete(k);
+    }
+    return { ...st, nodeMap };
+  });
+
   const removedRoots: string[] = [];
   for (const rp of roots) {
-    store.deleteNode(rp);
-    await loadFolderNode(store, rp, showHidden);
+    await loadFolderNode(store, normPath(rp), showHidden);
     const s = store.get();
-    const node = s.nodeMap.get(rp);
-    const ls = s.loadState.get(rp);
+    const node = s.nodeMap.get(normPath(rp));
+    const ls = s.loadState.get(normPath(rp));
     if (node && !node.loaded && ls?.error) {
       removedRoots.push(rp);
     }
@@ -160,18 +222,28 @@ export async function refreshTree(store: TreeStore, showHidden: boolean): Promis
     const s = store.get();
     store.setRoots(s.rootPaths.filter((p) => !removedRoots.includes(p)));
   }
+  // 重载此前已加载的非根目录：父目录按序恢复出子节点壳后，若该路径仍在树中则重载其内容
+  for (const p of loadedBefore) {
+    if (roots.some((r) => normPath(r) === p)) continue;
+    if (removedRoots.some((r) => normPath(r) === p)) continue;
+    const st = store.get();
+    if (!isPathInTree(st, p)) continue;
+    await loadFolderNode(store, p, showHidden);
+  }
 }
 
 /** 重新列举所有已加载层级（含根）——「显示隐藏项」切换后让显隐立即生效 */
 export async function reloadAllLoaded(store: TreeStore, showHidden: boolean): Promise<void> {
   const s = store.get();
-  const loaded = [...s.rootPaths];
-  for (const p of s.nodeMap.keys()) {
-    if (s.nodeMap.get(p)?.loaded && !s.rootPaths.includes(p)) loaded.push(p);
-  }
+  // 父目录先于子目录加载；不再预先 deleteNode——加载失败时保留旧内容比清空更安全
+  const loaded = [...new Set([
+    ...s.rootPaths.map(normPath),
+    ...[...s.nodeMap.entries()].filter(([, n]) => n.loaded).map(([p]) => normPath(p)),
+  ])].sort((a, b) => a.length - b.length);
   store.clearLoadState();
   for (const p of loaded) {
-    store.deleteNode(p);
+    // 父目录重载后可能已不存在该子目录（被外部删除/移动），不再强行加载
+    if (!s.rootPaths.some((r) => normPath(r) === p) && !isPathInTree(store.get(), p)) continue;
     await loadFolderNode(store, p, showHidden);
   }
 }

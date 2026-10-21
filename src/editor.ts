@@ -457,9 +457,16 @@ export function setKeymap(view: EditorView, cmKeys: Record<string, string>): voi
 
 // 整体替换文档内容（用于「打开文件」后载入）
 export function setDoc(view: EditorView, text: string): void {
-  view.dispatch({
-    changes: { from: 0, to: view.state.doc.length, insert: text },
-  });
+  // 整篇替换不是用户编辑：抑制有序列表自动重编号，避免打开/重载文档时
+  // 静默改写文末列表序号（随后还会被自动保存落盘）。
+  renumberGuard = true;
+  try {
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: text },
+    });
+  } finally {
+    renumberGuard = false;
+  }
   // 文档整体替换后重建围栏索引：改为空闲帧重建。
   // 旧实现逐行 .text 分配整行字符串，50MB 下同步重建约 ~1.3s 冻结；
   // 现在（1）rebuildFenceIndex 仅取行首 ≤32 字符检测、零整行分配，
@@ -1087,9 +1094,13 @@ const orderedListRenumber = EditorView.updateListener.of((u) => {
 function isInsideCodeBlock(state: EditorState, pos: number): boolean {
   const tree = syntaxTree(state);
   if (tree.length >= pos) {
+    // resolve() 在围栏内部通常返回 CodeText/CodeMark 等子节点，必须沿父链上溯，
+    // 只比较当前节点类型会把「代码块内」误判为普通文本。
     const node = tree.resolve(pos, 1);
-    const name = node.type.name;
-    if (name === "FencedCode" || name === "CodeBlock") return true;
+    for (let n: typeof node | null = node; n; n = n.parent) {
+      const name = n.type.name;
+      if (name === "FencedCode" || name === "CodeBlock") return true;
+    }
     if (!node.type.isError) return false;
   }
   const lineNo = state.doc.lineAt(pos).number;
@@ -1128,6 +1139,22 @@ export function smartEnter(view: EditorView): boolean {
   const { state } = view;
   const head = state.selection.main.head;
   const line = state.doc.lineAt(head);
+  // 代码块必须最先判定：代码中的 `> ` 或 `|` 行同样满足引用/表格前缀，
+  // 旧顺序会把代码块内的 Enter 改写成引用/表格，直接破坏代码。
+  if (isInsideCodeBlock(state, head)) {
+    let closeLine = -1;
+    for (let n = line.number + 1; n <= state.doc.lines; n++) {
+      if (/^\s*```/.test(state.doc.line(n).text)) { closeLine = n; break; }
+    }
+    if (closeLine > 0) {
+      const pos = state.doc.line(closeLine).to;
+      view.dispatch({ changes: { from: pos, insert: "\n\n" }, selection: { anchor: pos + 2 } });
+      requestAnimationFrame(() => view.focus());
+      return true;
+    }
+    // 未闭合围栏：交还原生 Enter（插入换行），绝不能走引用/表格分支
+    return false;
+  }
   if (quotePrefixOf(line.text)) {
     // 引用块内 Enter：在光标处换行且新行不带「> 」前缀（跳出引用，直接写正文）。
     // 若光标在行首（head === line.from），等价于在引用前插入一个空行。
@@ -1145,18 +1172,6 @@ export function smartEnter(view: EditorView): boolean {
     view.dispatch({ changes: { from: pos, insert: "\n\n" }, selection: { anchor: pos + 2 } });
     view.focus();
     return true;
-  }
-  if (isInsideCodeBlock(state, head)) {
-    let closeLine = -1;
-    for (let n = line.number + 1; n <= state.doc.lines; n++) {
-      if (/^\s*```/.test(state.doc.line(n).text)) { closeLine = n; break; }
-    }
-    if (closeLine > 0) {
-      const pos = state.doc.line(closeLine).to;
-      view.dispatch({ changes: { from: pos, insert: "\n\n" }, selection: { anchor: pos + 2 } });
-            requestAnimationFrame(() => view.focus());
-      return true;
-    }
   }
   return false;
 }

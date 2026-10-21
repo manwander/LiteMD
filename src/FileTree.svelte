@@ -31,7 +31,7 @@
     baseName,
     isUnder,
   } from "./filetree/types";
-  import type { FlatNode, TreeHandlers } from "./filetree/types";
+  import type { FlatNode, TreeHandlers, FileTreeNode } from "./filetree/types";
   import { dragTargetValid } from "./filetree/dnd";
   import { resolveDropTargetDir } from "./filetree/drop-target";
   import { showToast } from "./toast";
@@ -352,7 +352,9 @@
     if (dragPath) {
       // 真实发生了拖拽
       e.preventDefault();
-      const target = dragOverPath ?? resolveDropTargetDir(null, false, state.rootPaths);
+      // W8：只有明确悬停在文件夹/文件行上才落盘；落在空白处视为取消，
+      // 不再静默移动到「第一个根目录」（用户无法预期，且易误移文件）。
+      const target = dragOverPath;
       const srcs = dragPaths.length ? dragPaths : [dragPath];
       const isCopy = dragIsCopy;
       cleanupDrag();
@@ -395,94 +397,178 @@
     }
   }
 
-  /** 乐观移动/复制：先在树中更新节点，避免刷新前的闪断/不一致（D-05） */
+  /** 乐观移动/复制：先在树中更新节点，避免刷新前的闪断/不一致（D-05）。
+   *  S10 修复：
+   *  1. 目标目录必须已加载：未加载节点不渲染子项，先移除源会让文件“凭空消失”；
+   *  2. 目录移动/复制同步迁移/复制整棵子树缓存，避免目标显示空壳或旧路径残留；
+   *  3. 同一目录（targetPath === src）跳过：移动是无操作，复制交给后端生成唯一名，
+   *     绝不能在覆盖流程里删除源自身。 */
   function optimisticMove(srcs: string[], targetDir: string, isCopy: boolean) {
+    const tp = norm(targetDir);
     store.mutate((st) => {
       const nodeMap = new Map(st.nodeMap);
-      const tp = norm(targetDir);
-      for (const src of srcs) {
-        const sp = norm(src);
+      const loadState = new Map(st.loadState);
+      const target0 = nodeMap.get(tp);
+      if (!target0 || !target0.loaded) return st;
+      for (const rawSrc of srcs) {
+        const sp = norm(rawSrc);
         const parent = norm(parentDir(sp));
         const pNode = nodeMap.get(parent);
         if (!pNode) continue;
         const movedFile = pNode.files.find((f) => norm(f.path) === sp);
         const movedChild = movedFile ? undefined : pNode.children.find((c) => norm(c.path) === sp);
+        if (!movedFile && !movedChild) continue;
+        const name = movedFile?.name ?? movedChild!.name;
+        const newPath = norm(`${tp}/${name}`);
+        if (newPath === sp) continue; // 同一目录：见函数注释第 3 点
+
+        // 目标同名旧节点及其子树整体丢弃（覆盖移动时随后由磁盘删除兜底）
+        for (const k of Array.from(nodeMap.keys())) {
+          if (isUnder(norm(k), newPath)) {
+            nodeMap.delete(k);
+            loadState.delete(k);
+          }
+        }
+
+        if (movedChild) {
+          // 迁移/复制子树缓存：key、节点 path、files/children 内的路径必须同步改写，
+          // 否则展开目标文件夹时会读到旧路径内容或显示成空文件夹。
+          const remapped: [string, FileTreeNode][] = [];
+          for (const [k, n] of Array.from(nodeMap.entries())) {
+            const nk = norm(k);
+            if (!isUnder(nk, sp)) continue;
+            const mapped = norm(newPath + nk.slice(sp.length));
+            remapped.push([
+              mapped,
+              {
+                ...n,
+                path: mapped,
+                files: n.files.map((f) => ({ ...f, path: norm(newPath + norm(f.path).slice(sp.length)) })),
+                children: n.children.map((c) => ({ ...c, path: norm(newPath + norm(c.path).slice(sp.length)) })),
+              },
+            ]);
+          }
+          if (!isCopy) {
+            for (const k of Array.from(nodeMap.keys())) {
+              if (isUnder(norm(k), sp)) {
+                nodeMap.delete(k);
+                loadState.delete(k);
+              }
+            }
+          }
+          for (const [k, n] of remapped) nodeMap.set(k, n);
+        }
+
+        if (!isCopy) {
+          const curParent = nodeMap.get(parent);
+          if (curParent) {
+            if (movedFile) {
+              nodeMap.set(parent, { ...curParent, files: curParent.files.filter((f) => norm(f.path) !== sp) });
+            } else {
+              nodeMap.set(parent, { ...curParent, children: curParent.children.filter((c) => norm(c.path) !== sp) });
+            }
+          }
+        }
+
+        const tNode = nodeMap.get(tp);
+        if (!tNode) continue;
         if (movedFile) {
-          if (!isCopy) nodeMap.set(parent, { ...pNode, files: pNode.files.filter((f) => norm(f.path) !== sp) });
-          const tNode = nodeMap.get(tp);
-          const newPath = `${tp}/${movedFile.name}`;
-          if (tNode) {
-            // 先移除目标中同名项，避免来回移动时乐观节点残留导致重复 key（Svelte keyed-each 崩溃）
-            const newFiles = tNode.files.filter((f) => norm(f.path) !== newPath);
-            nodeMap.set(tp, { ...tNode, files: [...newFiles, { ...movedFile, path: newPath, optimistic: true }] });
-          }
-        } else if (movedChild) {
-          if (!isCopy) nodeMap.set(parent, { ...pNode, children: pNode.children.filter((c) => norm(c.path) !== sp) });
-          const tNode = nodeMap.get(tp);
-          const newPath = `${tp}/${movedChild.name}`;
-          if (tNode) {
-            const newChildren = tNode.children.filter((c) => norm(c.path) !== newPath);
-            nodeMap.set(tp, {
-              ...tNode,
-              children: [...newChildren, { ...movedChild, path: newPath, loaded: movedChild.loaded, optimistic: true }],
-            });
-          }
-          nodeMap.set(newPath, { ...movedChild, path: newPath });
+          nodeMap.set(tp, {
+            ...tNode,
+            files: [
+              ...tNode.files.filter((f) => norm(f.path) !== newPath),
+              { ...movedFile, path: newPath, optimistic: true },
+            ],
+          });
+        } else {
+          const childNode = nodeMap.get(newPath);
+          const childShell = childNode
+            ? { ...childNode, optimistic: true }
+            : { ...movedChild!, path: newPath, files: [], children: [], loaded: false, optimistic: true };
+          nodeMap.set(tp, {
+            ...tNode,
+            children: [
+              ...tNode.children.filter((c) => norm(c.path) !== newPath),
+              childShell,
+            ],
+          });
         }
       }
-      return { ...st, nodeMap };
+      return { ...st, nodeMap, loadState };
     });
   }
   async function performDrop(srcs: string[], targetDir: string, isCopy: boolean) {
     const valid = srcs.filter((s) => dragTargetValid(s, targetDir));
     if (!valid.length) return;
+    const td = norm(targetDir);
+    // 先完成全部覆盖确认，再改 UI：旧实现先乐观移除源再询问，取消瞬间文件会“消失”。
+    const overwrite = new Set<string>();
     try {
-      // D-05：乐观更新先呈现结果
-      optimisticMove(valid, targetDir, isCopy);
+      for (const src of valid) {
+        const targetPath = norm(`${td}/${baseName(src)}`);
+        // 同一目录：移动为无操作；复制由后端 resolve_dest 生成唯一名，
+        // 绝不能把「已存在」误判成覆盖并删除源自身（数据丢失）。
+        if (targetPath === norm(src)) continue;
+        const targetExists = await handlers.checkPathExists?.(targetPath);
+        if (!targetExists) continue;
+        const action = isCopy ? "复制" : "移动";
+        const ok = await handlers.confirm({
+          title: "目标已存在",
+          message: `目标位置已存在同名"${baseName(src)}"，是否覆盖？`,
+        });
+        if (!ok) {
+          handlers.setStatus(`${action}已取消`);
+          return; // 尚未做任何乐观修改，无需刷新
+        }
+        overwrite.add(targetPath);
+      }
+      // D-05：确认通过后再乐观呈现结果
+      optimisticMove(valid, td, isCopy);
       for (const src of valid) {
         const srcName = baseName(src);
-        const targetPath = `${norm(targetDir)}/${srcName}`;
-        const targetExists = await handlers.checkPathExists?.(targetPath);
-        if (targetExists) {
-          const action = isCopy ? "复制" : "移动";
-          const ok = await handlers.confirm({
-            title: "目标已存在",
-            message: `目标位置已存在同名"${srcName}"，是否覆盖？`,
-          });
-          if (!ok) {
-            handlers.setStatus(`${action}已取消`);
-            optimisticMove(valid, targetDir, isCopy); // 无覆盖：仍保留乐观（等效无操作），随后由刷新校正
-            await refreshAllAffected(valid, targetDir);
-            return;
+        const targetPath = norm(`${td}/${srcName}`);
+        if (targetPath === norm(src)) {
+          if (isCopy) {
+            const np = await copyPath(src, td); // 后端自动生成 xxx(1).md
+            logOp("复制文件: " + src + " → " + norm(np));
+            handlers.setStatus(`已复制 ${srcName} → ${baseName(np)}`);
           }
-          await deletePath(targetPath);
+          continue;
         }
+        if (overwrite.has(targetPath)) await deletePath(targetPath);
         if (isCopy) {
-          const np = await copyPath(src, targetDir);
+          const np = await copyPath(src, td);
           logOp("复制文件: " + src + " → " + np);
-          handlers.setStatus(`已复制 ${baseName(src)} → ${baseName(targetDir)}（${baseName(np)}）`);
+          handlers.setStatus(`已复制 ${srcName} → ${baseName(td)}（${baseName(np)}）`);
         } else {
-          const np = await movePath(src, targetDir);
+          const np = await movePath(src, td);
           logOp("移动文件: " + src + " → " + norm(np));
           if (norm(np) !== norm(src)) {
             handlers.onTabRenamed(src, norm(np));
             store.migrateCollapsedForMove(src, norm(np)); // 折叠态跟随目录迁移
             syncDirAfterMove(norm(np), norm(src)); // C-11：面包屑焦点与上下文目录跟随移动
           }
-          handlers.setStatus(`已移动 ${baseName(src)} → ${baseName(targetDir)}`);
+          handlers.setStatus(`已移动 ${srcName} → ${baseName(td)}`);
         }
       }
-      await refreshAllAffected(valid, targetDir);
+      await refreshAllAffected(valid, td);
     } catch (err) {
       // 失败：重新加载相关目录，恢复真实文件系统状态（D-05 回滚）
-      await refreshAllAffected(valid, targetDir);
+      await refreshAllAffected(valid, td);
       handlers.setStatus("操作失败：" + String(err));
     }
   }
   /** 刷新目标目录与所有源父目录（移动/复制/取消/失败统一入口） */
   async function refreshAllAffected(srcs: string[], targetDir: string) {
-    await refreshFolderOf(store, targetDir, store.get().showHidden);
-    for (const s of srcs) await refreshFolderOf(store, s, store.get().showHidden);
+    const showHidden = store.get().showHidden;
+    const dirs = new Set<string>([norm(targetDir)]);
+    for (const s of srcs) dirs.add(norm(parentDir(s)));
+    for (const d of dirs) {
+      // 目标目录本身必须重载（旧实现只刷其父目录，目标里的新内容要等手动刷新才出现）；
+      // 不在树中的目录回退为刷新其父目录。
+      if (store.get().nodeMap.has(d)) await reloadFolder(store, d, showHidden);
+      else await refreshFolderOf(store, d, showHidden);
+    }
   }
 
   // ================= 行内重命名（FEAT-6） =================

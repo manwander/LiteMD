@@ -1,6 +1,6 @@
 // ops（目录 IO 操作）单测：mock fs 层，验证状态写入 store 的正确性
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { loadFolderNode, reloadFolder, refreshFolderOf, applyFsChanges } from "../filetree/ops";
+import { loadFolderNode, reloadFolder, refreshFolderOf, applyFsChanges, refreshTree } from "../filetree/ops";
 import { createTreeStore } from "../filetree/store";
 import type { DirItem } from "../fs";
 
@@ -75,6 +75,76 @@ describe("loadFolderNode", () => {
     store.setLoadState("C:/a", { loading: true, error: null });
     await loadFolderNode(store, "C:/a", false);
     expect(calls).toBe(0);
+  });
+
+  it("并发加载同目录时只有最新请求的结果落地（W5 代际保护）", async () => {
+    let resolveFirst!: (v: DirItem[]) => void;
+    let resolveSecond!: (v: DirItem[]) => void;
+    const first = new Promise<DirItem[]>((r) => (resolveFirst = r));
+    const second = new Promise<DirItem[]>((r) => (resolveSecond = r));
+    listDirMock.mockImplementationOnce(() => first).mockImplementationOnce(() => second);
+    const store = createTreeStore();
+    const p1 = loadFolderNode(store, "C:/a", false);
+    const p2 = reloadFolder(store, "C:/a", false); // force：第二次请求
+
+    // 后发先至：新结果先落地，随后旧结果才返回——不得覆盖新结果
+    resolveSecond([dirItem({ name: "new.md", path: "C:/a/new.md", is_md: true })]);
+    await p2;
+    resolveFirst([dirItem({ name: "old.md", path: "C:/a/old.md", is_md: true })]);
+    await p1;
+
+    const node = store.get().nodeMap.get("C:/a");
+    expect(node?.files.map((f) => f.name)).toEqual(["new.md"]);
+    expect(store.get().loadState.get("C:/a")?.loading).toBe(false);
+  });
+});
+
+describe("refreshTree 全树刷新", () => {
+  beforeEach(() => {
+    listDirMock.mockReset();
+  });
+
+  it("重载根层的同时也重载此前已展开的深层目录（W5）", async () => {
+    listDirMock.mockImplementation(async (dir: string) => {
+      if (dir === "C:/a") {
+        return [
+          dirItem({ name: "sub", path: "C:/a/sub", is_dir: true }),
+          dirItem({ name: "root.md", path: "C:/a/root.md", is_md: true }),
+        ];
+      }
+      if (dir === "C:/a/sub") {
+        return [dirItem({ name: "old.md", path: "C:/a/sub/old.md", is_md: true })];
+      }
+      return [];
+    });
+    const store = createTreeStore();
+    store.setRoots(["C:/a"]);
+    await loadFolderNode(store, "C:/a", false);
+    await loadFolderNode(store, "C:/a/sub", false);
+
+    // 磁盘变化：根新增文件、深层子目录新增文件
+    listDirMock.mockImplementation(async (dir: string) => {
+      if (dir === "C:/a") {
+        return [
+          dirItem({ name: "sub", path: "C:/a/sub", is_dir: true }),
+          dirItem({ name: "root.md", path: "C:/a/root.md", is_md: true }),
+          dirItem({ name: "new.md", path: "C:/a/new.md", is_md: true }),
+        ];
+      }
+      if (dir === "C:/a/sub") {
+        return [
+          dirItem({ name: "old.md", path: "C:/a/sub/old.md", is_md: true }),
+          dirItem({ name: "deep.md", path: "C:/a/sub/deep.md", is_md: true }),
+        ];
+      }
+      return [];
+    });
+    await refreshTree(store, false);
+
+    const s = store.get();
+    expect(s.nodeMap.get("C:/a")?.files.map((f) => f.name).sort()).toEqual(["new.md", "root.md"]);
+    // 深层已展开目录必须同步刷新，而不是继续显示旧内容
+    expect(s.nodeMap.get("C:/a/sub")?.files.map((f) => f.name).sort()).toEqual(["deep.md", "old.md"]);
   });
 });
 

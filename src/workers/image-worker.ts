@@ -15,7 +15,7 @@ import {
 const ctx: any = self;
 
 ctx.onmessage = async (e: MessageEvent<ImageWorkerRequest>) => {
-  const { blob, opts } = e.data;
+  const { id, blob, opts } = e.data;
   const { maxEdge, quality, lossless, format } = opts;
   try {
     const bmp = await createImageBitmap(blob);
@@ -35,10 +35,10 @@ ctx.onmessage = async (e: MessageEvent<ImageWorkerRequest>) => {
     cv.width = 0;
     cv.height = 0; // 释放 canvas 后备存储
 
-    const msg: ImageWorkerSuccess = { bytes: buf, format, width: w, height: h };
+    const msg: ImageWorkerSuccess = { id, bytes: buf, format, width: w, height: h };
     ctx.postMessage(msg, [buf.buffer]); // transferable，零拷贝回传
   } catch (err: any) {
-    const msg: ImageWorkerError = { error: String(err?.message ?? err) };
+    const msg: ImageWorkerError = { id, error: String(err?.message ?? err) };
     ctx.postMessage(msg);
   }
 };

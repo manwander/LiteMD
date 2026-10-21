@@ -37,9 +37,12 @@ export function setDims(noteDir: string, ref: string, w: number, h: number): voi
 }
 
 export function getDims(noteDir: string, ref: string): Dims | undefined {
-  return (
-    map.get(key(noteDir, ref)) ?? map.get(key(noteDir, decodeURIComponent(ref)))
-  );
+  const direct = map.get(key(noteDir, ref));
+  if (direct) return direct;
+  // markdown-it 会保留 `%E4%B8`/`%FF` 这类非法转义；直接 decodeURIComponent 会抛
+  // URIError，进而让整个图片渲染规则失败、预览块空白。统一走容错的 normRef。
+  const decoded = normRef(ref);
+  return decoded === ref ? undefined : map.get(key(noteDir, decoded));
 }
 
 // 索引文件：<noteDir>/<assetsDir>/.index.json
