@@ -204,7 +204,7 @@
   .mask {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--mask);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -217,9 +217,9 @@
     height: 560px;
     max-height: 86vh;
     background: var(--bg);
-    border: 1px solid var(--sd);
-    border-radius: 14px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--srf);
+    border-radius: 16px;
+    box-shadow: var(--rs-l);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -267,16 +267,18 @@
     min-width: 140px;
     height: 30px;
     padding: 0 10px;
-    border: 1px solid var(--sd);
-    border-radius: 6px;
-    background: var(--sl);
+    border: none;
+    border-radius: 9px;
+    background: var(--bg);
+    box-shadow: var(--is-s);
     color: var(--t1);
     font-size: 13px;
   }
 
   .bar input.q:focus {
     outline: none;
-    border-color: var(--p);
+    border: 1.5px solid var(--p);
+    box-shadow: var(--is-s);
   }
 
   .case {

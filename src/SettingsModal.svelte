@@ -734,7 +734,7 @@
   .mask {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--mask);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -748,16 +748,16 @@
     max-height: calc(100vh - 40px);
     display: flex;
     background: var(--bg);
-    border-radius: 14px;
+    border-radius: 16px;
     overflow: hidden;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--rs-l);
   }
 
   /* 左侧导航 180w */
   nav {
     width: 180px;
     flex-shrink: 0;
-    background: var(--sl);
+    background: var(--bg);
     border-right: 1px solid var(--div);
     padding: 12px 8px;
     display: flex;
@@ -783,14 +783,17 @@
   }
 
   .nav-item:hover {
-    background: var(--div);
+    background: var(--hov);
     color: var(--t1);
   }
 
   .nav-item.active {
-    background: var(--tint);
+    box-shadow: var(--is-s);
     color: var(--p);
-    font-weight: 500;
+    font-weight: 600;
+  }
+  :root[data-theme="dark"] .nav-item.active {
+    border: 1px solid var(--ps);
   }
 
   /* 右侧内容 */
@@ -892,8 +895,9 @@
     font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
     font-size: 12px;
     color: var(--t2);
-    background: var(--sl);
-    border: 1px solid transparent;
+    background: var(--bg);
+    box-shadow: var(--rs-s);
+    border: 1px solid var(--div);
     border-radius: 6px;
     padding: 4px 8px;
     min-width: 96px;
@@ -928,7 +932,7 @@
   .btn {
     padding: 6px 12px;
     font-size: 13px;
-    border-radius: 6px;
+    border-radius: 9px;
   }
 
   .btn:disabled {
@@ -1031,14 +1035,16 @@
     font-size: 13px;
     font-family: "JetBrains Mono", Consolas, monospace;
     color: var(--t1);
-    background: var(--sl);
-    border: 1px solid var(--sd);
-    border-radius: 6px;
+    background: var(--bg);
+    border: none;
+    border-radius: 9px;
+    box-shadow: var(--is-s);
   }
 
   .text-input:focus {
     outline: none;
-    border-color: var(--p);
+    border: 1.5px solid var(--p);
+    box-shadow: var(--is-s);
   }
 
   .text-input.wide {
@@ -1050,12 +1056,12 @@
   }
 
   .warn-text {
-    color: #b26a00;
+    color: var(--warn);
   }
 
   .tag.ok {
-    color: #1a7f37;
-    background: rgba(26, 127, 55, 0.12);
+    color: var(--ok);
+    background: var(--tint);
   }
 
   .tag.skip {
@@ -1063,17 +1069,17 @@
   }
 
   .tag.bad {
-    color: #c0392b;
-    background: rgba(192, 57, 43, 0.12);
+    color: var(--err);
+    background: var(--tint);
   }
 
   .btn.danger {
-    color: #c0392b;
-    border-color: rgba(192, 57, 43, 0.4);
+    color: var(--err);
+    border-color: var(--ps);
   }
 
   .btn.danger:hover {
-    background: rgba(192, 57, 43, 0.08);
+    background: var(--tint);
   }
 
   .adv-toggle {

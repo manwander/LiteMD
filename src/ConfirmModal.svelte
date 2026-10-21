@@ -54,7 +54,7 @@
   .cm-mask {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--mask);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -65,9 +65,9 @@
     width: 400px;
     max-width: 90vw;
     background: var(--bg);
-    border: 1px solid var(--sd);
-    border-radius: 12px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--srf);
+    border-radius: 16px;
+    box-shadow: var(--rs-l);
     padding: 18px 20px;
     display: flex;
     flex-direction: column;
@@ -98,30 +98,26 @@
     height: 32px;
     padding: 0 16px;
     font-size: 13px;
-    border-radius: 6px;
-    border: 1px solid var(--sd);
-    background: var(--sl);
+    border-radius: 16px;
+    border: none;
+    background: var(--bg);
+    box-shadow: var(--rs-s);
     color: var(--t1);
     cursor: pointer;
   }
 
   .cm-btn.danger {
-    background: #d32f2f;
-    border-color: #d32f2f;
+    background: linear-gradient(135deg, #E8574F 0%, #D43F3A 100%);
     color: #fff;
   }
 
   /* 第三按钮（保存并关闭）：主操作强调色 */
   .cm-btn-third {
-    background: var(--p);
-    border-color: var(--p);
+    background: linear-gradient(135deg, var(--pt) 0%, var(--pb) 100%);
     color: #fff;
   }
 
   .cm-btn-third:hover {
-    background: var(--p);
-    border-color: var(--p);
-    color: #fff;
     filter: brightness(1.1);
   }
 </style>
