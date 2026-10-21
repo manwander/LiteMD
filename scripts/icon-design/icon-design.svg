@@ -10,8 +10,8 @@
   <defs>
     <!-- mark gradient (unchanged) -->
     <linearGradient id="mark" x1="0" y1="300" x2="0" y2="680" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#6E7BFF"/>
-      <stop offset="1" stop-color="#2324A8"/>
+      <stop offset="0" stop-color="#7A6EE0"/>
+      <stop offset="1" stop-color="#5B4FD0"/>
     </linearGradient>
 
     <!-- plate body: bright center, MID-shaded rim (between v5 and v5.1) -->
@@ -30,17 +30,17 @@
 
     <!-- halo behind the mark -->
     <radialGradient id="halo" cx="0.5" cy="0.47" r="0.40">
-      <stop offset="0" stop-color="#5B6BFF" stop-opacity="0.16"/>
-      <stop offset="0.55" stop-color="#5B6BFF" stop-opacity="0.05"/>
-      <stop offset="1" stop-color="#5B6BFF" stop-opacity="0"/>
+      <stop offset="0" stop-color="#6A5FD8" stop-opacity="0.16"/>
+      <stop offset="0.55" stop-color="#6A5FD8" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#6A5FD8" stop-opacity="0"/>
     </radialGradient>
 
     <!-- crisp glow ring framing the mark -->
     <radialGradient id="ring" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#5B6BFF" stop-opacity="0"/>
-      <stop offset="0.80" stop-color="#5B6BFF" stop-opacity="0"/>
-      <stop offset="0.90" stop-color="#6E7BFF" stop-opacity="0.50"/>
-      <stop offset="1" stop-color="#5B6BFF" stop-opacity="0"/>
+      <stop offset="0" stop-color="#6A5FD8" stop-opacity="0"/>
+      <stop offset="0.80" stop-color="#6A5FD8" stop-opacity="0"/>
+      <stop offset="0.90" stop-color="#7A6EE0" stop-opacity="0.50"/>
+      <stop offset="1" stop-color="#6A5FD8" stop-opacity="0"/>
     </radialGradient>
 
     <clipPath id="clip">

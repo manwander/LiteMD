@@ -130,14 +130,14 @@ body {
   padding-right: calc(12px + var(--safe-right));
   padding-top: var(--safe-top);
   background: var(--sl);
-  border-bottom: 1px solid var(--div);
+  border-bottom: 1px solid var(--div-nav);
   /* 防止刘海屏 / 圆角内容被裁剪 */
   box-sizing: border-box;
 }
 
 .brand {
   font-weight: 600;
-  background: linear-gradient(135deg, #6e7bff 0%, #2324a8 100%);
+  background: linear-gradient(135deg, var(--pt) 0%, var(--pb) 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -1923,4 +1923,349 @@ body.low-end * {
 }
 .fatal-actions button:hover {
   filter: brightness(1.05);
+}
+
+/* ==========================================================================
+   菜单栏（B2 · mb- 前缀；素塑深度阶梯：栏体 L1 / 根钮 L3 / 下拉 L4）
+   光源恒左上 45°：下拉用 --rs-l 凸起；暗色浮层按 §1.3 补 1px 白描边补偿。
+   ========================================================================== */
+.menubar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  position: relative;
+  z-index: 100;
+}
+
+/* Alt / 视图菜单整栏隐藏（.hidden 由 App 的 menubarVisible 状态驱动） */
+.menubar.hidden {
+  display: none;
+}
+
+/* 展开时的全屏点击捕获层（透明，不压暗；下拉面板经 z-index 高于本层） */
+.mb-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+
+.mb-root {
+  position: relative;
+}
+
+/* 根按钮：L3 控件面，悬停 --hov，展开 --tint（覆盖通用 button 基线） */
+.menubar .mb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--t1);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.menubar .mb-btn:hover {
+  background: var(--hov);
+  color: var(--t1);
+}
+
+.menubar .mb-btn.open {
+  background: var(--tint);
+  color: var(--p);
+}
+
+.mb-caret {
+  font-size: 9px;
+  line-height: 1;
+  color: var(--t3);
+}
+
+.menubar .mb-btn.open .mb-caret {
+  color: var(--p);
+}
+
+/* 下拉面板：L4 同色凸起（--rs-l），r12 · padding 6 · min-w 228（LM-02 参数表） */
+.mb-drop {
+  position: absolute;
+  top: 34px;
+  left: 0;
+  min-width: 228px;
+  padding: 6px;
+  background: var(--bg);
+  border-radius: 12px;
+  box-shadow: var(--rs-l);
+  z-index: 100;
+}
+
+/* 暗色补偿（EXECUTION-SPEC §1.3 白描边）：浮层 L4 1px 白描边 */
+:root[data-theme="dark"] .mb-drop {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* 菜单项：7,10 · r9 · 悬停 tint + primary · 无面（覆盖通用 button 基线） */
+.mb-drop .mb-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--t1);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mb-drop .mb-item:hover {
+  background: var(--tint);
+  color: var(--p);
+}
+
+/* 禁用态：t3 字、无悬停反馈（集成阶段按 when() 谓词使用） */
+.mb-drop .mb-item:disabled {
+  color: var(--t3);
+  cursor: default;
+}
+
+.mb-drop .mb-item:disabled:hover {
+  background: transparent;
+  color: var(--t3);
+}
+
+/* 分隔线：1px --div，margin 5,6（LM-02） */
+.mb-sep {
+  height: 1px;
+  background: var(--div);
+  margin: 5px 6px;
+}
+
+/* 分组小标题（最近打开/导出/标题…）：10.5/700 字距 1 · t3 */
+.mb-group {
+  padding: 6px 10px 3px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--t3);
+  user-select: none;
+}
+
+/* 「最近打开」空态占位 */
+.mb-empty {
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--t3);
+  user-select: none;
+}
+
+/* 菜单项右侧加速键键帽：等宽 10.5 右对齐成列；--div 描边（B6 定夺） */
+.kbd {
+  margin-left: auto;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--t2);
+  background: var(--sl);
+  border: 1px solid var(--div);
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+
+.mb-drop .mb-item:hover .kbd {
+  color: var(--p);
+}
+
+/* ==========================================================================
+   产品化集成段（Wave-2：B2–B4 工具栏重组 / 侧栏三 tab / B5 渲染管线挂钩）
+   令牌与光影一律引用 :root 定义（素塑 SoftRelief，光源恒左上 45°）。
+   ========================================================================== */
+
+/* ---- 工具栏段分组（LM-03）---- */
+/* 段内按钮紧凑排列；段间由既有 .tb .sep（1×20 --div）分隔 */
+.tb-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+/* 末段（模式分段 + 主题/专注/设置）右对齐 */
+.tb-seg.seg-end {
+  margin-left: auto;
+}
+
+/* ---- 模式分段控件（LM-03 参数表）----
+   容器 h26 padding 3 r15 · 底 is-s 凹槽；段 r12 padding 4,11；
+   选中段主色渐变 + 双向投影（右下主色影 + 左上白辉）。 */
+.modeseg {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 3px;
+  margin-right: 8px;
+  border-radius: 15px;
+  background: var(--bg);
+  box-shadow: var(--is-s);
+}
+.modeseg button {
+  width: auto;
+  height: 20px;
+  padding: 0 11px;
+  font-size: 12px;
+  line-height: 1;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 12px;
+  color: var(--t2);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, box-shadow 0.15s;
+}
+.modeseg button:hover {
+  color: var(--t1);
+  border-color: transparent;
+}
+.modeseg button.on {
+  background: linear-gradient(135deg, var(--pt) 0%, var(--pb) 100%);
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 2px 2px 4px var(--ps), -1px -1px 2px rgba(255, 255, 255, 0.45);
+}
+
+/* ---- 侧栏三 tab（LM-04：目录 / 大纲 / 搜索）---- */
+/* 宽度传递：.body 内联 --sbw（与 FileTree 的 .sidebar 列同宽，保证三块对齐） */
+.sb-tabs,
+.sb-body,
+.ol-panel,
+.sb-search {
+  width: var(--sbw, 240px);
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+.sb-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--sl);
+  border-right: 1px solid var(--div);
+  border-bottom: 1px solid var(--div-nav);
+}
+/* tab：32×28 r9，静息 rs-s 凸起；选中 is 内嵌 + primary（E3 契约） */
+.sb-tab {
+  flex: 1;
+  height: 28px;
+  font-size: 12px;
+  border-radius: 9px;
+  border: 1px solid var(--sd);
+  background: var(--sl);
+  color: var(--t2);
+  cursor: pointer;
+  box-shadow: var(--rs-s);
+  transition: box-shadow 0.15s, color 0.15s, background 0.15s;
+}
+.sb-tab:hover {
+  color: var(--t1);
+}
+.sb-tab.on {
+  color: var(--p);
+  background: var(--tint);
+  border-color: var(--p);
+  box-shadow: var(--is);
+}
+/* 文件树面板包裹层：非当前 tab 时整体隐藏（FileTree 保持挂载态，不销毁） */
+.sb-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.sb-body.hidden {
+  display: none;
+}
+/* FileTree 根 .sidebar 原为 .body 行布局直接子项（stretch 撑高）；
+   包进 .sb-body 列布局后需显式 flex:1 保持撑满，否则树区下方露空 */
+.sb-body > .sidebar {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---- 侧栏「搜索」入口（LM-04 面板停靠化：文件夹查找替换的停靠入口）---- */
+.sb-search {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 12px;
+  background: var(--sl);
+  border-right: 1px solid var(--div);
+}
+.sb-search-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--t2);
+}
+.sb-search-btn {
+  height: 30px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+/* ---- B5 渲染管线挂钩（md-pipeline 产物的样式）---- */
+/* C-6 Mermaid 占位：虚线框 + 等宽原文（未接渲染库时的可见回退） */
+.mermaid-placeholder {
+  margin: 8px 0;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px dashed var(--sd);
+  border-radius: 8px;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--t2);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+/* C-5 数学：块级包裹层横向滚动（宽公式不撑破预览） */
+.math-block {
+  margin: 8px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+/* KaTeX 不可用时的降级占位（行内 / 块级） */
+.math-pending {
+  font-family: Consolas, Menlo, monospace;
+  color: var(--t2);
+  background: var(--tint);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.math-pending-block {
+  display: block;
+  margin: 8px 0;
+  padding: 8px 12px;
+  overflow-x: auto;
+}
+
+/* C-4 任务列表：markdown-it-task-lists 现产出 li.task-list-item（旧正则路径的
+   li.task 已随 createMd 接线退出，保留同款样式双选择器兜底） */
+.preview-content li.task,
+.preview-content li.task-list-item,
+.preview-edit li.task,
+.preview-edit li.task-list-item {
+  list-style: none;
+  margin-left: -20px;
+}
+.preview-content li.task input[type="checkbox"],
+.preview-content li.task-list-item input[type="checkbox"],
+.preview-edit li.task input[type="checkbox"],
+.preview-edit li.task-list-item input[type="checkbox"] {
+  accent-color: var(--p);
+  margin-right: 6px;
+  vertical-align: -2px;
 }
