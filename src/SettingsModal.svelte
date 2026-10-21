@@ -690,17 +690,10 @@
           <div class="group first">
             <div class="row">
               <span class="row-label">
-                导出 HTML
-                <small>内联样式的单文件，可直接分享</small>
+                导出
+                <small>Markdown / PDF / HTML / 自包含 MD，四格式统一入口</small>
               </span>
-              <button class="btn" on:click={() => dispatch("export")}>立即导出</button>
-            </div>
-            <div class="row">
-              <span class="row-label">
-                导出 PDF
-                <small>Rust 侧排版渲染（A4/中文自动换行分页），当前文档内容</small>
-              </span>
-              <button class="btn" on:click={() => dispatch("exportPdf")}>立即导出</button>
+              <button class="btn" on:click={() => dispatch("export")}>打开导出对话框</button>
             </div>
           </div>
 
