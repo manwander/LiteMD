@@ -1509,15 +1509,7 @@ button.on {
   background: var(--sl);
   font-weight: 600;
 }
-.preview-edit li.task {
-  list-style: none;
-  margin-left: -20px;
-}
-.preview-edit li.task input[type="checkbox"] {
-  accent-color: var(--p);
-  margin-right: 6px;
-  vertical-align: -2px;
-}
+/* 任务列表复选框样式已并入集成段（.preview-edit li.task / li.task-list-item 双选择器） */
 
 /* 隐藏文件/文件夹管理弹窗 */
 .hm-mask {
@@ -2268,4 +2260,22 @@ body.low-end * {
   accent-color: var(--p);
   margin-right: 6px;
   vertical-align: -2px;
+}
+
+/* ---- LM-22 预览编辑 · 块级直改 ----
+   契约：preview-edit-keys.ts 在光标所在顶层块打 .pv-blk-active（click/keyup 时同步）；
+   块 = .preview-edit 直接子元素。悬停 hov 叠色零位移；激活 is-s + 左 2px 主色竖条
+   （同树行/大纲选中语言）。表格不参与（单元格级编辑另有交互）。 */
+.preview-edit > *:not(table) {
+  border-radius: 8px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  margin-right: -6px;
+}
+.preview-edit > *:not(table):hover {
+  background: var(--hov);
+}
+.preview-edit > .pv-blk-active {
+  box-shadow: var(--is-s), inset 2px 0 0 var(--p);
+  color: var(--p);
 }
