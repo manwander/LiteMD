@@ -757,8 +757,8 @@
   nav {
     width: 180px;
     flex-shrink: 0;
-    background: var(--panel);
-    border-right: 1px solid var(--border);
+    background: var(--sl);
+    border-right: 1px solid var(--div);
     padding: 12px 8px;
     display: flex;
     flex-direction: column;
@@ -767,7 +767,7 @@
 
   .nav-title {
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
     padding: 4px 10px 10px;
   }
 
@@ -778,18 +778,18 @@
     background: transparent;
     border-radius: 6px;
     font-size: 14px;
-    color: var(--text);
+    color: var(--t1);
     cursor: pointer;
   }
 
   .nav-item:hover {
-    background: var(--border);
-    color: var(--text);
+    background: var(--div);
+    color: var(--t1);
   }
 
   .nav-item.active {
-    background: var(--accent-soft);
-    color: var(--accent);
+    background: var(--tint);
+    color: var(--p);
     font-weight: 500;
   }
 
@@ -830,7 +830,7 @@
   .desc {
     margin: 0 0 16px;
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .group {
@@ -842,13 +842,13 @@
   .group-title {
     font-size: 13px;
     font-weight: 600;
-    color: var(--text);
+    color: var(--t1);
     margin-bottom: 2px;
   }
 
   .divider {
     height: 1px;
-    background: var(--border);
+    background: var(--div);
     margin: 16px 0; /* 组间分隔 16 */
   }
 
@@ -862,7 +862,7 @@
 
   .row-label {
     font-size: 14px;
-    color: var(--text);
+    color: var(--t1);
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -871,7 +871,7 @@
 
   .row-label small {
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .path {
@@ -891,8 +891,8 @@
   .pill {
     font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
     font-size: 12px;
-    color: var(--text-2);
-    background: var(--pill);
+    color: var(--t2);
+    background: var(--sl);
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 4px 8px;
@@ -902,14 +902,14 @@
   }
 
   .pill:hover {
-    border-color: var(--accent);
-    color: var(--accent);
+    border-color: var(--p);
+    color: var(--p);
   }
 
   .pill.capturing {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-    color: var(--accent);
+    border-color: var(--p);
+    background: var(--tint);
+    color: var(--p);
   }
 
   .mini {
@@ -937,8 +937,8 @@
   }
 
   .btn.primary {
-    background: var(--accent);
-    border-color: var(--accent);
+    background: var(--p);
+    border-color: var(--p);
     color: #fff;
   }
 
@@ -949,15 +949,15 @@
   }
 
   .chip.on {
-    background: var(--accent-soft);
-    border-color: var(--accent);
-    color: var(--accent);
+    background: var(--tint);
+    border-color: var(--p);
+    color: var(--p);
   }
 
   .tag {
     font-size: 12px;
-    color: var(--text-2);
-    background: var(--pill);
+    color: var(--t2);
+    background: var(--sl);
     border-radius: 6px;
     padding: 3px 8px;
   }
@@ -967,13 +967,13 @@
     align-items: center;
     gap: 8px;
     padding: 12px 24px;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--div);
   }
 
   .msg {
     flex: 1;
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -982,7 +982,7 @@
   .about p {
     margin: 0 0 8px;
     font-size: 14px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .about .links {
@@ -997,7 +997,7 @@
     border: none;
     padding: 0;
     font-size: 14px;
-    color: var(--accent);
+    color: var(--p);
     text-decoration: underline;
     cursor: pointer;
   }
@@ -1013,12 +1013,12 @@
   input[type="checkbox"] {
     width: 16px;
     height: 16px;
-    accent-color: var(--accent);
+    accent-color: var(--p);
   }
 
   input[type="range"] {
     width: 180px;
-    accent-color: var(--accent);
+    accent-color: var(--p);
   }
 
   input[type="range"]:disabled {
@@ -1030,15 +1030,15 @@
     padding: 5px 8px;
     font-size: 13px;
     font-family: "JetBrains Mono", Consolas, monospace;
-    color: var(--text);
-    background: var(--panel);
-    border: 1px solid var(--border);
+    color: var(--t1);
+    background: var(--sl);
+    border: 1px solid var(--sd);
     border-radius: 6px;
   }
 
   .text-input:focus {
     outline: none;
-    border-color: var(--accent);
+    border-color: var(--p);
   }
 
   .text-input.wide {
@@ -1059,7 +1059,7 @@
   }
 
   .tag.skip {
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .tag.bad {
@@ -1078,6 +1078,6 @@
 
   .adv-toggle {
     margin: 4px 0 10px;
-    color: var(--accent);
+    color: var(--p);
   }
 </style>

@@ -77,7 +77,7 @@
     width: 420px;
     max-width: 90vw;
     background: var(--bg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--sd);
     border-radius: 12px;
     box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
     padding: 18px 20px;
@@ -89,7 +89,7 @@
   .pm-title {
     font-weight: 600;
     font-size: 15px;
-    color: var(--text);
+    color: var(--t1);
   }
 
   .pm-pathrow {
@@ -107,36 +107,36 @@
   .pm-browse {
     flex-shrink: 0;
     width: 38px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--sd);
     border-radius: 6px;
-    background: var(--panel);
-    color: var(--text);
+    background: var(--sl);
+    color: var(--t1);
     cursor: pointer;
     font-size: 15px;
   }
 
   .pm-browse:hover {
-    border-color: var(--accent);
+    border-color: var(--p);
   }
 
   .pm-label {
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .pm-input {
     height: 34px;
     padding: 0 10px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--sd);
     border-radius: 6px;
-    background: var(--panel);
-    color: var(--text);
+    background: var(--sl);
+    color: var(--t1);
     font-size: 14px;
   }
 
   .pm-input:focus {
     outline: none;
-    border-color: var(--accent);
+    border-color: var(--p);
   }
 
   .pm-btns {
@@ -151,15 +151,15 @@
     padding: 0 16px;
     font-size: 13px;
     border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    color: var(--text);
+    border: 1px solid var(--sd);
+    background: var(--sl);
+    color: var(--t1);
     cursor: pointer;
   }
 
   .pm-btn.primary {
-    background: var(--accent);
-    border-color: var(--accent);
+    background: var(--p);
+    border-color: var(--p);
     color: #fff;
   }
 </style>

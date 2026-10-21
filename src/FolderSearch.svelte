@@ -217,7 +217,7 @@
     height: 560px;
     max-height: 86vh;
     background: var(--bg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--sd);
     border-radius: 14px;
     box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
     display: flex;
@@ -230,17 +230,17 @@
     align-items: center;
     gap: 10px;
     padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--div);
   }
 
   .title {
     font-weight: 600;
-    color: var(--text);
+    color: var(--t1);
   }
 
   .folder {
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
     max-width: 380px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -267,16 +267,16 @@
     min-width: 140px;
     height: 30px;
     padding: 0 10px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--sd);
     border-radius: 6px;
-    background: var(--panel);
-    color: var(--text);
+    background: var(--sl);
+    color: var(--t1);
     font-size: 13px;
   }
 
   .bar input.q:focus {
     outline: none;
-    border-color: var(--accent);
+    border-color: var(--p);
   }
 
   .case {
@@ -284,7 +284,7 @@
     align-items: center;
     gap: 4px;
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--t2);
     cursor: pointer;
     white-space: nowrap;
   }
@@ -298,7 +298,7 @@
   .msg {
     padding: 0 16px 8px;
     font-size: 12px;
-    color: var(--accent);
+    color: var(--p);
     min-height: 20px;
   }
 
@@ -319,14 +319,14 @@
     padding: 4px 8px;
     font-size: 12px;
     font-weight: 600;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .file-name .cnt {
     font-size: 11px;
     font-weight: 400;
-    color: var(--accent);
-    background: var(--accent-soft);
+    color: var(--p);
+    background: var(--tint);
     border-radius: 8px;
     padding: 0 6px;
   }
@@ -342,7 +342,7 @@
   }
 
   .fs-item:hover {
-    background: var(--accent-soft);
+    background: var(--tint);
   }
 
   .fs-item .ln {
@@ -350,11 +350,11 @@
     width: 34px;
     text-align: right;
     font-size: 11px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .fs-item .txt {
-    color: var(--text);
+    color: var(--t1);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -371,6 +371,6 @@
     padding: 24px 16px;
     text-align: center;
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 </style>

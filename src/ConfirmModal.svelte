@@ -65,7 +65,7 @@
     width: 400px;
     max-width: 90vw;
     background: var(--bg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--sd);
     border-radius: 12px;
     box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
     padding: 18px 20px;
@@ -77,12 +77,12 @@
   .cm-title {
     font-weight: 600;
     font-size: 15px;
-    color: var(--text);
+    color: var(--t1);
   }
 
   .cm-msg {
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--t2);
     line-height: 1.6;
     word-break: break-all;
   }
@@ -99,9 +99,9 @@
     padding: 0 16px;
     font-size: 13px;
     border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    color: var(--text);
+    border: 1px solid var(--sd);
+    background: var(--sl);
+    color: var(--t1);
     cursor: pointer;
   }
 
@@ -113,14 +113,14 @@
 
   /* 第三按钮（保存并关闭）：主操作强调色 */
   .cm-btn-third {
-    background: var(--accent);
-    border-color: var(--accent);
+    background: var(--p);
+    border-color: var(--p);
     color: #fff;
   }
 
   .cm-btn-third:hover {
-    background: var(--accent);
-    border-color: var(--accent);
+    background: var(--p);
+    border-color: var(--p);
     color: #fff;
     filter: brightness(1.1);
   }

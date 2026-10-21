@@ -27,9 +27,9 @@
     border-radius: 8px;
     font-size: 13px;
     line-height: 1.4;
-    color: var(--text);
-    background: var(--toast-bg, #ffffff);
-    border: 1px solid var(--border, #e2e2e6);
+    color: var(--t1);
+    background: var(--sl, #ffffff);
+    border: 1px solid var(--div, #e2e2e6);
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
     animation: toast-in 160ms ease-out;
   }
@@ -40,7 +40,7 @@
     border-left: 3px solid #e0483d;
   }
   .toast-info {
-    border-left: 3px solid var(--accent, #3b82f6);
+    border-left: 3px solid var(--p, #3b82f6);
   }
   @keyframes toast-in {
     from {

@@ -158,17 +158,17 @@ const codeLanguages: LanguageDescription[] = [
 // ---------------- 外观：浅色主题 + 字号 ----------------
 const liteTheme = EditorView.theme(
   {
-    "&": { height: "100%", backgroundColor: "var(--bg)", color: "var(--text)" },
+    "&": { height: "100%", backgroundColor: "var(--bg)", color: "var(--t1)" },
     ".cm-scroller": {
       fontFamily: '"JetBrains Mono", "SF Mono", Consolas, monospace',
       lineHeight: "1.6",
     },
-    ".cm-gutters": { backgroundColor: "transparent", border: "none", color: "var(--text-2)" },
+    ".cm-gutters": { backgroundColor: "transparent", border: "none", color: "var(--t2)" },
     ".cm-activeLine": { backgroundColor: "rgba(15,110,86,0.06)" },
     ".cm-activeLineGutter": { backgroundColor: "transparent" },
     "&.cm-focused": { outline: "none" },
     ".cm-content": { padding: "16px 0" },
-    ".cm-cursor": { borderLeftColor: "var(--accent)" },
+    ".cm-cursor": { borderLeftColor: "var(--p)" },
   },
   { dark: false }
 );
