@@ -47,7 +47,8 @@
   }
   function targetPathOf(fmt: Fmt): string {
     const d = targetDir.replace(/[\\/]+$/, "");
-    return d + "/" + fileNameOf(fmt);
+    const sep = /\\/.test(d) ? "\\" : "/";
+    return d + sep + fileNameOf(fmt);
   }
 
   function chooseFormat(id: Fmt["id"]) {
