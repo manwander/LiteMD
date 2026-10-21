@@ -5,12 +5,13 @@
   import { listen } from "@tauri-apps/api/event";
   // 模态组件动态加载：不占用主 chunk 启动解析成本，首次打开时才拉对应 chunk
   type SvelteCmp = any;
-  let modalCmps: { SettingsModal?: SvelteCmp; FolderSearch?: SvelteCmp; PromptModal?: SvelteCmp; ConfirmModal?: SvelteCmp } = {};
+  let modalCmps: { SettingsModal?: SvelteCmp; FolderSearch?: SvelteCmp; PromptModal?: SvelteCmp; ConfirmModal?: SvelteCmp; ExportDialog?: SvelteCmp } = {};
   const modalLoaders = {
     SettingsModal: () => import("./SettingsModal.svelte"),
     FolderSearch: () => import("./FolderSearch.svelte"),
     PromptModal: () => import("./PromptModal.svelte"),
     ConfirmModal: () => import("./ConfirmModal.svelte"),
+    ExportDialog: () => import("./ExportDialog.svelte"),
   } as const;
   function loadModal(name: keyof typeof modalLoaders) {
     if (modalCmps[name]) return;
@@ -918,6 +919,26 @@ console.log("Hello LiteMD");
     let painter: { markers: string[]; locked: boolean } | null = null;
     let colorMenu: { type: "fg" | "bg" } | null = null;
     let showFolderSearch = false;
+
+    // ---- LM-23 统一导出对话框 ----
+    type ExportFormat = "md" | "pdf" | "html" | "bundled";
+    let showExportDialog = false;
+    let exportDialogDefault: ExportFormat = "md";
+    function openExportDialog(defaultFormat?: ExportFormat) {
+      if (!currentPath) {
+        status = "请先保存文件再导出";
+        return;
+      }
+      exportDialogDefault = defaultFormat ?? "md";
+      showExportDialog = true;
+    }
+    async function handleExport(format: ExportFormat, targetPath: string) {
+      if (!currentPath) return;
+      if (format === "md") await exportMarkdown(targetPath);
+      else if (format === "pdf") await exportPdfDoc(targetPath);
+      else if (format === "html") await exportHtmlDoc(targetPath);
+      else if (format === "bundled") await exportBundledMd(targetPath);
+    }
 
     // ---- 自定义输入对话框（替代 window.prompt，避免标题栏出现 tauri.localhost）----
     type PromptResult = { name: string; path: string };
@@ -2483,10 +2504,11 @@ console.log("Hello LiteMD");
     "file.save": () => cmd(save),
     "file.saveAs": () => cmd(saveAs),
     "file.saveAll": () => cmd(saveAll),
-    "file.exportMd": () => cmd(exportMarkdown),
-    "file.exportPdf": () => cmd(exportPdfDoc),
-    "file.export": () => cmd(exportHtmlDoc),
-    "file.exportBundled": () => cmd(exportBundledMd),
+    // LM-23：导出收敛到统一对话框。file.export=默认 Markdown；file.exportPdf=预选 PDF
+    // （设置-导出 tab 的「立即导出」按钮仍经此打开对话框）。file.exportMd/Bundled 不再进菜单，
+    // 由对话框的 handleExport 直接调底层导出函数。
+    "file.export": () => cmd(() => openExportDialog()),
+    "file.exportPdf": () => cmd(() => openExportDialog("pdf")),
     "file.clearRecent": () => {
       settings.recentFiles = [];
       persist();
@@ -3103,13 +3125,13 @@ console.log("Hello LiteMD");
     return { html: root.innerHTML, embedded, failed };
   }
 
-  async function exportMarkdown() {
+  async function exportMarkdown(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const text = pullDoc(); // 对话框期间切换标签不会导出错文件
-    const p = await pickSaveFile();
+    const p = targetPath ?? (await pickSaveFile());
     if (!p) return;
     try {
       await writeFile(p, text);
@@ -3119,13 +3141,13 @@ console.log("Hello LiteMD");
     }
   }
 
-  async function exportPdfDoc() {
+  async function exportPdfDoc(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const text = pullDoc();
-    const p = await pickSavePdfFile();
+    const p = targetPath ?? (await pickSavePdfFile());
     if (!p) return;
     const finalPath = /\.pdf$/i.test(p) ? p : p + ".pdf";
     try {
@@ -3137,14 +3159,14 @@ console.log("Hello LiteMD");
     }
   }
 
-  async function exportHtmlDoc() {
+  async function exportHtmlDoc(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const srcPath = currentPath;
     const text = pullDoc();
-    const p = await pickSaveFile();
+    const p = targetPath ?? (await pickSaveFile());
     if (!p) return;
     const title = basename(srcPath);
     const noteDir = srcPath.replace(/[\\/][^\\/]+$/, "") || srcPath;
@@ -3190,13 +3212,13 @@ ${bodyHtml}
     }
   }
 
-  async function exportBundledMd() {
+  async function exportBundledMd(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const baseDir = currentPath.replace(/[\\/][^\\/]+$/, "") || currentPath;
-    const savePath = await pickSaveBundledFile(currentPath);
+    const savePath = targetPath ?? (await pickSaveBundledFile(currentPath));
     if (!savePath) return; // 用户取消
     try {
       const res = await exportBundledMarkdown(savePath, pullDoc(), baseDir);
@@ -4089,7 +4111,7 @@ ${bodyHtml}
     else if (hit("file.openFolder")) run(e, openFolder);
     else if (hit("file.save")) run(e, save);
     else if (hit("file.saveAs")) run(e, saveAs);
-    else if (hit("file.export")) run(e, exportHtmlDoc);
+    else if (hit("file.export")) run(e, () => openExportDialog());
     else if (hit("insert.image")) run(e, insertImg);
     else if (hit("insert.codeBlock")) run(e, codeBlock);
     else if (hit("insert.table")) run(e, table);
@@ -4262,6 +4284,7 @@ ${bodyHtml}
   $: if (showFolderSearch) loadModal("FolderSearch");
   $: if (promptState) loadModal("PromptModal");
   $: if (confirmState || closeTabDialog || closeAllDialog || confirmMigrate || confirmCleanup) loadModal("ConfirmModal");
+  $: if (showExportDialog) loadModal("ExportDialog");
 
   // ====== 脚本块结束，以下为模板 ======
 </script>
@@ -4580,11 +4603,24 @@ ${bodyHtml}
     on:syncForce={(e: CustomEvent<{ mode: "forceUpload" | "forceDownload" }>) => void doSyncRun(e.detail.mode)}
     on:export={() => {
       showSettings = false;
-      exportHtmlDoc();
+      openExportDialog("html");
     }}
     on:exportPdf={() => {
       showSettings = false;
-      exportPdfDoc();
+      openExportDialog("pdf");
+    }}
+  />
+{/if}
+
+{#if showExportDialog && modalCmps.ExportDialog && currentPath}
+  <svelte:component
+    this={modalCmps.ExportDialog}
+    notePath={currentPath}
+    defaultFormat={exportDialogDefault}
+    on:close={() => (showExportDialog = false)}
+    on:export={(e: CustomEvent<{ format: ExportFormat; targetPath: string }>) => {
+      showExportDialog = false;
+      void handleExport(e.detail.format, e.detail.targetPath);
     }}
   />
 {/if}

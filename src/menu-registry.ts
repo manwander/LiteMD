@@ -62,7 +62,7 @@ const SUB_DEFS: Record<MenuGroupId, SubDef[]> = {
     // 「最近打开」：结构上留 sub 标记，运行时由 MenuBar 经 recentFiles prop 注入动态条目，
     // file.clearRecent（清除列表）作为静态子项挂在小标题行下。
     { id: "recent", label: "最近打开", order: 50, children: ["file.clearRecent"] },
-    { id: "exports", label: "导出", order: 90, children: ["file.exportMd", "file.exportPdf", "file.export", "file.exportBundled"] },
+    { id: "exports", label: "导出", order: 90, children: ["file.export"] },
   ],
   edit: [],
   view: [

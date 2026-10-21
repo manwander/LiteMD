@@ -183,7 +183,7 @@ export const SHORTCUT_GROUPS: ActionGroup[] = [
       { id: "file.openFolder", label: "打开文件夹", scope: "app", group: "file", order: 40, surfaces: ["menu", "palette"], ctx: ["tree"] },
       { id: "file.save", label: "保存", scope: "app", group: "file", order: 60, surfaces: ["menu", "palette"], ctx: ["editor", "tree"] },
       { id: "file.saveAs", label: "另存为", scope: "app", group: "file", order: 70, surfaces: ["menu", "palette"], ctx: ["editor"] },
-      { id: "file.export", label: "导出", scope: "app", group: "file", order: 93, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "file.export", label: "导出…", scope: "app", group: "file", order: 93, surfaces: ["menu", "palette"], ctx: ["editor"] },
     ],
   },
   {
@@ -244,9 +244,11 @@ export const MENU_ONLY_ACTIONS: ActionDef[] = [
   { id: "file.newFolder", label: "新建文件夹", scope: "app", group: "file", order: 20, surfaces: ["menu", "palette"], ctx: ["tree"] },
   { id: "file.clearRecent", label: "清除最近打开列表", scope: "app", group: "file", order: 51, surfaces: ["menu", "palette"], ctx: ["tree"] },
   { id: "file.saveAll", label: "全部保存", scope: "app", group: "file", order: 80, surfaces: ["menu", "palette"], ctx: ["editor"] },
-  { id: "file.exportMd", label: "导出 Markdown", scope: "app", group: "file", order: 91, surfaces: ["menu", "palette"], ctx: ["editor"] },
-  { id: "file.exportPdf", label: "导出 PDF", scope: "app", group: "file", order: 92, surfaces: ["menu", "palette"], ctx: ["editor"] },
-  { id: "file.exportBundled", label: "导出自包含 MD", scope: "app", group: "file", order: 94, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  // LM-23：导出收敛为统一对话框。以下三项不再进菜单/命令面板（surfaces 空），但保留
+  // 注册以便设置-导出 tab 的「立即导出」按钮仍能经 dispatch 打开对话框。
+  { id: "file.exportMd", label: "导出 Markdown", scope: "app", order: 91, surfaces: [] },
+  { id: "file.exportPdf", label: "导出 PDF", scope: "app", order: 92, surfaces: [] },
+  { id: "file.exportBundled", label: "导出自包含 MD", scope: "app", order: 94, surfaces: [] },
   { id: "file.print", label: "打印", scope: "app", group: "file", order: 100, accel: "Ctrl+Alt+P", surfaces: ["menu", "palette"], ctx: ["editor"] },
   { id: "file.exit", label: "退出", scope: "app", group: "file", order: 110, accel: "Alt+F4", surfaces: ["menu", "palette"] },
   // —— 编辑组 ——
