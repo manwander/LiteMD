@@ -883,6 +883,52 @@
   export function requestNewFolder() {
     void newFolderIn(newTargetDir());
   }
+  /** 供父组件调用：在侧栏定位指定路径——逐级展开祖先目录，加载并滚动聚焦到该项。
+   *  路径不在任何根之下返回 false（调用方据此提示「不在工作区」）。
+   *  与 revealCreated 的区别：展开全部祖先（深层路径也能显形），且不假定路径是新建项。 */
+  export async function requestReveal(path: string): Promise<boolean> {
+    const np = normPath(path);
+    const s = store.get();
+    const roots = s.rootPaths.map(normPath);
+    const isRoot = roots.includes(np);
+    const underRoot = isRoot || roots.some((r) => isUnder(np, r));
+    if (!underRoot) return false;
+    // 逐级展开祖先（直接父级 → 根），保证深层路径显形
+    if (!isRoot) {
+      const ancestors: string[] = [];
+      let cur = parentDir(np);
+      while (cur && !roots.includes(cur)) {
+        ancestors.push(cur);
+        const up = parentDir(cur);
+        if (up === cur) break;
+        cur = up;
+      }
+      if (ancestors.length) {
+        const next = new Set(s.collapsed);
+        for (const a of ancestors) next.delete(a);
+        store.setCollapsed(next);
+      }
+    }
+    if (isRoot) {
+      const idx = indexOfPath(np);
+      if (idx >= 0) {
+        setFocus(idx);
+        scrollToIndex(idx);
+        return true;
+      }
+      return false;
+    }
+    await opsRevealCreated(store, np);
+    // 等响应式 flatTree 更新后再定位（与 revealCreated 本地版同策略）
+    await new Promise((r) => setTimeout(r, 50));
+    const idx = indexOfPath(np);
+    if (idx >= 0) {
+      setFocus(idx);
+      scrollToIndex(idx);
+      return true;
+    }
+    return false;
+  }
   function toggleFolder(path: string) {
     store.toggleCollapsed(path);
     const s = store.get();

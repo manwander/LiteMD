@@ -129,7 +129,7 @@ body {
   padding-left: calc(12px + var(--safe-left));
   padding-right: calc(12px + var(--safe-right));
   padding-top: var(--safe-top);
-  background: var(--sl);
+  background: var(--bg);
   border-bottom: 1px solid var(--div-nav);
   /* 防止刘海屏 / 圆角内容被裁剪 */
   box-sizing: border-box;
@@ -181,6 +181,7 @@ body {
   gap: 4px;
 }
 
+/* 弹出面板：L4 浮层——同色 + rs-l 凸起（亮色无边，暗色按 §12② 补 1px 白描边） */
 .color-pop {
   position: absolute;
   top: 36px;
@@ -191,9 +192,11 @@ body {
   gap: 6px;
   padding: 10px;
   background: var(--bg);
-  border: 1px solid var(--sd);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  border-radius: 12px;
+  box-shadow: var(--rs-l);
+}
+:root[data-theme="dark"] .color-pop {
+  border: 1px solid var(--srf);
 }
 
 .color-pop .swatch {
@@ -201,7 +204,7 @@ body {
   height: 22px;
   padding: 0;
   border: 1px solid var(--sd);
-  border-radius: 4px;
+  border-radius: 9px;
   cursor: pointer;
 }
 
@@ -225,7 +228,7 @@ body {
   height: 20px;
   padding: 0;
   border: 1px solid var(--sd);
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
   cursor: pointer;
 }
@@ -352,11 +355,11 @@ button:disabled:hover {
   border-color: var(--sd);
 }
 
-/* 文件树 */
+/* 文件树：L1 容器——同色 + 右侧 1px 导航分栏线（--div-nav，§12③） */
 .sidebar {
   width: 240px;
-  background: var(--sl);
-  border-right: 1px solid var(--div);
+  background: var(--bg);
+  border-right: 1px solid var(--div-nav);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -374,18 +377,18 @@ button:disabled:hover {
   outline: none;
 }
 
+/* 树行：r9 · 无行分隔线（分层靠悬停/选中，分栏线只用于容器边界） */
 .sidebar li {
   padding: 0 8px;
   height: 27px;
   line-height: 27px;
-  border-radius: 4px;
+  border-radius: 9px;
   cursor: pointer;
   display: flex;
   align-items: center;
   gap: 6px;
   box-sizing: border-box;
   white-space: nowrap;
-  border-bottom: 1px solid var(--div);
 }
 
 /* 文件树虚拟化占位行（大目录时撑起滚动高度） */

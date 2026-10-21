@@ -290,12 +290,22 @@ export const MENU_ONLY_ACTIONS: ActionDef[] = [
   // —— 窗口组 ——
   { id: "win.newWindow", label: "新窗口", scope: "app", group: "window", order: 10, accel: "Ctrl+Shift+N", surfaces: ["menu", "palette"] },
   { id: "win.newTab", label: "新建标签", scope: "app", group: "window", order: 20, surfaces: ["menu", "palette"] },
-  { id: "win.closeTab", label: "关闭标签", scope: "app", group: "window", order: 30, accel: "Ctrl+W", surfaces: ["menu", "palette"] },
-  { id: "win.closeAllTabs", label: "关闭全部标签", scope: "app", group: "window", order: 40, surfaces: ["menu", "palette"] },
+  { id: "win.closeTab", label: "关闭标签", scope: "app", group: "window", order: 30, accel: "Ctrl+W", surfaces: ["menu", "palette"], ctx: ["tab"] },
+  { id: "win.closeOthers", label: "关闭其他标签", scope: "app", group: "window", order: 35, surfaces: ["menu", "palette"], ctx: ["tab"] },
+  { id: "win.closeAllTabs", label: "关闭全部标签", scope: "app", group: "window", order: 40, surfaces: ["menu", "palette"], ctx: ["tab"] },
   { id: "win.alwaysOnTop", label: "置顶", scope: "app", group: "window", order: 50, surfaces: ["menu", "palette"] },
   { id: "win.minimize", label: "最小化", scope: "app", group: "window", order: 60, surfaces: ["menu", "palette"] },
   { id: "win.toggleMax", label: "最大化 / 还原", scope: "app", group: "window", order: 70, surfaces: ["menu", "palette"] },
   { id: "win.close", label: "关闭", scope: "app", group: "window", order: 80, surfaces: ["menu", "palette"] },
+  // —— 右键专用（B5 四层右键：无 group 不进菜单栏，surfaces 空 = 仅右键消费）——
+  // 标签层
+  { id: "tab.copyPath", label: "复制路径", scope: "app", ctx: ["tab"], surfaces: [] },
+  { id: "tab.revealInTree", label: "在侧栏定位", scope: "app", ctx: ["tab"], surfaces: [] },
+  // 预览层（copyLink / saveImage 由菜单按右键目标条件过滤，见 App ctxMenuItems）
+  { id: "preview.copy", label: "复制", scope: "app", ctx: ["preview"], surfaces: [] },
+  { id: "preview.copyLink", label: "复制链接地址", scope: "app", ctx: ["preview"], surfaces: [] },
+  { id: "preview.openLink", label: "在浏览器打开链接", scope: "app", ctx: ["preview"], surfaces: [] },
+  { id: "preview.saveImage", label: "图片保存到附件", scope: "app", ctx: ["preview"], surfaces: [] },
   // —— 帮助组 ——
   { id: "help.docs", label: "使用文档", scope: "app", group: "help", order: 10, accel: "F1", surfaces: ["menu", "palette"] },
   { id: "help.shortcuts", label: "快捷键速查", scope: "app", group: "help", order: 20, surfaces: ["menu", "palette"] },

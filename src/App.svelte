@@ -35,7 +35,7 @@ import CommandPalette from "./CommandPalette.svelte";
 import OutlinePanel from "./OutlinePanel.svelte";
 import { runAction, type ActionHandlerMap } from "./action-dispatch";
 import { extractOutline, type OutlineItem } from "./outline";
-import { MENU_TREE, GROUP_ORDER, type MenuGroupId, type MenuNode } from "./menu-registry";
+import { MENU_TREE, GROUP_ORDER, displayAccelOf, type MenuGroupId, type MenuNode } from "./menu-registry";
 import { needsMath } from "./needs-math";
 import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizontalRule, insertToc, selectAllDoc, clearFormatting } from "./insert-actions";
   import StatusBar from "./StatusBar.svelte";
@@ -90,6 +90,7 @@ import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizo
     writeFile,
     pickSaveFile,
     pickImageFile,
+    openExternal,
     importAsset,
     importAssetBytes,
     importAssetRaw,
@@ -114,6 +115,7 @@ import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizo
     rewriteAttachmentRefs,
     resolveAttachmentDir,
     attachmentDirName,
+    resolveRef,
   } from "./attachment";
   import { logOp, logInfo, logError, logWarn } from "./logger";
   import {
@@ -127,9 +129,12 @@ import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizo
     DEFAULT_SETTINGS,
     DEFAULT_SHORTCUTS,
     ALL_ACTIONS,
+    ALL_MENU_ACTIONS,
     FONT_SIZE_MIN,
     FONT_SIZE_MAX,
     type Settings,
+    type ActionDef,
+    type CtxId,
   } from "./settings";
   import { settingsBridge } from "./settings-store";
   import { SyncScheduler } from "./sync-scheduler";
@@ -220,6 +225,9 @@ import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizo
             } catch {
               /* 解码失败保持原样 */
             }
+            // 注入原始引用（data-md-ref）：解码后的 markdown 引用串，未受绝对化 / asset
+            // 转换影响；供预览右键「图片保存到附件」精确匹配并改写文档中的旧引用。
+            if (token.attrIndex("data-md-ref") < 0) token.attrPush(["data-md-ref", src]);
             // 相对路径（收编后的 assets/xxx）：按当前笔记所在目录拼成绝对路径后再转换
             const isRemote = /^(https?:|data:|blob:)/.test(src);
             // H-6：导出 HTML 时跳过 asset:// 转换与绝对化，保留原始相对引用
@@ -972,11 +980,180 @@ console.log("Hello LiteMD");
       confirmState = null;
     }
 
-    // ---- 标签右键：关闭当前 / 关闭其他 / 关闭全部（文件树右键菜单在 FileTree 内部）----
-    let ctxMenu: { x: number; y: number; path: string; name: string } | null = null;
+    // ---- 四层右键（B5）：标签 / 编辑器 / 预览（文件树右键菜单在 FileTree 内部）----
+    // 统一 .ctx-menu 原子；条目由菜单注册表按 ctx 过滤，点击走 dispatch
+    // （标签/预览层的上下文动作在 onCtxItem 内按右键目标特判，不依赖 dispatch 传参）
+    type CtxTarget =
+      | { kind: "tab"; path: string; name: string }
+      | { kind: "editor" }
+      | { kind: "preview"; link: string | null; img: string | null };
+    let ctxMenu: { x: number; y: number; target: CtxTarget } | null = null;
 
     function closeCtx() {
       ctxMenu = null;
+    }
+    /** 编辑器层右键（规格 ②）：编辑区右键出格式/插入/编辑子集菜单 */
+    function openEditorCtx(e: MouseEvent) {
+      ctxMenu = { x: e.clientX, y: e.clientY, target: { kind: "editor" } };
+    }
+    /** 预览层右键（规格 ④）：按右键目标带出链接 / 图片上下文（条件项见 ctxMenuItems） */
+    function openPreviewCtx(e: MouseEvent) {
+      const el = e.target as HTMLElement | null;
+      const a = el?.closest?.("a") as HTMLAnchorElement | null;
+      const img = el?.closest?.("img") as HTMLImageElement | null;
+      // 图片取 data-md-ref（initMd 注入的原始引用，收编改写用）；回退 src
+      const imgRef = img ? img.getAttribute("data-md-ref") || img.getAttribute("src") || "" : "";
+      ctxMenu = {
+        x: e.clientX,
+        y: e.clientY,
+        target: {
+          kind: "preview",
+          link: a ? a.getAttribute("href") || null : null,
+          img: imgRef || null,
+        },
+      };
+    }
+
+    /** 编辑器右键条目（规格 ②：剪切/复制/粘贴 · 格式子集 · 插入图片/表格 · 查找） */
+    const EDITOR_CTX_IDS = [
+      "edit.cut", "edit.copy", "edit.paste",
+      "format.bold", "format.italic", "format.underline", "format.code",
+      "insert.bullet", "insert.orderedList",
+      "insert.image", "insert.table",
+      "edit.find",
+    ];
+    interface CtxItem {
+      id: string;
+      label: string;
+    }
+    /** 当前右键菜单条目：编辑器层按 curated 列表；标签/预览层按注册表 ctx 过滤 + 条件项 */
+    function ctxMenuItems(): CtxItem[] {
+      const t = ctxMenu?.target;
+      if (!t) return [];
+      if (t.kind === "editor") {
+        const out: CtxItem[] = [];
+        for (const id of EDITOR_CTX_IDS) {
+          const a = ALL_MENU_ACTIONS.find((x) => x.id === id);
+          if (a) out.push({ id: a.id, label: a.label });
+        }
+        return out;
+      }
+      const ctxId: CtxId = t.kind;
+      return ALL_MENU_ACTIONS.filter((a) => a.ctx?.includes(ctxId))
+        .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
+        .filter((a) => {
+          if (a.id === "preview.copyLink") return t.kind === "preview" && !!t.link;
+          if (a.id === "preview.saveImage") return t.kind === "preview" && !!t.img;
+          return true;
+        })
+        .map((a) => ({ id: a.id, label: a.label }));
+    }
+    /** 右键条目点击：上下文动作特判，其余走统一 dispatch */
+    function onCtxItem(id: string) {
+      const t = ctxMenu?.target ?? null;
+      ctxMenu = null;
+      if (t?.kind === "tab") {
+        if (id === "win.closeTab") {
+          requestCloseTab(t.path);
+          return;
+        }
+        if (id === "win.closeOthers") {
+          for (const tb of [...tabs]) if (tb.path !== t.path) requestCloseTab(tb.path);
+          return;
+        }
+        if (id === "win.closeAllTabs") {
+          for (const tb of [...tabs]) requestCloseTab(tb.path);
+          return;
+        }
+        if (id === "tab.copyPath") {
+          void navigator.clipboard?.writeText(t.path).catch(() => {});
+          status = "已复制路径 " + t.path;
+          return;
+        }
+        if (id === "tab.revealInTree") {
+          void revealInTree(t.path);
+          return;
+        }
+      }
+      if (t?.kind === "preview") {
+        if (id === "preview.copyLink" && t.link) {
+          void navigator.clipboard?.writeText(t.link).catch(() => {});
+          status = "已复制链接地址";
+          return;
+        }
+        if (id === "preview.openLink" && t.link) {
+          void openExternal(t.link).catch(() => {});
+          return;
+        }
+        if (id === "preview.saveImage" && t.img) {
+          void savePreviewImage(t.img);
+          return;
+        }
+      }
+      dispatch(id);
+    }
+    /** 在侧栏定位：展开侧栏目录 tab，展开祖先并滚动聚焦 */
+    async function revealInTree(path: string): Promise<void> {
+      showTree = true;
+      sidebarTab = "tree";
+      await tick();
+      const ok = await treeRef?.requestReveal(path);
+      status = ok ? "已在侧栏定位 " + basename(path) : "不在当前工作区，无法定位";
+    }
+    /** 预览右键「图片保存到附件」：收编进当前文档附件目录，并改写文档中的旧引用 */
+    async function savePreviewImage(ref: string): Promise<void> {
+      const mp = currentMdPath();
+      if (!mp) {
+        status = "请先保存文档，再保存图片到附件";
+        return;
+      }
+      const noteDir = (mp.replace(/[\\/][^\\/]+$/, "") || mp).replace(/\\/g, "/");
+      const assetsName = currentAttachmentName();
+      const isRemote = /^(https?:|data:)/i.test(ref);
+      let newRef: string;
+      try {
+        if (isRemote) {
+          // 外链 / data URL：拉字节走 raw 收编（asset:// 本地图走下方路径版）
+          const resp = await fetch(ref);
+          const bytes = new Uint8Array(await resp.arrayBuffer());
+          const ext = (ref.split("?")[0].match(/\.(\w{2,5})$/)?.[1] ?? "png").toLowerCase();
+          newRef = await importAssetRaw(noteDir, assetsName, ext, bytes, settings.compressImages, settings.jpegQuality);
+        } else {
+          // 本地图片：按原始引用（相对→绝对）直接收编，走压缩管线
+          const abs = resolveRef(noteDir, ref) ?? ref;
+          newRef = await importAsset(abs, noteDir, assetsName, settings.compressImages, settings.jpegQuality);
+        }
+      } catch (e) {
+        status = "保存图片失败：" + String((e as { message?: string })?.message ?? e);
+        return;
+      }
+      // 改写文档引用：仅精确匹配旧引用串时替换（避免误伤正文同名文本）
+      if (view && !isRemote) {
+        const doc = pullDoc();
+        if (doc.includes(ref)) {
+          const next = doc.split(ref).join(newRef);
+          if (next !== doc) {
+            view.dispatch(view.state.update({ changes: { from: 0, to: view.state.doc.length, insert: next } }));
+          }
+        }
+      }
+      status = "图片已保存到附件：" + newRef;
+    }
+    /** 右键「粘贴」：读剪贴板文本插入光标处（execCommand paste 已被浏览器禁用） */
+    async function pasteFromClipboard(): Promise<void> {
+      if (!view) return;
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+          status = "剪贴板中没有文本";
+          return;
+        }
+        view.dispatch(view.state.replaceSelection(text));
+        view.focus();
+        status = "已粘贴";
+      } catch {
+        status = "无法读取剪贴板，请用 Ctrl+V 粘贴";
+      }
     }
 
     // 树内重命名/移动后：更新已打开标签的路径（供 FileTree handlers.onTabRenamed 使用）
@@ -1092,24 +1269,6 @@ console.log("Hello LiteMD");
       }
     }
 
-    // ---- 标签右键：关闭当前 / 关闭其他 / 关闭全部 ----
-    function ctxCloseTab() {
-      const p = ctxMenu?.path;
-      ctxMenu = null;
-      if (p) requestCloseTab(p);
-    }
-    function ctxCloseOthers() {
-      const p = ctxMenu?.path;
-      ctxMenu = null;
-      if (!p) return;
-      for (const t of [...tabs]) {
-        if (t.path !== p) requestCloseTab(t.path);
-      }
-    }
-    function ctxCloseAll() {
-      ctxMenu = null;
-      for (const t of [...tabs]) requestCloseTab(t.path);
-    }
     // ---- 分栏拖动（侧边栏宽度 / 预览宽度）----
     let sidebarWidth = 240;
     let previewWidth = 440;
@@ -2340,6 +2499,22 @@ console.log("Hello LiteMD");
     "edit.replace": () => cmd(() => { if (!view) return; view.focus(); openSearchPanelCmd(true)(view); }),
     "edit.folderSearch": () => cmd(openFolderSearch),
     "edit.selectAll": () => cmd(() => { if (view) selectAllDoc(view); }),
+    // 剪切/复制/粘贴（右键编辑器层）：cut/copy 走 execCommand（用户手势上下文可用）；
+    // paste 经 clipboard.readText 后插入光标处（execCommand paste 已被浏览器禁用）
+    "edit.cut": () => cmd(() => { if (view) { view.focus(); document.execCommand("cut"); } }),
+    "edit.copy": () => cmd(() => { if (view) { view.focus(); document.execCommand("copy"); } }),
+    "edit.paste": () => cmd(() => { void pasteFromClipboard(); }),
+    // 预览右键（B5 四层右键·预览层；上下文动作在 onCtxItem 特判）
+    "preview.copy": () => cmd(() => {
+      const sel = window.getSelection();
+      const text = sel && !sel.isCollapsed ? sel.toString() : "";
+      if (text) {
+        void navigator.clipboard?.writeText(text).catch(() => {});
+        status = "已复制所选文本";
+      } else {
+        status = "未选择内容";
+      }
+    }),
     // 视图
     "view.togglePreview": () => cmd(togglePreviewPane),
     "view.modeRealtime": () => cmd(() => setViewMode("live")),
@@ -2394,6 +2569,14 @@ console.log("Hello LiteMD");
     "help.about": () => (showSettings = true),
     "help.shortcuts": () => (showSettings = true),
     // 窗口
+    // 注：win.newWindow / win.newTab 暂无真实实现，保持无 handler（菜单树 pruneTree 裁掉）；
+    // 不做占位 handler——那会让菜单出现点了不干事的条目（无 TODO 桩红线）。
+    "win.closeTab": () => cmd(() => { const t = tabs[activeIdx]; if (t) requestCloseTab(t.path); }),
+    "win.closeOthers": () => cmd(() => {
+      const keep = tabs[activeIdx]?.path;
+      for (const t of [...tabs]) if (t.path !== keep) requestCloseTab(t.path);
+    }),
+    "win.closeAllTabs": () => cmd(() => { for (const t of [...tabs]) requestCloseTab(t.path); }),
     "win.minimize": () => cmd(winMinimize),
     "win.toggleMax": () => cmd(winToggleMax),
     "win.close": () => cmd(winClose),
@@ -4190,8 +4373,12 @@ ${bodyHtml}
                 tabindex="-1"
                 on:click={() => activateTab(i)}
                 on:contextmenu|preventDefault={(e) => {
-                  // 右键标签：显示操作菜单（关闭/关闭其他/关闭全部）
-                  ctxMenu = { x: e.clientX, y: e.clientY, path: tab.path, name: basename(tab.path) };
+                  // 右键标签（B5 四层右键·标签层）：关闭/关闭其他/关闭全部/复制路径/在侧栏定位
+                  ctxMenu = {
+                    x: e.clientX,
+                    y: e.clientY,
+                    target: { kind: "tab", path: tab.path, name: basename(tab.path) },
+                  };
                 }}
                 title={tab.path}
               >
@@ -4244,6 +4431,7 @@ ${bodyHtml}
         class="editor-host"
         bind:this={editorHost}
         on:mouseup={onEditorMouseUp}
+        on:contextmenu|preventDefault={(e) => openEditorCtx(e)}
         style={previewEditMode ? "display:none" : ""}
       ></div>
       {#if loadingBigDoc}
@@ -4271,7 +4459,8 @@ ${bodyHtml}
             >↻</button>
           {/if}
         </div>
-        <div class="preview-content">
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <div class="preview-content" on:contextmenu|preventDefault={(e) => openPreviewCtx(e)}>
           <VirtualPreview
             bind:this={previewRef}
             {md}
@@ -4512,10 +4701,12 @@ ${bodyHtml}
       on:click|stopPropagation
       on:contextmenu|preventDefault|stopPropagation
     >
-      <div class="ctx-title" title={ctxMenu.path}>{ctxMenu.name}</div>
-      <button class="ctx-item" on:click={ctxCloseTab}>✕ 关闭标签</button>
-      <button class="ctx-item" on:click={ctxCloseOthers}>✕ 关闭其他标签</button>
-      <button class="ctx-item" on:click={ctxCloseAll}>✕ 关闭全部标签</button>
+      {#if ctxMenu.target.kind === "tab"}
+        <div class="ctx-title" title={ctxMenu.target.path}>{ctxMenu.target.name}</div>
+      {/if}
+      {#each ctxMenuItems() as item (item.id)}
+        <button class="ctx-item" on:click={() => onCtxItem(item.id)}>{item.label}</button>
+      {/each}
     </div>
   </div>
 {/if}
