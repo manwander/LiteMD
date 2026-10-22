@@ -2105,6 +2105,7 @@ version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "encoding_rs",
  "futures",
  "httpdate",
  "image",

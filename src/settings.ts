@@ -131,6 +131,23 @@ export interface Settings {
 
 export type ActionScope = "app" | "editor";
 
+/** 菜单栏组 id（8 组，对齐设计方案 §04；menu-registry 单一数据源消费） */
+export type MenuGroupId =
+  | "file"
+  | "edit"
+  | "view"
+  | "insert"
+  | "format"
+  | "tools"
+  | "window"
+  | "help";
+
+/** 入口面：菜单栏 / 工具栏 / 命令面板（B3 起按 surfaces 过滤渲染） */
+export type Surface = "menu" | "toolbar" | "palette";
+
+/** 右键上下文 id（B5 四层右键菜单按 ctx 过滤） */
+export type CtxId = "editor" | "tree" | "tab" | "preview";
+
 export interface ActionDef {
   id: string;
   label: string;
@@ -138,6 +155,18 @@ export interface ActionDef {
   scope: ActionScope;
   /** 只读项不允许重绑定（保留给系统级键位） */
   readonly?: boolean;
+  /** 菜单栏组（缺省 = 不出现在菜单栏，仅供工具栏/命令面板等入口使用） */
+  group?: MenuGroupId;
+  /** 组内排序（升序；子菜单 children 同样按 order 排序） */
+  order?: number;
+  /** 展示用加速键（仅显示用；真值仍读 DEFAULT_SHORTCUTS / settings.shortcuts） */
+  accel?: string;
+  /** 图标 symbol id（B6 图标落地时启用，此前留空） */
+  icon?: string;
+  /** 出现在哪些入口（默认仅 "menu"） */
+  surfaces?: Surface[];
+  /** 右键上下文归属（B5 消费） */
+  ctx?: CtxId[];
 }
 
 export interface ActionGroup {
@@ -149,65 +178,152 @@ export const SHORTCUT_GROUPS: ActionGroup[] = [
   {
     title: "文件",
     actions: [
-      { id: "file.new", label: "新建笔记", scope: "app" },
-      { id: "file.open", label: "打开文件", scope: "app" },
-      { id: "file.openFolder", label: "打开文件夹", scope: "app" },
-      { id: "file.save", label: "保存", scope: "app" },
-      { id: "file.saveAs", label: "另存为", scope: "app" },
-      { id: "file.export", label: "导出", scope: "app" },
+      { id: "file.new", label: "新建笔记", scope: "app", group: "file", order: 10, surfaces: ["menu", "palette"], ctx: ["tree"] },
+      { id: "file.open", label: "打开文件", scope: "app", group: "file", order: 30, surfaces: ["menu", "palette"], ctx: ["tree"] },
+      { id: "file.openFolder", label: "打开文件夹", scope: "app", group: "file", order: 40, surfaces: ["menu", "palette"], ctx: ["tree"] },
+      { id: "file.save", label: "保存", scope: "app", group: "file", order: 60, surfaces: ["menu", "palette"], ctx: ["editor", "tree"] },
+      { id: "file.saveAs", label: "另存为", scope: "app", group: "file", order: 70, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "file.export", label: "导出…", scope: "app", group: "file", order: 93, surfaces: ["menu", "palette"], ctx: ["editor"] },
     ],
   },
   {
     title: "编辑",
     actions: [
-      { id: "edit.undo", label: "撤销", scope: "editor" },
-      { id: "edit.redo", label: "重做", scope: "editor" },
-      { id: "edit.find", label: "查找", scope: "editor" },
-      { id: "edit.replace", label: "替换", scope: "editor" },
-      { id: "table.duplicateRow", label: "复制表格行到下方", scope: "editor" },
+      { id: "edit.undo", label: "撤销", scope: "editor", group: "edit", order: 10, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "edit.redo", label: "重做", scope: "editor", group: "edit", order: 20, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "edit.find", label: "查找", scope: "editor", group: "edit", order: 40, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "edit.replace", label: "替换", scope: "editor", group: "edit", order: 41, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "table.duplicateRow", label: "复制表格行到下方", scope: "editor", group: "edit", order: 60, surfaces: ["menu", "palette"], ctx: ["editor"] },
     ],
   },
   {
     title: "格式",
     actions: [
-      { id: "format.bold", label: "加粗", scope: "editor" },
-      { id: "format.italic", label: "斜体", scope: "editor" },
-      { id: "format.underline", label: "下划线", scope: "editor" },
-      { id: "format.strike", label: "删除线", scope: "editor" },
-      { id: "format.link", label: "插入链接", scope: "editor" },
-      { id: "format.h1", label: "一级标题", scope: "editor" },
-      { id: "format.h2", label: "二级标题", scope: "editor" },
-      { id: "format.h3", label: "三级标题", scope: "editor" },
-      { id: "format.h4", label: "四级标题", scope: "editor" },
-      { id: "format.h5", label: "五级标题", scope: "editor" },
-      { id: "format.quote", label: "引用", scope: "app" },
+      { id: "format.bold", label: "加粗", scope: "editor", group: "format", order: 20, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "format.italic", label: "斜体", scope: "editor", group: "format", order: 30, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "format.underline", label: "下划线", scope: "editor", group: "format", order: 40, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "format.strike", label: "删除线", scope: "editor", group: "format", order: 50, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "format.link", label: "插入链接", scope: "editor", group: "insert", order: 60, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "format.h1", label: "一级标题", scope: "editor", group: "format", order: 11, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "format.h2", label: "二级标题", scope: "editor", group: "format", order: 12, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "format.h3", label: "三级标题", scope: "editor", group: "format", order: 13, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "format.h4", label: "四级标题", scope: "editor", group: "format", order: 14, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "format.h5", label: "五级标题", scope: "editor", group: "format", order: 15, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "format.quote", label: "引用", scope: "app", group: "insert", order: 70, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
     ],
   },
   {
     title: "插入",
     actions: [
-      { id: "insert.image", label: "插入图片", scope: "app" },
-      { id: "insert.codeBlock", label: "插入代码块", scope: "app" },
-      { id: "insert.table", label: "插入表格", scope: "app" },
-      { id: "table.addColumn", label: "表格添加列", scope: "app" },
-      { id: "insert.bullet", label: "无序号列表", scope: "app" },
+      { id: "insert.image", label: "插入图片", scope: "app", group: "insert", order: 10, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "insert.codeBlock", label: "插入代码块", scope: "app", group: "insert", order: 30, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "insert.table", label: "插入表格", scope: "app", group: "insert", order: 20, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+      { id: "table.addColumn", label: "表格添加列", scope: "app", group: "insert", order: 110, surfaces: ["menu", "palette"], ctx: ["editor"] },
+      { id: "insert.bullet", label: "无序号列表", scope: "app", group: "format", order: 71, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
     ],
   },
   {
     title: "视图",
     actions: [
-      { id: "view.togglePreview", label: "切换预览/分屏", scope: "app" },
-      { id: "view.focusMode", label: "专注模式", scope: "app" },
-      { id: "view.fontIncrease", label: "增大字号", scope: "app" },
-      { id: "view.fontDecrease", label: "减小字号", scope: "app" },
+      { id: "view.togglePreview", label: "切换预览/分屏", scope: "app", group: "view", order: 10, surfaces: ["menu", "palette"] },
+      { id: "view.focusMode", label: "专注模式", scope: "app", group: "view", order: 30, surfaces: ["menu", "toolbar", "palette"] },
+      { id: "view.fontIncrease", label: "增大字号", scope: "app", group: "view", order: 50, surfaces: ["menu", "palette"] },
+      { id: "view.fontDecrease", label: "减小字号", scope: "app", group: "view", order: 51, surfaces: ["menu", "palette"] },
     ],
   },
 ];
 
 export const ALL_ACTIONS: ActionDef[] = SHORTCUT_GROUPS.flatMap((g) => g.actions);
 
+// ---------------- 菜单专用动作定义（B2 菜单注册表数据源） ----------------
+// 只进菜单注册表、不进 SHORTCUT_GROUPS（设置页快捷键 tab 渲染零变化）：
+// 含本批尚无 handler 的条目（打印/检查更新/公式/目录等），集成阶段按 handler
+// 可用性裁剪；accel 仅展示用，真值仍读 DEFAULT_SHORTCUTS / settings.shortcuts。
+export const MENU_ONLY_ACTIONS: ActionDef[] = [
+  // —— 文件组 ——
+  { id: "file.newFolder", label: "新建文件夹", scope: "app", group: "file", order: 20, surfaces: ["menu", "palette"], ctx: ["tree"] },
+  { id: "file.clearRecent", label: "清除最近打开列表", scope: "app", group: "file", order: 51, surfaces: ["menu", "palette"], ctx: ["tree"] },
+  { id: "file.saveAll", label: "全部保存", scope: "app", group: "file", order: 80, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  // LM-23：导出收敛为统一对话框。以下三项不再进菜单/命令面板（surfaces 空），但保留
+  // 注册以便设置-导出 tab 的「立即导出」按钮仍能经 dispatch 打开对话框。
+  { id: "file.exportMd", label: "导出 Markdown", scope: "app", order: 91, surfaces: [] },
+  { id: "file.exportPdf", label: "导出 PDF", scope: "app", order: 92, surfaces: [] },
+  { id: "file.exportBundled", label: "导出自包含 MD", scope: "app", order: 94, surfaces: [] },
+  { id: "file.print", label: "打印", scope: "app", group: "file", order: 100, accel: "Ctrl+Alt+P", surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "file.exit", label: "退出", scope: "app", group: "file", order: 110, accel: "Alt+F4", surfaces: ["menu", "palette"] },
+  // —— 编辑组 ——
+  { id: "edit.cut", label: "剪切", scope: "app", group: "edit", order: 30, accel: "Ctrl+X", surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "edit.copy", label: "复制", scope: "app", group: "edit", order: 31, accel: "Ctrl+C", surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "edit.paste", label: "粘贴", scope: "app", group: "edit", order: 32, accel: "Ctrl+V", surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "edit.selectAll", label: "全选", scope: "app", group: "edit", order: 33, accel: "Ctrl+A", surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "edit.folderSearch", label: "文件夹内查找替换", scope: "app", group: "edit", order: 50, accel: "Ctrl+Shift+F", surfaces: ["menu", "palette"], ctx: ["editor"] },
+  // —— 视图组 ——
+  { id: "view.modeRealtime", label: "实时预览", scope: "app", group: "view", order: 11, accel: "Ctrl+1", surfaces: ["menu", "palette"] },
+  { id: "view.modeSource", label: "源码", scope: "app", group: "view", order: 12, accel: "Ctrl+2", surfaces: ["menu", "palette"] },
+  { id: "view.modeSplit", label: "分屏", scope: "app", group: "view", order: 13, accel: "Ctrl+3", surfaces: ["menu", "palette"] },
+  { id: "view.panelTree", label: "文件树", scope: "app", group: "view", order: 21, accel: "Ctrl+B", surfaces: ["menu", "palette"] },
+  { id: "view.panelOutline", label: "大纲", scope: "app", group: "view", order: 22, surfaces: ["menu", "palette"] },
+  { id: "view.panelSearch", label: "搜索", scope: "app", group: "view", order: 23, surfaces: ["menu", "palette"] },
+  { id: "view.typewriter", label: "打字机模式", scope: "app", group: "view", order: 31, accel: "F9", surfaces: ["menu", "palette"] },
+  { id: "view.themeLight", label: "素塑亮", scope: "app", group: "view", order: 41, surfaces: ["menu", "palette"] },
+  { id: "view.themeDark", label: "素塑暗", scope: "app", group: "view", order: 42, surfaces: ["menu", "palette"] },
+  { id: "view.themeAuto", label: "跟随系统", scope: "app", group: "view", order: 43, surfaces: ["menu", "palette"] },
+  { id: "view.fullscreen", label: "全屏", scope: "app", group: "view", order: 60, surfaces: ["menu", "palette"] },
+  { id: "view.menubar", label: "菜单栏", scope: "app", group: "view", order: 70, accel: "Alt", surfaces: ["menu", "palette"] },
+  // —— 插入组 ——
+  { id: "insert.math", label: "公式", scope: "app", group: "insert", order: 40, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "insert.task", label: "任务列表", scope: "app", group: "insert", order: 50, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+  { id: "insert.hr", label: "水平线", scope: "app", group: "insert", order: 80, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "insert.datetime", label: "日期时间", scope: "app", group: "insert", order: 90, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "insert.toc", label: "目录", scope: "app", group: "insert", order: 100, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  // —— 格式组 ——
+  { id: "format.h6", label: "六级标题", scope: "editor", group: "format", order: 16, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "format.paragraph", label: "正文", scope: "editor", group: "format", order: 17, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "format.code", label: "行内代码", scope: "editor", group: "format", order: 60, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "format.clearFormat", label: "清除格式", scope: "editor", group: "format", order: 80, surfaces: ["menu", "palette"], ctx: ["editor"] },
+  { id: "insert.orderedList", label: "有序列表", scope: "app", group: "format", order: 72, surfaces: ["menu", "toolbar", "palette"], ctx: ["editor"] },
+  // —— 工具组 ——
+  { id: "tools.wordCount", label: "字数统计", scope: "app", group: "tools", order: 10, surfaces: ["menu", "palette"] },
+  { id: "tools.migrateImages", label: "迁移图片附件", scope: "app", group: "tools", order: 21, surfaces: ["menu", "palette"] },
+  { id: "tools.migrateFolder", label: "批量迁移文件夹图片", scope: "app", group: "tools", order: 22, surfaces: ["menu", "palette"] },
+  { id: "tools.cleanupAssets", label: "清理未引用附件", scope: "app", group: "tools", order: 23, surfaces: ["menu", "palette"] },
+  { id: "app.settings", label: "设置", scope: "app", group: "tools", order: 30, accel: "Ctrl+,", surfaces: ["menu", "toolbar", "palette"] },
+  { id: "app.shortcuts", label: "快捷键", scope: "app", group: "tools", order: 40, surfaces: ["menu", "palette"] },
+  // —— 窗口组 ——
+  { id: "win.newWindow", label: "新窗口", scope: "app", group: "window", order: 10, accel: "Ctrl+Shift+N", surfaces: ["menu", "palette"] },
+  { id: "win.newTab", label: "新建标签", scope: "app", group: "window", order: 20, surfaces: ["menu", "palette"] },
+  { id: "win.closeTab", label: "关闭标签", scope: "app", group: "window", order: 30, accel: "Ctrl+W", surfaces: ["menu", "palette"], ctx: ["tab"] },
+  { id: "win.closeOthers", label: "关闭其他标签", scope: "app", group: "window", order: 35, surfaces: ["menu", "palette"], ctx: ["tab"] },
+  { id: "win.closeAllTabs", label: "关闭全部标签", scope: "app", group: "window", order: 40, surfaces: ["menu", "palette"], ctx: ["tab"] },
+  { id: "win.alwaysOnTop", label: "置顶", scope: "app", group: "window", order: 50, surfaces: ["menu", "palette"] },
+  { id: "win.minimize", label: "最小化", scope: "app", group: "window", order: 60, surfaces: ["menu", "palette"] },
+  { id: "win.toggleMax", label: "最大化 / 还原", scope: "app", group: "window", order: 70, surfaces: ["menu", "palette"] },
+  { id: "win.close", label: "关闭", scope: "app", group: "window", order: 80, surfaces: ["menu", "palette"] },
+  // —— 右键专用（B5 四层右键：无 group 不进菜单栏，surfaces 空 = 仅右键消费）——
+  // 标签层
+  { id: "tab.copyPath", label: "复制路径", scope: "app", ctx: ["tab"], surfaces: [] },
+  { id: "tab.revealInTree", label: "在侧栏定位", scope: "app", ctx: ["tab"], surfaces: [] },
+  // 预览层（copyLink / saveImage 由菜单按右键目标条件过滤，见 App ctxMenuItems）
+  { id: "preview.copy", label: "复制", scope: "app", ctx: ["preview"], surfaces: [] },
+  { id: "preview.copyLink", label: "复制链接地址", scope: "app", ctx: ["preview"], surfaces: [] },
+  { id: "preview.openLink", label: "在浏览器打开链接", scope: "app", ctx: ["preview"], surfaces: [] },
+  { id: "preview.saveImage", label: "图片保存到附件", scope: "app", ctx: ["preview"], surfaces: [] },
+  // —— 帮助组 ——
+  { id: "help.docs", label: "使用文档", scope: "app", group: "help", order: 10, accel: "F1", surfaces: ["menu", "palette"] },
+  { id: "help.shortcuts", label: "快捷键速查", scope: "app", group: "help", order: 20, surfaces: ["menu", "palette"] },
+  { id: "help.checkUpdate", label: "检查更新", scope: "app", group: "help", order: 30, surfaces: ["menu", "palette"] },
+  { id: "help.about", label: "关于", scope: "app", group: "help", order: 40, surfaces: ["menu", "palette"] },
+];
+
+/** 菜单注册表全量动作 = 快捷键注册表动作 + 菜单专用动作（menu-registry 唯一数据源） */
+export const ALL_MENU_ACTIONS: ActionDef[] = [...ALL_ACTIONS, ...MENU_ONLY_ACTIONS];
+
+const MENU_ACTION_INDEX: Map<string, ActionDef> = new Map(
+  ALL_MENU_ACTIONS.map((a) => [a.id, a])
+);
+
 export function actionLabel(id: string): string {
-  return ALL_ACTIONS.find((a) => a.id === id)?.label ?? id;
+  return MENU_ACTION_INDEX.get(id)?.label ?? id;
 }
 
 export const DEFAULT_SHORTCUTS: Record<string, string> = {

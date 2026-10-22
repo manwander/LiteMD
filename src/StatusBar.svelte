@@ -52,25 +52,24 @@
 
 <style>
   .sb-warn {
-    color: #b26a00;
-    background: rgba(255, 176, 32, 0.14);
+    color: var(--warn);
     border-radius: 4px;
     padding: 0 6px;
     white-space: nowrap;
     cursor: help;
   }
   .sb-sync {
-    color: var(--text-2);
+    color: var(--t2);
     border-radius: 4px;
     padding: 0 6px;
     white-space: nowrap;
     cursor: pointer;
   }
   .sb-sync:hover {
-    background: var(--border);
-    color: var(--text);
+    background: var(--hov);
+    color: var(--t1);
   }
   .sb-sync.busy {
-    color: var(--accent);
+    color: var(--p);
   }
 </style>

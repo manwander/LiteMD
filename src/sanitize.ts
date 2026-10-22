@@ -12,6 +12,13 @@
 //   默认集收窄而来：额外禁掉 style/iframe/form 等可被滥用的标签，
 //   并显式放行 Tauri 的 asset:// 协议（本地图片预览依赖它）。
 //
+// E5 渲染补强放行（最小原则，C-4/C-5/C-6）：
+//   - input[type=checkbox][disabled]：markdown-it-task-lists 产物（原有降级
+//     钩子已覆盖，input 不在禁用列表，属性经钩子归一化）；
+//   - data-src：Mermaid 占位 div 的原文属性（ADD_ATTR 定向放行，不开放全部 data-*）；
+//   - .katex 子树内的 position/top/border-bottom-width：KaTeX 分式/根式行内
+//     堆叠所必需（position 仅放行 relative；fixed/absolute 点击劫持面继续全拦）。
+//
 // 单一出口原则：任何新增的 innerHTML/{@html} 注入点都必须调用本模块，
 //   不要绕过。搜索 `sanitizeHtml(` 即可枚举全部注入点。
 
@@ -125,6 +132,18 @@ const SAFE_STYLE_PROPS = new Set([
   "list-style-type",
 ]);
 
+/**
+ * KaTeX 产物专用样式属性（仅当元素处于 .katex 子树内时放行，见 sanitizeStyleAttr）。
+ * KaTeX 的分式/根式/巨符用 relative + 负 top 做行内堆叠，缺了会散架；
+ * 这些属性对 .katex 之外的元素继续全拦（现有布局劫持测试不受影响）。
+ * position 的值约束在 sanitizeStyleAttr 内单独收紧为 relative。
+ */
+const KATEX_STYLE_PROPS = new Set([
+  "position",
+  "top",
+  "border-bottom-width",
+]);
+
 /** 危险 CSS 值模式：外链、脚本表达式、行为绑定；反斜杠用于阻断 CSS 转义绕过（u\72l(...)） */
 const UNSAFE_STYLE_VALUE = /url\s*\(|expression\s*\(|javascript:|vbscript:|@import|behavior\s*:|-moz-binding|image-set\s*\(|element\s*\(|\\/i;
 
@@ -132,6 +151,10 @@ const UNSAFE_STYLE_VALUE = /url\s*\(|expression\s*\(|javascript:|vbscript:|@impo
 function sanitizeStyleAttr(el: Element): void {
   const raw = el.getAttribute("style");
   if (!raw) return;
+  // KaTeX 产物（.katex 子树内的分式/根式堆叠）放行 position:relative + top 等
+  // 几何属性；其余元素仍走保守白名单（ALLOW_DATA_ATTR=false 等策略不变）。
+  // 手写 <span class="katex" style="position:fixed"> 也会被下方值约束拦下。
+  const inKatex = typeof el.closest === "function" && el.closest(".katex") !== null;
   const kept: string[] = [];
   // 限制单元素样式长度，避免超长垃圾串拖慢解析/渲染
   for (const decl of raw.slice(0, 4000).split(";")) {
@@ -139,8 +162,10 @@ function sanitizeStyleAttr(el: Element): void {
     if (idx <= 0) continue;
     const prop = decl.slice(0, idx).trim().toLowerCase();
     const value = decl.slice(idx + 1).trim();
-    if (!SAFE_STYLE_PROPS.has(prop)) continue;
+    if (!SAFE_STYLE_PROPS.has(prop) && !(inKatex && KATEX_STYLE_PROPS.has(prop))) continue;
     if (!value || UNSAFE_STYLE_VALUE.test(value)) continue;
+    // position 仅放行 relative（KaTeX 唯一用法）；fixed/absolute 是点击劫持面
+    if (prop === "position" && !/^relative$/i.test(value)) continue;
     kept.push(`${prop}: ${value}`);
   }
   if (kept.length) el.setAttribute("style", kept.join("; "));
@@ -204,7 +229,9 @@ export function sanitizeHtml(html: string): string {
     FORBID_TAGS,
     FORBID_ATTR,
     ALLOWED_URI_REGEXP,
-    ADD_ATTR: ["target", "loading", "decoding", "align", "colspan", "rowspan"],
+    // data-src：Mermaid 占位 div 的原文属性（md-pipeline C-6，URI 编码后注入）；
+    // ALLOW_DATA_ATTR=false 保持不动，仅定向放行这一个属性
+    ADD_ATTR: ["target", "loading", "decoding", "align", "colspan", "rowspan", "data-src"],
     ALLOW_DATA_ATTR: false,
     // 保留完整文档片段结构（表格 / 列表等），不做 body 提取
     WHOLE_DOCUMENT: false,

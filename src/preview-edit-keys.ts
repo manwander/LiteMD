@@ -706,7 +706,30 @@ export function attachPreviewEditKeys(root: HTMLElement, opts: PreviewEditKeyOpt
   // 光标定位（点击 / 方向键等）后也把光标纠正到「倒数第二行」，
   // 避免光标先停在最后一行、输入时再跳到倒数第二行的「跳」感。
   // rAF 等一帧让浏览器更新 selection 后再测量。
+  //
+  // LM-22 块级直改：同点同步「激活块」类——光标所在顶层块打 .pv-blk-active
+  // （激活表面 is-s + 左 2px 主色竖条，样式见 style.css .preview-edit > .pv-blk-active）。
+  // 顶层块 = root 的直接子元素；切块时迁移类，detach 时清除。
+  let activeBlock: Element | null = null;
+  function topLevelBlock(node: Node | null): Element | null {
+    let el: Node | null = node && node.nodeType === 1 ? (node as Element) : node?.parentElement ?? null;
+    while (el && el !== root) {
+      if (el.parentElement === root) return el.nodeType === 1 ? (el as Element) : null;
+      el = el.parentElement;
+    }
+    return null;
+  }
+  function syncActiveBlock() {
+    const sel = window.getSelection();
+    const node = sel && sel.rangeCount ? sel.anchorNode : null;
+    const block = node && root.contains(node) ? topLevelBlock(node) : null;
+    if (block === activeBlock) return;
+    activeBlock?.classList.remove("pv-blk-active");
+    block?.classList.add("pv-blk-active");
+    activeBlock = block;
+  }
   function onCursorMove() {
+    syncActiveBlock();
     const sel = window.getSelection();
     // 选择 / 全选（非折叠选区）时只放置了拖蓝、光标未定，不滚动跟焦，避免误跳。
     if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return;
@@ -718,7 +741,11 @@ export function attachPreviewEditKeys(root: HTMLElement, opts: PreviewEditKeyOpt
   root.addEventListener("paste", onPaste);
   root.addEventListener("dragover", onDragOver);
   root.addEventListener("drop", onDrop);
+  // 进入预览编辑时若已有光标（重入场景），立即标定激活块
+  syncActiveBlock();
   return () => {
+    activeBlock?.classList.remove("pv-blk-active");
+    activeBlock = null;
     root.removeEventListener("click", onCursorMove);
     root.removeEventListener("keyup", onCursorMove);
     root.removeEventListener("keydown", onKeydown);

@@ -5,12 +5,13 @@
   import { listen } from "@tauri-apps/api/event";
   // 模态组件动态加载：不占用主 chunk 启动解析成本，首次打开时才拉对应 chunk
   type SvelteCmp = any;
-  let modalCmps: { SettingsModal?: SvelteCmp; FolderSearch?: SvelteCmp; PromptModal?: SvelteCmp; ConfirmModal?: SvelteCmp } = {};
+  let modalCmps: { SettingsModal?: SvelteCmp; FolderSearch?: SvelteCmp; PromptModal?: SvelteCmp; ConfirmModal?: SvelteCmp; ExportDialog?: SvelteCmp } = {};
   const modalLoaders = {
     SettingsModal: () => import("./SettingsModal.svelte"),
     FolderSearch: () => import("./FolderSearch.svelte"),
     PromptModal: () => import("./PromptModal.svelte"),
     ConfirmModal: () => import("./ConfirmModal.svelte"),
+    ExportDialog: () => import("./ExportDialog.svelte"),
   } as const;
   function loadModal(name: keyof typeof modalLoaders) {
     if (modalCmps[name]) return;
@@ -28,6 +29,16 @@
   // 安全边界：所有 HTML 注入（预览 / 预览编辑 / 导出）必须经此清洗，见 sanitize.ts 注释
   import { safeRender, sanitizeHtml } from "./sanitize";
   import VirtualPreview from "./preview/VirtualPreview.svelte";
+// 产品化集成（B2–B4）：菜单栏 / 工具栏 / 命令面板 / 大纲面板 / 菜单注册表 / 动作分发 / 渲染管线
+import MenuBar from "./MenuBar.svelte";
+import Toolbar from "./Toolbar.svelte";
+import CommandPalette from "./CommandPalette.svelte";
+import OutlinePanel from "./OutlinePanel.svelte";
+import { runAction, type ActionHandlerMap } from "./action-dispatch";
+import { extractOutline, type OutlineItem } from "./outline";
+import { MENU_TREE, GROUP_ORDER, displayAccelOf, type MenuGroupId, type MenuNode } from "./menu-registry";
+import { needsMath } from "./needs-math";
+import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizontalRule, insertToc, selectAllDoc, clearFormatting } from "./insert-actions";
   import StatusBar from "./StatusBar.svelte";
   import Toast from "./Toast.svelte";
   import FileTree from "./FileTree.svelte";
@@ -81,6 +92,7 @@
     writeFile,
     pickSaveFile,
     pickImageFile,
+    openExternal,
     importAsset,
     importAssetBytes,
     importAssetRaw,
@@ -105,6 +117,7 @@
     rewriteAttachmentRefs,
     resolveAttachmentDir,
     attachmentDirName,
+    resolveRef,
   } from "./attachment";
   import { logOp, logInfo, logError, logWarn } from "./logger";
   import {
@@ -118,9 +131,12 @@
     DEFAULT_SETTINGS,
     DEFAULT_SHORTCUTS,
     ALL_ACTIONS,
+    ALL_MENU_ACTIONS,
     FONT_SIZE_MIN,
     FONT_SIZE_MAX,
     type Settings,
+    type ActionDef,
+    type CtxId,
   } from "./settings";
   import { settingsBridge } from "./settings-store";
   import { SyncScheduler } from "./sync-scheduler";
@@ -168,23 +184,30 @@
   // markdown-it 动态 import：解析器移出启动主 chunk，首次预览/导出时才加载
   let md: MarkdownIt | null = null;
   let mdLoading: Promise<MarkdownIt> | null = null;
+  // 数学能力分代：实例按「是否装载 KaTeX」缓存；文档含公式时整代重建
+  // （markdown-it 本体与 katex 模块均经系统模块缓存，重建仅重挂规则，开销可忽略）
+  let mdMath = false;
+  let mdGen = 0;
   // H-6：导出 HTML 时置真——图片规则跳过本地路径→asset:// 转换与目录绝对化，
   // 保留原始（相对）引用，使导出的 HTML 连同 assets 目录一起分享时图片仍可显示。
   let exportingHtml = false;
-  function initMd(): Promise<MarkdownIt> {
-    if (md) return Promise.resolve(md);
-    if (!mdLoading) {
-      mdLoading = (async () => {
-        const { default: MarkdownItCtor } = await import("markdown-it");
-        const instance = new MarkdownItCtor({
-          html: true,
-          // linkify 收窄：只识别显式 http(s):// 链接，关闭模糊链接/邮箱识别（linkify 是 markdown-it 最贵的 inline 处理）。
-          // 注意：markdown-it 的 linkify 选项只判真假，传对象（{fuzzyLink:false,...}）恒为真等于模糊匹配全开，
-          // 必须构造后用 linkify.set() 收窄，否则含 URL/邮箱文本的解析耗时会被放大 9~22 倍。
-          linkify: true,
-          highlight: (code, lang) => highlightCode(code, lang),
-        });
-        instance.linkify.set({ fuzzyLink: false, fuzzyEmail: false });
+  /** 传入 doc 时按 needsMath 判定是否装载 KaTeX（无公式文档不背 katex chunk）；
+   *  与已缓存实例能力不一致时开新代重建；失败复位以便重试。
+   *  md-pipeline 自身亦为动态 import——task-lists 等依赖随管线整块留在独立 chunk。 */
+  function initMd(doc?: string): Promise<MarkdownIt> {
+    const wantMath = doc ? needsMath(doc) : false;
+    if (md && mdMath === wantMath) return Promise.resolve(md);
+    if (mdLoading && mdMath === wantMath) return mdLoading;
+    const gen = ++mdGen;
+    mdMath = wantMath;
+    mdLoading = (async () => {
+      try {
+        // KaTeX 样式与本体一同按需装载（Vite 切成独立 CSS chunk，不进主 bundle）
+        if (wantMath) await import("katex/dist/katex.min.css");
+        // 解析器核心委托 md-pipeline（task-lists / KaTeX 按需 / Mermaid 占位 / linkify 收窄）；
+        // 宿主规则（图片 asset:// 转换、尺寸内联、懒加载、TOC 锚点）在拿到实例后继续后置挂载
+        const { createMd } = await import("./md-pipeline");
+        const instance = await createMd({ highlight: (code, lang) => highlightCode(code, lang), math: wantMath });
 
         // 图片渲染：本地绝对路径转 Tauri asset 协议 URL，预览区才能加载
         const defaultImageRender =
@@ -204,6 +227,9 @@
             } catch {
               /* 解码失败保持原样 */
             }
+            // 注入原始引用（data-md-ref）：解码后的 markdown 引用串，未受绝对化 / asset
+            // 转换影响；供预览右键「图片保存到附件」精确匹配并改写文档中的旧引用。
+            if (token.attrIndex("data-md-ref") < 0) token.attrPush(["data-md-ref", src]);
             // 相对路径（收编后的 assets/xxx）：按当前笔记所在目录拼成绝对路径后再转换
             const isRemote = /^(https?:|data:|blob:)/.test(src);
             // H-6：导出 HTML 时跳过 asset:// 转换与绝对化，保留原始相对引用
@@ -232,10 +258,13 @@
           }
           return defaultImageRender(tokens, idx, options, env, self);
         };
-        md = instance;
+        if (gen === mdGen) md = instance;
         return instance;
-      })();
-    }
+      } catch (err) {
+        if (gen === mdGen) mdLoading = null; // 失败复位，允许下次重试
+        throw err;
+      }
+    })();
     return mdLoading;
   }
 
@@ -285,7 +314,7 @@ console.log("Hello LiteMD");
   const treeStore = createTreeStore();
   let treeRef: FileTree | null = null;
   let status = "就绪";
-  let menuOpen = false;
+  // menuOpen 已随旧文件下拉菜单移除（B2：MenuBar 8 组取代）
   // 全局致命错误兜底：未捕获异常时显示友好错误页，避免白屏（item 4）
   let fatalError: { msg: string; stack: string } | null = null;
   function copyFatalLog() {
@@ -1062,6 +1091,26 @@ console.log("Hello LiteMD");
     let colorMenu: { type: "fg" | "bg" } | null = null;
     let showFolderSearch = false;
 
+    // ---- LM-23 统一导出对话框 ----
+    type ExportFormat = "md" | "pdf" | "html" | "bundled";
+    let showExportDialog = false;
+    let exportDialogDefault: ExportFormat = "md";
+    function openExportDialog(defaultFormat?: ExportFormat) {
+      if (!currentPath) {
+        status = "请先保存文件再导出";
+        return;
+      }
+      exportDialogDefault = defaultFormat ?? "md";
+      showExportDialog = true;
+    }
+    async function handleExport(format: ExportFormat, targetPath: string) {
+      if (!currentPath) return;
+      if (format === "md") await exportMarkdown(targetPath);
+      else if (format === "pdf") await exportPdfDoc(targetPath);
+      else if (format === "html") await exportHtmlDoc(targetPath);
+      else if (format === "bundled") await exportBundledMd(targetPath);
+    }
+
     // ---- 自定义输入对话框（替代 window.prompt，避免标题栏出现 tauri.localhost）----
     type PromptResult = { name: string; path: string };
     let promptState: {
@@ -1123,11 +1172,180 @@ console.log("Hello LiteMD");
       confirmState = null;
     }
 
-    // ---- 标签右键：关闭当前 / 关闭其他 / 关闭全部（文件树右键菜单在 FileTree 内部）----
-    let ctxMenu: { x: number; y: number; path: string; name: string } | null = null;
+    // ---- 四层右键（B5）：标签 / 编辑器 / 预览（文件树右键菜单在 FileTree 内部）----
+    // 统一 .ctx-menu 原子；条目由菜单注册表按 ctx 过滤，点击走 dispatch
+    // （标签/预览层的上下文动作在 onCtxItem 内按右键目标特判，不依赖 dispatch 传参）
+    type CtxTarget =
+      | { kind: "tab"; path: string; name: string }
+      | { kind: "editor" }
+      | { kind: "preview"; link: string | null; img: string | null };
+    let ctxMenu: { x: number; y: number; target: CtxTarget } | null = null;
 
     function closeCtx() {
       ctxMenu = null;
+    }
+    /** 编辑器层右键（规格 ②）：编辑区右键出格式/插入/编辑子集菜单 */
+    function openEditorCtx(e: MouseEvent) {
+      ctxMenu = { x: e.clientX, y: e.clientY, target: { kind: "editor" } };
+    }
+    /** 预览层右键（规格 ④）：按右键目标带出链接 / 图片上下文（条件项见 ctxMenuItems） */
+    function openPreviewCtx(e: MouseEvent) {
+      const el = e.target as HTMLElement | null;
+      const a = el?.closest?.("a") as HTMLAnchorElement | null;
+      const img = el?.closest?.("img") as HTMLImageElement | null;
+      // 图片取 data-md-ref（initMd 注入的原始引用，收编改写用）；回退 src
+      const imgRef = img ? img.getAttribute("data-md-ref") || img.getAttribute("src") || "" : "";
+      ctxMenu = {
+        x: e.clientX,
+        y: e.clientY,
+        target: {
+          kind: "preview",
+          link: a ? a.getAttribute("href") || null : null,
+          img: imgRef || null,
+        },
+      };
+    }
+
+    /** 编辑器右键条目（规格 ②：剪切/复制/粘贴 · 格式子集 · 插入图片/表格 · 查找） */
+    const EDITOR_CTX_IDS = [
+      "edit.cut", "edit.copy", "edit.paste",
+      "format.bold", "format.italic", "format.underline", "format.code",
+      "insert.bullet", "insert.orderedList",
+      "insert.image", "insert.table",
+      "edit.find",
+    ];
+    interface CtxItem {
+      id: string;
+      label: string;
+    }
+    /** 当前右键菜单条目：编辑器层按 curated 列表；标签/预览层按注册表 ctx 过滤 + 条件项 */
+    function ctxMenuItems(): CtxItem[] {
+      const t = ctxMenu?.target;
+      if (!t) return [];
+      if (t.kind === "editor") {
+        const out: CtxItem[] = [];
+        for (const id of EDITOR_CTX_IDS) {
+          const a = ALL_MENU_ACTIONS.find((x) => x.id === id);
+          if (a) out.push({ id: a.id, label: a.label });
+        }
+        return out;
+      }
+      const ctxId: CtxId = t.kind;
+      return ALL_MENU_ACTIONS.filter((a) => a.ctx?.includes(ctxId))
+        .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
+        .filter((a) => {
+          if (a.id === "preview.copyLink") return t.kind === "preview" && !!t.link;
+          if (a.id === "preview.saveImage") return t.kind === "preview" && !!t.img;
+          return true;
+        })
+        .map((a) => ({ id: a.id, label: a.label }));
+    }
+    /** 右键条目点击：上下文动作特判，其余走统一 dispatch */
+    function onCtxItem(id: string) {
+      const t = ctxMenu?.target ?? null;
+      ctxMenu = null;
+      if (t?.kind === "tab") {
+        if (id === "win.closeTab") {
+          requestCloseTab(t.path);
+          return;
+        }
+        if (id === "win.closeOthers") {
+          for (const tb of [...tabs]) if (tb.path !== t.path) requestCloseTab(tb.path);
+          return;
+        }
+        if (id === "win.closeAllTabs") {
+          for (const tb of [...tabs]) requestCloseTab(tb.path);
+          return;
+        }
+        if (id === "tab.copyPath") {
+          void navigator.clipboard?.writeText(t.path).catch(() => {});
+          status = "已复制路径 " + t.path;
+          return;
+        }
+        if (id === "tab.revealInTree") {
+          void revealInTree(t.path);
+          return;
+        }
+      }
+      if (t?.kind === "preview") {
+        if (id === "preview.copyLink" && t.link) {
+          void navigator.clipboard?.writeText(t.link).catch(() => {});
+          status = "已复制链接地址";
+          return;
+        }
+        if (id === "preview.openLink" && t.link) {
+          void openExternal(t.link).catch(() => {});
+          return;
+        }
+        if (id === "preview.saveImage" && t.img) {
+          void savePreviewImage(t.img);
+          return;
+        }
+      }
+      dispatch(id);
+    }
+    /** 在侧栏定位：展开侧栏目录 tab，展开祖先并滚动聚焦 */
+    async function revealInTree(path: string): Promise<void> {
+      showTree = true;
+      sidebarTab = "tree";
+      await tick();
+      const ok = await treeRef?.requestReveal(path);
+      status = ok ? "已在侧栏定位 " + basename(path) : "不在当前工作区，无法定位";
+    }
+    /** 预览右键「图片保存到附件」：收编进当前文档附件目录，并改写文档中的旧引用 */
+    async function savePreviewImage(ref: string): Promise<void> {
+      const mp = currentMdPath();
+      if (!mp) {
+        status = "请先保存文档，再保存图片到附件";
+        return;
+      }
+      const noteDir = (mp.replace(/[\\/][^\\/]+$/, "") || mp).replace(/\\/g, "/");
+      const assetsName = currentAttachmentName();
+      const isRemote = /^(https?:|data:)/i.test(ref);
+      let newRef: string;
+      try {
+        if (isRemote) {
+          // 外链 / data URL：拉字节走 raw 收编（asset:// 本地图走下方路径版）
+          const resp = await fetch(ref);
+          const bytes = new Uint8Array(await resp.arrayBuffer());
+          const ext = (ref.split("?")[0].match(/\.(\w{2,5})$/)?.[1] ?? "png").toLowerCase();
+          newRef = await importAssetRaw(noteDir, assetsName, ext, bytes, settings.compressImages, settings.jpegQuality);
+        } else {
+          // 本地图片：按原始引用（相对→绝对）直接收编，走压缩管线
+          const abs = resolveRef(noteDir, ref) ?? ref;
+          newRef = await importAsset(abs, noteDir, assetsName, settings.compressImages, settings.jpegQuality);
+        }
+      } catch (e) {
+        status = "保存图片失败：" + String((e as { message?: string })?.message ?? e);
+        return;
+      }
+      // 改写文档引用：仅精确匹配旧引用串时替换（避免误伤正文同名文本）
+      if (view && !isRemote) {
+        const doc = pullDoc();
+        if (doc.includes(ref)) {
+          const next = doc.split(ref).join(newRef);
+          if (next !== doc) {
+            view.dispatch(view.state.update({ changes: { from: 0, to: view.state.doc.length, insert: next } }));
+          }
+        }
+      }
+      status = "图片已保存到附件：" + newRef;
+    }
+    /** 右键「粘贴」：读剪贴板文本插入光标处（execCommand paste 已被浏览器禁用） */
+    async function pasteFromClipboard(): Promise<void> {
+      if (!view) return;
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+          status = "剪贴板中没有文本";
+          return;
+        }
+        view.dispatch(view.state.replaceSelection(text));
+        view.focus();
+        status = "已粘贴";
+      } catch {
+        status = "无法读取剪贴板，请用 Ctrl+V 粘贴";
+      }
     }
 
     // 树内重命名/移动后：更新已打开标签的路径（供 FileTree handlers.onTabRenamed 使用）
@@ -1243,24 +1461,6 @@ console.log("Hello LiteMD");
       }
     }
 
-    // ---- 标签右键：关闭当前 / 关闭其他 / 关闭全部 ----
-    function ctxCloseTab() {
-      const p = ctxMenu?.path;
-      ctxMenu = null;
-      if (p) requestCloseTab(p);
-    }
-    function ctxCloseOthers() {
-      const p = ctxMenu?.path;
-      ctxMenu = null;
-      if (!p) return;
-      for (const t of [...tabs]) {
-        if (t.path !== p) requestCloseTab(t.path);
-      }
-    }
-    function ctxCloseAll() {
-      ctxMenu = null;
-      for (const t of [...tabs]) requestCloseTab(t.path);
-    }
     // ---- 分栏拖动（侧边栏宽度 / 预览宽度）----
     let sidebarWidth = 240;
     let previewWidth = 440;
@@ -1515,6 +1715,7 @@ console.log("Hello LiteMD");
     schedulePreview();
     queueAutoSave();
     queueSessionSave();
+    refreshOutline(); // 侧栏大纲可见时随文档变化重算（内部判可见性）
   }
   /** 把本事务变更区间合并进 pendingEdit（旧文档坐标）；始终维持「旧[from,to) 被长 insert 的新内容替换」不变式 */
   function accumulateEdit(fromA: number, toA: number, fromB: number, toB: number) {
@@ -2482,6 +2683,198 @@ console.log("Hello LiteMD");
   // ---- 预览编辑模式：隐藏 markdown 编辑器，全屏显示可编辑的渲染预览 ----
   // contenteditable 渲染 HTML；编辑后防抖用 turndown 转回 markdown 写回 CodeMirror。
   let previewEditMode = false;
+
+  // ===== 产品化集成（B2–B4）：菜单栏 / 命令面板 / 侧栏三 tab / 视图模式 =====
+  let menubarVisible = true;
+  let paletteOpen = false;
+  let sidebarTab: "tree" | "outline" | "search" = "tree";
+  let outlineItems: OutlineItem[] = [];
+  type ViewMode = "live" | "source" | "split";
+  let viewMode: ViewMode = "split";
+  /** 视图模式由既有双标志派生（单一真源仍是 showPreview/previewEditMode）：
+   *  previewEditMode = 所见即所得（live）· showPreview = 编辑器+只读预览（split）· 均否 = 源码（source） */
+  $: viewMode = previewEditMode ? "live" : showPreview ? "split" : "source";
+  function setViewMode(m: ViewMode): void {
+    const cur: ViewMode = previewEditMode ? "live" : showPreview ? "split" : "source";
+    if (m === cur) return;
+    if (m === "live") {
+      void enterPreviewEdit();
+      return;
+    }
+    if (previewEditMode) exitPreviewEdit();
+    showPreview = m === "split";
+  }
+  /** 大纲刷新：侧栏大纲可见时按当前文档重算（100KB 实测 ≈1.2ms，同步执行无感） */
+  function refreshOutline(): void {
+    if (sidebarTab !== "outline") return;
+    const tab = tabs[activeIdx];
+    if (!tab) {
+      outlineItems = [];
+      return;
+    }
+    outlineItems = extractOutline(view && tabs[activeIdx] === tab ? pullDoc() : (tab.content ?? ""));
+  }
+  $: activeIdx, sidebarTab, refreshOutline();
+
+  // ===== 动作分发表：菜单栏 / 工具栏 / 命令面板统一出口（未注册 → runAction console.warn）=====
+  const ACTION_HANDLERS: ActionHandlerMap = {
+    // 文件
+    "file.new": () => treeRef?.requestNewFile(),
+    "file.newFolder": () => treeRef?.requestNewFolder(),
+    "file.open": () => cmd(openFile),
+    "file.openFolder": () => cmd(openFolder),
+    "file.save": () => cmd(save),
+    "file.saveAs": () => cmd(saveAs),
+    "file.saveAll": () => cmd(saveAll),
+    // LM-23：导出收敛到统一对话框。file.export=默认 Markdown；file.exportPdf=预选 PDF
+    // （设置-导出 tab 的「立即导出」按钮仍经此打开对话框）。file.exportMd/Bundled 不再进菜单，
+    // 由对话框的 handleExport 直接调底层导出函数。
+    "file.export": () => cmd(() => openExportDialog()),
+    "file.exportPdf": () => cmd(() => openExportDialog("pdf")),
+    "file.clearRecent": () => {
+      settings.recentFiles = [];
+      persist();
+      status = "已清除最近打开列表";
+    },
+    // 编辑
+    "edit.undo": () => cmd(doUndo),
+    "edit.redo": () => cmd(doRedo),
+    "edit.find": () => cmd(() => { if (!view) return; view.focus(); openSearchPanelCmd(false)(view); }),
+    "edit.replace": () => cmd(() => { if (!view) return; view.focus(); openSearchPanelCmd(true)(view); }),
+    "edit.folderSearch": () => cmd(openFolderSearch),
+    "edit.selectAll": () => cmd(() => { if (view) selectAllDoc(view); }),
+    // 剪切/复制/粘贴（右键编辑器层）：cut/copy 走 execCommand（用户手势上下文可用）；
+    // paste 经 clipboard.readText 后插入光标处（execCommand paste 已被浏览器禁用）
+    "edit.cut": () => cmd(() => { if (view) { view.focus(); document.execCommand("cut"); } }),
+    "edit.copy": () => cmd(() => { if (view) { view.focus(); document.execCommand("copy"); } }),
+    "edit.paste": () => cmd(() => { void pasteFromClipboard(); }),
+    // 预览右键（B5 四层右键·预览层；上下文动作在 onCtxItem 特判）
+    "preview.copy": () => cmd(() => {
+      const sel = window.getSelection();
+      const text = sel && !sel.isCollapsed ? sel.toString() : "";
+      if (text) {
+        void navigator.clipboard?.writeText(text).catch(() => {});
+        status = "已复制所选文本";
+      } else {
+        status = "未选择内容";
+      }
+    }),
+    // 视图
+    "view.togglePreview": () => cmd(togglePreviewPane),
+    "view.modeRealtime": () => cmd(() => setViewMode("live")),
+    "view.modeSource": () => cmd(() => setViewMode("source")),
+    "view.modeSplit": () => cmd(() => setViewMode("split")),
+    "view.panelTree": () => cmd(() => (sidebarTab = "tree")),
+    "view.panelOutline": () => cmd(() => (sidebarTab = "outline")),
+    "view.panelSearch": () => cmd(() => (sidebarTab = "search")),
+    "view.focusMode": () => cmd(toggleFocus),
+    "view.fontIncrease": () => cmd(() => bumpFont(1)),
+    "view.fontDecrease": () => cmd(() => bumpFont(-1)),
+    "view.themeLight": () => setThemeMode("light"),
+    "view.themeDark": () => setThemeMode("dark"),
+    "view.themeAuto": () => setThemeMode("auto"),
+    "view.menubar": () => (menubarVisible = !menubarVisible),
+    // 插入
+    "insert.image": () => cmd(insertImg),
+    "insert.codeBlock": () => cmd(codeBlock),
+    "insert.table": () => cmd(table),
+    "insert.bullet": () => cmd(ul),
+    "insert.orderedList": () => cmd(ol),
+    "insert.task": () => cmd(task),
+    "insert.math": () => cmd(() => { if (view) wrapMath(view); }),
+    "insert.datetime": () => cmd(() => { if (view) insertDateTime(view); }),
+    "insert.hr": () => cmd(() => { if (view) insertHorizontalRule(view); }),
+    "insert.toc": () => cmd(() => { if (view && !insertToc(view)) status = "文档无标题，未插入目录"; }),
+    // 格式
+    "format.bold": () => cmd(bold),
+    "format.italic": () => cmd(italic),
+    "format.underline": () => cmd(underline),
+    "format.strike": () => cmd(strike),
+    "format.quote": () => cmd(quote),
+    "format.link": () => cmd(link),
+    "format.h1": () => cmd(h1),
+    "format.h2": () => cmd(() => { if (view) setHeadingLevel(view, 2); }),
+    "format.h3": () => cmd(() => { if (view) setHeadingLevel(view, 3); }),
+    "format.h4": () => cmd(() => { if (view) setHeadingLevel(view, 4); }),
+    "format.h5": () => cmd(() => { if (view) setHeadingLevel(view, 5); }),
+    "format.h6": () => cmd(() => { if (view) setHeadingLevel(view, 6); }),
+    "format.paragraph": () => cmd(() => { if (view) setHeadingLevel(view, 0); }),
+    "format.code": () => cmd(() => { if (view) wrapInlineCode(view); }),
+    "format.clearFormat": () => cmd(() => { if (view) clearFormatting(view); }),
+    // 表格
+    "table.addColumn": () => cmd(addColumn),
+    // 工具（图片附件管理，自旧文件菜单迁入）
+    "tools.migrateImages": () => cmd(migrateImages),
+    "tools.migrateFolder": () => cmd(doMigrateFolder),
+    "tools.cleanupAssets": () => cmd(doCleanupAssets),
+    // 应用 / 帮助（设置弹窗入口）
+    "app.settings": () => (showSettings = true),
+    "app.shortcuts": () => (showSettings = true),
+    "help.about": () => (showSettings = true),
+    "help.shortcuts": () => (showSettings = true),
+    // 窗口
+    // 注：win.newWindow / win.newTab 暂无真实实现，保持无 handler（菜单树 pruneTree 裁掉）；
+    // 不做占位 handler——那会让菜单出现点了不干事的条目（无 TODO 桩红线）。
+    "win.closeTab": () => cmd(() => { const t = tabs[activeIdx]; if (t) requestCloseTab(t.path); }),
+    "win.closeOthers": () => cmd(() => {
+      const keep = tabs[activeIdx]?.path;
+      for (const t of [...tabs]) if (t.path !== keep) requestCloseTab(t.path);
+    }),
+    "win.closeAllTabs": () => cmd(() => { for (const t of [...tabs]) requestCloseTab(t.path); }),
+    "win.minimize": () => cmd(winMinimize),
+    "win.toggleMax": () => cmd(winToggleMax),
+    "win.close": () => cmd(winClose),
+  };
+  function setThemeMode(m: "light" | "dark" | "auto"): void {
+    settings.theme = m;
+    persist();
+  }
+  /** 统一分发：setting: 前缀 → 打开设置弹窗；其余查分发表 */
+  function dispatch(id: string): void {
+    if (id.startsWith("setting:")) {
+      showSettings = true;
+      return;
+    }
+    runAction(id, ACTION_HANDLERS);
+  }
+  /** 菜单树裁剪：剔除未接线的 action；空 sub 小标题 / 冗余 sep / 首尾 sep 一并清理 */
+  function pruneTree(tree: Record<MenuGroupId, MenuNode[]>): Record<MenuGroupId, MenuNode[]> {
+    const out = {} as Record<MenuGroupId, MenuNode[]>;
+    for (const g of GROUP_ORDER) {
+      const kept: MenuNode[] = [];
+      for (const n of tree[g] ?? []) {
+        if (n.kind === "action" && !(n.id && n.id in ACTION_HANDLERS)) continue;
+        kept.push(n);
+      }
+      const nodes: MenuNode[] = [];
+      for (let i = 0; i < kept.length; i++) {
+        const n = kept[i];
+        if (n.kind === "sub") {
+          let j = i + 1;
+          while (j < kept.length && kept[j].kind === "action") j++;
+          if (j === i + 1) continue; // 小标题下无存活子项 → 删标题
+        }
+        nodes.push(n);
+      }
+      const clean: MenuNode[] = [];
+      for (const n of nodes) {
+        if (n.kind === "sep" && (clean.length === 0 || clean[clean.length - 1].kind === "sep")) continue;
+        clean.push(n);
+      }
+      while (clean.length && clean[clean.length - 1].kind === "sep") clean.pop();
+      out[g] = clean;
+    }
+    return out;
+  }
+  $: activeMenuTree = pruneTree(MENU_TREE);
+  /** 大纲点击跳转：0-based 行号 → CM6 位置（OutlinePanel 契约） */
+  function jumpToLine(line: number): void {
+    if (!view) return;
+    const ln = Math.min(Math.max(line, 0) + 1, view.state.doc.lines);
+    const pos = view.state.doc.line(ln).from;
+    view.dispatch({ selection: { anchor: pos }, scrollIntoView: true });
+    view.focus();
+  }
   let previewEditBefore = { preview: true };
   let previewEditEl: HTMLDivElement | null = null;
   let previewEditTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2580,7 +2973,7 @@ console.log("Hello LiteMD");
         showPreview = previewEditBefore.preview;
         return;
       }
-      const m = md ?? (await initMd());
+      const m = md ?? (await initMd(text));
       previewEditEl.innerHTML = safeRender(m, text); // C-01：清洗后注入
       // contenteditable 新段落统一用 <p>（turndown 往返稳定）
       document.execCommand("defaultParagraphSeparator", false, "p");
@@ -2852,6 +3245,68 @@ console.log("Hello LiteMD");
     syncScheduler.notifySaved();
   }
 
+  /** 全部保存（file.saveAll）：顺序写盘所有脏标签。
+   *  活动标签以编辑器实时内容为准（tab.dirty 只在切换/防抖时同步，见 dirtyFilesInFolder）；
+   *  非活动标签用 tab.content（切换离开时已由 pullDoc 同步）。
+   *  安全闸门与 save() 对齐：suppressSave 期间不写、loadFailed 标签禁写、
+   *  活动标签 lastSaved 基准未建立禁写；externalChanged 标签逐个确认成本高，
+   *  批量场景跳过并在状态栏明示（由用户逐个 save() 处理确认）。 */
+  async function saveAll(): Promise<void> {
+    if (suppressSave) {
+      status = "正在切换文档，已暂存本次编辑（自动保存恢复后生效）";
+      return;
+    }
+    if (previewEditMode) flushPreviewEdit();
+    // 快照待保存清单（后续 await 期间 tabs 可能变化）
+    const targets: { tab: TabState; text: string }[] = [];
+    let skipped = 0;
+    for (let i = 0; i < tabs.length; i++) {
+      const tab = tabs[i];
+      if (tab.deferred) continue; // 延迟未载入标签：内容未加载，无保存基准
+      if (tab.loadFailed || tab.externalChanged) {
+        if (tab.dirty || tab.externalChanged) skipped++;
+        continue;
+      }
+      if (i === activeIdx) {
+        if (!docDirty) continue;
+        if (lastSaved === null) {
+          skipped++;
+          continue;
+        }
+        const text = pullDoc();
+        if (text === lastSaved) continue;
+        targets.push({ tab, text });
+      } else {
+        if (!tab.dirty) continue;
+        targets.push({ tab, text: tab.content });
+      }
+    }
+    if (!targets.length) {
+      status = skipped ? "没有可保存的文档（" + skipped + " 个已跳过）" : "没有需要保存的文档";
+      return;
+    }
+    let ok = 0;
+    let fail = 0;
+    for (const { tab, text } of targets) {
+      const path = tab.path;
+      const gen = tab.rev ?? 0;
+      try {
+        await writeFileQueued(path, text);
+      } catch (e) {
+        ioFail("全部保存", e);
+        fail++;
+        continue; // 单个失败不中断其余标签
+      }
+      commitTabSaved(tab, path, text, gen);
+      ok++;
+    }
+    status = "已保存 " + ok + " 个文档" + (fail ? "，" + fail + " 个失败" : "") + (skipped ? "，" + skipped + " 个已跳过" : "");
+    logOp("全部保存: " + ok + " 成功 / " + fail + " 失败 / " + skipped + " 跳过");
+    updateTitle();
+    saveSession();
+    syncScheduler.notifySaved();
+  }
+
   // ---------- 导出：Markdown / PDF / HTML ----------
   const EXPORT_MIME: Record<string, string> = {
     png: "image/png",
@@ -2931,13 +3386,13 @@ console.log("Hello LiteMD");
     return true;
   }
 
-  async function exportMarkdown() {
+  async function exportMarkdown(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const text = pullDoc(); // 对话框期间切换标签不会导出错文件
-    const p = await pickSaveFile();
+    const p = targetPath ?? (await pickSaveFile());
     if (!p || exportTargetBlocked(p)) return;
     try {
       await writeFile(p, text);
@@ -2947,13 +3402,13 @@ console.log("Hello LiteMD");
     }
   }
 
-  async function exportPdfDoc() {
+  async function exportPdfDoc(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const text = pullDoc();
-    const p = await pickSavePdfFile();
+    const p = targetPath ?? (await pickSavePdfFile());
     if (!p) return;
     const finalPath = /\.pdf$/i.test(p) ? p : p + ".pdf";
     if (exportTargetBlocked(finalPath)) return;
@@ -2966,18 +3421,18 @@ console.log("Hello LiteMD");
     }
   }
 
-  async function exportHtmlDoc() {
+  async function exportHtmlDoc(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const srcPath = currentPath;
     const text = pullDoc();
-    const p = await pickSaveFile();
+    const p = targetPath ?? (await pickSaveFile());
     if (!p || exportTargetBlocked(p)) return;
     const title = basename(srcPath);
     const noteDir = srcPath.replace(/[\\/][^\\/]+$/, "") || srcPath;
-    const m = md ?? (await initMd()); // 导出前确保解析器就绪（首导触发动态加载）
+    const m = md ?? (await initMd(text)); // 导出前确保解析器就绪（首导触发动态加载）
     // H-6：渲染导出正文期间关闭 asset:// 转换，图片保留相对引用（否则导出件图全断）。
     let bodyHtml = "";
     exportingHtml = true;
@@ -3019,13 +3474,13 @@ ${bodyHtml}
     }
   }
 
-  async function exportBundledMd() {
+  async function exportBundledMd(targetPath?: string) {
     if (!currentPath) {
       status = "请先保存文件再导出";
       return;
     }
     const baseDir = currentPath.replace(/[\\/][^\\/]+$/, "") || currentPath;
-    const savePath = await pickSaveBundledFile(currentPath);
+    const savePath = targetPath ?? (await pickSaveBundledFile(currentPath));
     if (!savePath || exportTargetBlocked(savePath)) return; // 用户取消 / 目标是已打开文件
     try {
       const res = await exportBundledMarkdown(savePath, pullDoc(), baseDir);
@@ -3865,6 +4320,21 @@ ${bodyHtml}
       if (isSave) { e.preventDefault(); save(); }
       return;
     }
+    // ===== 产品化集成：Alt 菜单栏显隐 / Ctrl+P 命令面板 / Ctrl+1~3 视图模式 =====
+    if (e.key === "Alt" && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      e.preventDefault();
+      menubarVisible = !menubarVisible;
+      return;
+    }
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && e.code === "KeyP") {
+      run(e, () => (paletteOpen = !paletteOpen));
+      return;
+    }
+    if (e.ctrlKey && !e.altKey && !e.shiftKey && /^Digit[123]$/.test(e.code)) {
+      const m: ViewMode = e.code === "Digit1" ? "live" : e.code === "Digit2" ? "source" : "split";
+      run(e, () => setViewMode(m));
+      return;
+    }
     // Esc 退出格式刷（固定模式）
     if (e.key === "Escape" && painter) {
       painter = null;
@@ -3903,7 +4373,7 @@ ${bodyHtml}
     else if (hit("file.openFolder")) run(e, openFolder);
     else if (hit("file.save")) run(e, save);
     else if (hit("file.saveAs")) run(e, saveAs);
-    else if (hit("file.export")) run(e, exportHtmlDoc);
+    else if (hit("file.export")) run(e, () => openExportDialog());
     else if (hit("insert.image")) run(e, insertImg);
     else if (hit("insert.codeBlock")) run(e, codeBlock);
     else if (hit("insert.table")) run(e, table);
@@ -3918,10 +4388,6 @@ ${bodyHtml}
 
   // 点击菜单外区域关闭文件菜单
   function onWindowClick(e: MouseEvent) {
-    if (menuOpen) {
-      const target = e.target as HTMLElement;
-      if (!target.closest(".menu")) menuOpen = false;
-    }
     if (colorMenu) {
       const target = e.target as HTMLElement;
       if (!target.closest(".color-wrap")) colorMenu = null;
@@ -4090,6 +4556,7 @@ ${bodyHtml}
   $: if (showFolderSearch) loadModal("FolderSearch");
   $: if (promptState) loadModal("PromptModal");
   $: if (confirmState || closeTabDialog || closeAllDialog || confirmMigrate || confirmCleanup) loadModal("ConfirmModal");
+  $: if (showExportDialog) loadModal("ExportDialog");
 
   // ====== 脚本块结束，以下为模板 ======
 </script>
@@ -4100,121 +4567,31 @@ ${bodyHtml}
   <header class="titlebar" data-tauri-drag-region>
     <span class="brand">LiteMD</span>
 
-    <div class="menu">
-      <button on:click={() => (menuOpen = !menuOpen)} title="文件">文件 ▾</button>
-      {#if menuOpen}
-        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-        <div class="menu-list" on:mouseleave={() => (menuOpen = false)}>
-          <div on:click={() => { menuOpen = false; cmd(openFile); }}>
-            打开文件 <span>{accel("file.open")}</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(openFolder); }}>
-            打开文件夹 <span>{accel("file.openFolder")}</span>
-          </div>
-          {#if settings.recentFiles.length}
-            <div class="sep-line"></div>
-            <div class="menu-header">最近打开</div>
-            {#each settings.recentFiles as rf}
-              <div on:click={() => { menuOpen = false; cmd(() => openFileByPath(rf)); }} title={rf}>
-                {basename(rf)}
-              </div>
-            {/each}
-          {/if}
-          <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; cmd(save); }}>
-            保存 <span>{accel("file.save")}</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(saveAs); }}>
-            另存为 <span>{accel("file.saveAs")}</span>
-          </div>
-          <div class="menu-header">导出</div>
-          <div on:click={() => { menuOpen = false; cmd(exportMarkdown); }}>
-            导出 Markdown <span>.md</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(exportPdfDoc); }}>
-            导出 PDF <span>.pdf</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(exportHtmlDoc); }}>
-            导出 HTML <span>{accel("file.export")}</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(exportBundledMd); }}>
-            导出自包含 MD（图片内嵌）<span>单文件</span>
-          </div>
-          <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; cmd(openFolderSearch); }}>
-            文件夹内查找替换 <span>Ctrl + Shift + F</span>
-          </div>
-          <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; cmd(migrateImages); }}>
-            迁移图片附件 <span>绝对路径→相对</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(doMigrateFolder); }}>
-            批量迁移文件夹图片 <span>递归</span>
-          </div>
-          <div on:click={() => { menuOpen = false; cmd(doCleanupAssets); }}>
-            清理未引用附件 <span>{settings.attachmentMode === "shared" ? settings.assetsDir + "/" : "按文档目录"}</span>
-          </div>
-          <div class="sep-line"></div>
-          <div on:click={() => { menuOpen = false; showSettings = true; }}>
-            设置 <span>快捷键 / 外观</span>
-          </div>
-        </div>
-      {/if}
-    </div>
+    <MenuBar
+      visible={menubarVisible}
+      tree={activeMenuTree}
+      onAction={dispatch}
+      accelFn={accel}
+      recentFiles={settings.recentFiles.slice(0, 10).map((p) => ({ path: p, name: basename(p) }))}
+      onOpenRecent={(p) => cmd(() => openFileByPath(p))}
+    />
 
-    <div class="tb">
-      <button on:click={doUndo} title="撤销 {accel('edit.undo')}">↶</button>
-      <button on:click={doRedo} title="重做 {accel('edit.redo')}">↷</button>
-      <button on:click={() => cmd(openFolderSearch)} title="文件夹内查找替换 Ctrl+Shift+F">🔍</button>
-      <span class="sep"></span>
-      <button on:click={bold} title="加粗 {accel('format.bold')}"><b>B</b></button>
-      <button on:click={italic} title="斜体 {accel('format.italic')}"><i>I</i></button>
-      <button on:click={underline} title="下划线 {accel('format.underline')}"><u>U</u></button>
-      <button on:click={strike} title="删除线 {accel('format.strike')}">S</button>
-      <button
-        on:click={() => armPainter(false)}
-        on:dblclick={() => armPainter(true)}
-        class:on={!!painter}
-        title="格式刷（单击应用一次 / 双击固定，Esc 退出）">🖌</button>
-      <span class="color-wrap">
-        <button on:click={() => openColorMenu("fg")} class:on={colorMenu?.type === "fg"} title="字体颜色"><span class="fg-a">A</span></button>
-        <button on:click={() => openColorMenu("bg")} class:on={colorMenu?.type === "bg"} title="背景颜色">🖍</button>
-        {#if colorMenu}
-          <div class="color-pop">
-            {#each PALETTE as hex}
-              <button class="swatch" style="background:{hex}" title={hex} on:click={() => pickColor(hex)}></button>
-            {/each}
-            <label class="custom-color" title="自定义颜色">
-              <input type="color" value="#ff0000" on:change={onCustomColor} />
-              自定义
-            </label>
-          </div>
-        {/if}
-      </span>
-      <span class="sep"></span>
-      <button on:click={h1} title="标题">H</button>
-      <button on:click={ul} title="无序列表">•</button>
-      <button on:click={ol} title="有序列表">1.</button>
-      <button on:click={task} title="任务列表">☐</button>
-      <button on:click={quote} title="引用">❝</button>
-      <button on:click={link} title="插入链接 {accel('format.link')}">🔗</button>
-      <button on:click={() => cmd(insertImg)} title="插入图片">🖼</button>
-      <button on:click={codeBlock} title="插入代码块">{'{ }'}</button>
-      <span class="sep"></span>
-      <button on:click={() => alignCol("left")} title="左对齐（表格列）">⬅</button>
-      <button on:click={() => alignCol("center")} title="居中对齐（表格列）">☰</button>
-      <button on:click={() => alignCol("right")} title="右对齐（表格列）">➡</button>
-      <span class="sep"></span>
-      <button on:click={toggleTheme} title="切换主题">
-        {settings.theme === "dark" ? "☀" : "🌙"}
-      </button>
-      <button
-        on:click={toggleFocus}
-        class:on={focusMode}
-        title="专注模式 {accel('view.focusMode')}">⛶</button
-      >
-      <button on:click={() => (showSettings = true)} title="设置">⚙</button>
-    </div>
+    <Toolbar
+      dispatch={dispatch}
+      accelFn={accel}
+      theme={settings.theme === "dark" ? "dark" : "light"}
+      {focusMode}
+      {viewMode}
+      painterOn={!!painter}
+      colorMenu={colorMenu?.type ?? null}
+      palette={PALETTE}
+      onPainter={(fix) => armPainter(fix)}
+      onColorMenu={(t) => openColorMenu(t)}
+      onPickColor={(hex) => pickColor(hex)}
+      onCustomColor={onCustomColor}
+      onToggleTheme={() => cmd(toggleTheme)}
+      onAlignCol={(dir) => cmd(() => alignCol(dir))}
+    />
 
     <!-- 自定义窗口控制按钮 -->
     <div class="win-ctrl">
@@ -4224,37 +4601,55 @@ ${bodyHtml}
     </div>
   </header>
 
-  <div class="body">
+  <!-- --sbw：侧栏当前宽度（px），供 tab 条 / 大纲 / 搜索三块与文件树列对齐 -->
+  <div class="body" style="--sbw: {sidebarWidth}px">
     {#if showTree}
-      <FileTree
-        bind:this={treeRef}
-        store={treeStore}
-        {sidebarWidth}
-        {currentPath}
-        defaultDir={settings.lastFolder}
-        hiddenPaths={settings.hiddenPaths}
-        hideAttachments={settings.hideAttachments}
-        assetsDir={settings.assetsDir}
-        attachmentMode={settings.attachmentMode}
-        attachmentTemplate={settings.attachmentTemplate}
-        handlers={{
-          openFile: openFileByPathSafe,
-          setStatus: (m) => (status = m),
-          confirm: askConfirm,
-          prompt: askPrompt,
-          pickFolder: () => pickOpenFolder(),
-          onTabRenamed: updateTabPath,
-          onTabRemoved: (p) => void removeTabsUnderPath(p),
-          setHiddenPaths: (paths) => {
-            settings.hiddenPaths = paths;
-            persist();
-          },
-          setTreePrefs: onTreePrefsChange,
-          onRootsChanged: onTreeRootsChanged,
-          checkPathExists: (p) => pathExists(p),
-        }}
-        on:collapse={() => (showTree = false)}
-      />
+      <div class="sb-tabs" role="tablist" aria-label="侧栏面板">
+        <button class="sb-tab" class:on={sidebarTab === "tree"} role="tab" aria-selected={sidebarTab === "tree"} on:click={() => (sidebarTab = "tree")}>目录</button>
+        <button class="sb-tab" class:on={sidebarTab === "outline"} role="tab" aria-selected={sidebarTab === "outline"} on:click={() => (sidebarTab = "outline")}>大纲</button>
+        <button class="sb-tab" class:on={sidebarTab === "search"} role="tab" aria-selected={sidebarTab === "search"} on:click={() => (sidebarTab = "search")}>搜索</button>
+      </div>
+      <div class="sb-body" class:hidden={sidebarTab !== "tree"}>
+        <FileTree
+          bind:this={treeRef}
+          store={treeStore}
+          {sidebarWidth}
+          {currentPath}
+          defaultDir={settings.lastFolder}
+          hiddenPaths={settings.hiddenPaths}
+          hideAttachments={settings.hideAttachments}
+          assetsDir={settings.assetsDir}
+          attachmentMode={settings.attachmentMode}
+          attachmentTemplate={settings.attachmentTemplate}
+          handlers={{
+            openFile: openFileByPathSafe,
+            setStatus: (m) => (status = m),
+            confirm: askConfirm,
+            prompt: askPrompt,
+            pickFolder: () => pickOpenFolder(),
+            onTabRenamed: updateTabPath,
+            onTabRemoved: (p) => void removeTabsUnderPath(p),
+            setHiddenPaths: (paths) => {
+              settings.hiddenPaths = paths;
+              persist();
+            },
+            setTreePrefs: onTreePrefsChange,
+            onRootsChanged: onTreeRootsChanged,
+            checkPathExists: (p) => pathExists(p),
+          }}
+          on:collapse={() => (showTree = false)}
+        />
+      </div>
+      {#if sidebarTab === "outline"}
+        <OutlinePanel items={outlineItems} activeLine={cursorLine - 1} onJump={jumpToLine} />
+      {:else if sidebarTab === "search"}
+        <div class="sb-search">
+          <p class="sb-search-hint">在整个文件夹内查找 / 替换</p>
+          <button class="sb-search-btn" on:click={() => cmd(openFolderSearch)} disabled={!settings.lastFolder}>
+            {settings.lastFolder ? "打开文件夹查找替换" : "请先打开一个文件夹"}
+          </button>
+        </div>
+      {/if}
       <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="splitter" on:mousedown={(e) => startDrag("sidebar", e)} title="拖动调整宽度"></div>
     {/if}
@@ -4273,8 +4668,12 @@ ${bodyHtml}
                 tabindex="-1"
                 on:click={() => activateTab(i)}
                 on:contextmenu|preventDefault={(e) => {
-                  // 右键标签：显示操作菜单（关闭/关闭其他/关闭全部）
-                  ctxMenu = { x: e.clientX, y: e.clientY, path: tab.path, name: basename(tab.path) };
+                  // 右键标签（B5 四层右键·标签层）：关闭/关闭其他/关闭全部/复制路径/在侧栏定位
+                  ctxMenu = {
+                    x: e.clientX,
+                    y: e.clientY,
+                    target: { kind: "tab", path: tab.path, name: basename(tab.path) },
+                  };
                 }}
                 title={tab.path}
               >
@@ -4327,6 +4726,7 @@ ${bodyHtml}
         class="editor-host"
         bind:this={editorHost}
         on:mouseup={onEditorMouseUp}
+        on:contextmenu|preventDefault={(e) => openEditorCtx(e)}
         style={previewEditMode ? "display:none" : ""}
       ></div>
       {#if loadingBigDoc}
@@ -4354,7 +4754,8 @@ ${bodyHtml}
             >↻</button>
           {/if}
         </div>
-        <div class="preview-content">
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <div class="preview-content" on:contextmenu|preventDefault={(e) => openPreviewCtx(e)}>
           <VirtualPreview
             bind:this={previewRef}
             {md}
@@ -4474,11 +4875,24 @@ ${bodyHtml}
     on:syncForce={(e: CustomEvent<{ mode: "forceUpload" | "forceDownload" }>) => void doSyncRun(e.detail.mode)}
     on:export={() => {
       showSettings = false;
-      exportHtmlDoc();
+      openExportDialog("html");
     }}
     on:exportPdf={() => {
       showSettings = false;
-      exportPdfDoc();
+      openExportDialog("pdf");
+    }}
+  />
+{/if}
+
+{#if showExportDialog && modalCmps.ExportDialog && currentPath}
+  <svelte:component
+    this={modalCmps.ExportDialog}
+    notePath={currentPath}
+    defaultFormat={exportDialogDefault}
+    on:close={() => (showExportDialog = false)}
+    on:export={(e: CustomEvent<{ format: ExportFormat; targetPath: string }>) => {
+      showExportDialog = false;
+      void handleExport(e.detail.format, e.detail.targetPath);
     }}
   />
 {/if}
@@ -4493,6 +4907,17 @@ ${bodyHtml}
     on:replaced={onFolderReplaced}
   />
 {/if}
+
+<CommandPalette
+  open={paletteOpen}
+  mdRoot={settings.lastFolder}
+  onClose={() => {
+    paletteOpen = false;
+    if (view) view.focus();
+  }}
+  dispatch={dispatch}
+  onOpenFile={(p) => openFileByPathSafe(p)}
+/>
 
 {#if promptState && modalCmps.PromptModal}
   <svelte:component
@@ -4584,10 +5009,12 @@ ${bodyHtml}
       on:click|stopPropagation
       on:contextmenu|preventDefault|stopPropagation
     >
-      <div class="ctx-title" title={ctxMenu.path}>{ctxMenu.name}</div>
-      <button class="ctx-item" on:click={ctxCloseTab}>✕ 关闭标签</button>
-      <button class="ctx-item" on:click={ctxCloseOthers}>✕ 关闭其他标签</button>
-      <button class="ctx-item" on:click={ctxCloseAll}>✕ 关闭全部标签</button>
+      {#if ctxMenu.target.kind === "tab"}
+        <div class="ctx-title" title={ctxMenu.target.path}>{ctxMenu.target.name}</div>
+      {/if}
+      {#each ctxMenuItems() as item (item.id)}
+        <button class="ctx-item" on:click={() => onCtxItem(item.id)}>{item.label}</button>
+      {/each}
     </div>
   </div>
 {/if}

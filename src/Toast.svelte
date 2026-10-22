@@ -24,23 +24,23 @@
     pointer-events: auto;
     max-width: 70vw;
     padding: 9px 16px;
-    border-radius: 8px;
+    border-radius: 12px;
     font-size: 13px;
     line-height: 1.4;
-    color: var(--text);
-    background: var(--toast-bg, #ffffff);
-    border: 1px solid var(--border, #e2e2e6);
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+    color: var(--t1);
+    background: var(--bg);
+    border: 1px solid var(--srf);
+    box-shadow: var(--rs);
     animation: toast-in 160ms ease-out;
   }
   .toast-success {
-    border-left: 3px solid #2e9e5b;
+    border-left: 3px solid var(--ok);
   }
   .toast-error {
-    border-left: 3px solid #e0483d;
+    border-left: 3px solid var(--err);
   }
   .toast-info {
-    border-left: 3px solid var(--accent, #3b82f6);
+    border-left: 3px solid var(--p);
   }
   @keyframes toast-in {
     from {

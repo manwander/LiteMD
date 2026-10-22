@@ -690,17 +690,10 @@
           <div class="group first">
             <div class="row">
               <span class="row-label">
-                导出 HTML
-                <small>内联样式的单文件，可直接分享</small>
+                导出
+                <small>Markdown / PDF / HTML / 自包含 MD，四格式统一入口</small>
               </span>
-              <button class="btn" on:click={() => dispatch("export")}>立即导出</button>
-            </div>
-            <div class="row">
-              <span class="row-label">
-                导出 PDF
-                <small>Rust 侧排版渲染（A4/中文自动换行分页），当前文档内容</small>
-              </span>
-              <button class="btn" on:click={() => dispatch("exportPdf")}>立即导出</button>
+              <button class="btn" on:click={() => dispatch("export")}>打开导出对话框</button>
             </div>
           </div>
 
@@ -734,7 +727,7 @@
   .mask {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--mask);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -748,17 +741,17 @@
     max-height: calc(100vh - 40px);
     display: flex;
     background: var(--bg);
-    border-radius: 14px;
+    border-radius: 16px;
     overflow: hidden;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--rs-l);
   }
 
   /* 左侧导航 180w */
   nav {
     width: 180px;
     flex-shrink: 0;
-    background: var(--panel);
-    border-right: 1px solid var(--border);
+    background: var(--bg);
+    border-right: 1px solid var(--div);
     padding: 12px 8px;
     display: flex;
     flex-direction: column;
@@ -767,7 +760,7 @@
 
   .nav-title {
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
     padding: 4px 10px 10px;
   }
 
@@ -778,19 +771,22 @@
     background: transparent;
     border-radius: 6px;
     font-size: 14px;
-    color: var(--text);
+    color: var(--t1);
     cursor: pointer;
   }
 
   .nav-item:hover {
-    background: var(--border);
-    color: var(--text);
+    background: var(--hov);
+    color: var(--t1);
   }
 
   .nav-item.active {
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-weight: 500;
+    box-shadow: var(--is-s);
+    color: var(--p);
+    font-weight: 600;
+  }
+  :root[data-theme="dark"] .nav-item.active {
+    border: 1px solid var(--ps);
   }
 
   /* 右侧内容 */
@@ -830,7 +826,7 @@
   .desc {
     margin: 0 0 16px;
     font-size: 13px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .group {
@@ -842,13 +838,13 @@
   .group-title {
     font-size: 13px;
     font-weight: 600;
-    color: var(--text);
+    color: var(--t1);
     margin-bottom: 2px;
   }
 
   .divider {
     height: 1px;
-    background: var(--border);
+    background: var(--div);
     margin: 16px 0; /* 组间分隔 16 */
   }
 
@@ -862,7 +858,7 @@
 
   .row-label {
     font-size: 14px;
-    color: var(--text);
+    color: var(--t1);
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -871,7 +867,7 @@
 
   .row-label small {
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .path {
@@ -891,9 +887,10 @@
   .pill {
     font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
     font-size: 12px;
-    color: var(--text-2);
-    background: var(--pill);
-    border: 1px solid transparent;
+    color: var(--t2);
+    background: var(--bg);
+    box-shadow: var(--rs-s);
+    border: 1px solid var(--div);
     border-radius: 6px;
     padding: 4px 8px;
     min-width: 96px;
@@ -902,14 +899,14 @@
   }
 
   .pill:hover {
-    border-color: var(--accent);
-    color: var(--accent);
+    border-color: var(--p);
+    color: var(--p);
   }
 
   .pill.capturing {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-    color: var(--accent);
+    border-color: var(--p);
+    background: var(--tint);
+    color: var(--p);
   }
 
   .mini {
@@ -928,7 +925,7 @@
   .btn {
     padding: 6px 12px;
     font-size: 13px;
-    border-radius: 6px;
+    border-radius: 9px;
   }
 
   .btn:disabled {
@@ -937,8 +934,8 @@
   }
 
   .btn.primary {
-    background: var(--accent);
-    border-color: var(--accent);
+    background: var(--p);
+    border-color: var(--p);
     color: #fff;
   }
 
@@ -949,15 +946,15 @@
   }
 
   .chip.on {
-    background: var(--accent-soft);
-    border-color: var(--accent);
-    color: var(--accent);
+    background: var(--tint);
+    border-color: var(--p);
+    color: var(--p);
   }
 
   .tag {
     font-size: 12px;
-    color: var(--text-2);
-    background: var(--pill);
+    color: var(--t2);
+    background: var(--sl);
     border-radius: 6px;
     padding: 3px 8px;
   }
@@ -967,13 +964,13 @@
     align-items: center;
     gap: 8px;
     padding: 12px 24px;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--div);
   }
 
   .msg {
     flex: 1;
     font-size: 12px;
-    color: var(--text-2);
+    color: var(--t2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -982,7 +979,7 @@
   .about p {
     margin: 0 0 8px;
     font-size: 14px;
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .about .links {
@@ -997,7 +994,7 @@
     border: none;
     padding: 0;
     font-size: 14px;
-    color: var(--accent);
+    color: var(--p);
     text-decoration: underline;
     cursor: pointer;
   }
@@ -1013,12 +1010,12 @@
   input[type="checkbox"] {
     width: 16px;
     height: 16px;
-    accent-color: var(--accent);
+    accent-color: var(--p);
   }
 
   input[type="range"] {
     width: 180px;
-    accent-color: var(--accent);
+    accent-color: var(--p);
   }
 
   input[type="range"]:disabled {
@@ -1030,15 +1027,17 @@
     padding: 5px 8px;
     font-size: 13px;
     font-family: "JetBrains Mono", Consolas, monospace;
-    color: var(--text);
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 6px;
+    color: var(--t1);
+    background: var(--bg);
+    border: none;
+    border-radius: 9px;
+    box-shadow: var(--is-s);
   }
 
   .text-input:focus {
     outline: none;
-    border-color: var(--accent);
+    border: 1.5px solid var(--p);
+    box-shadow: var(--is-s);
   }
 
   .text-input.wide {
@@ -1050,34 +1049,34 @@
   }
 
   .warn-text {
-    color: #b26a00;
+    color: var(--warn);
   }
 
   .tag.ok {
-    color: #1a7f37;
-    background: rgba(26, 127, 55, 0.12);
+    color: var(--ok);
+    background: var(--tint);
   }
 
   .tag.skip {
-    color: var(--text-2);
+    color: var(--t2);
   }
 
   .tag.bad {
-    color: #c0392b;
-    background: rgba(192, 57, 43, 0.12);
+    color: var(--err);
+    background: var(--tint);
   }
 
   .btn.danger {
-    color: #c0392b;
-    border-color: rgba(192, 57, 43, 0.4);
+    color: var(--err);
+    border-color: var(--ps);
   }
 
   .btn.danger:hover {
-    background: rgba(192, 57, 43, 0.08);
+    background: var(--tint);
   }
 
   .adv-toggle {
     margin: 4px 0 10px;
-    color: var(--accent);
+    color: var(--p);
   }
 </style>
