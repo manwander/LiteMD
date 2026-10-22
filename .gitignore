@@ -13,3 +13,4 @@ src-tauri/icons.bak/
 memory/
 .qoder/
 .reasonix/
+.cargo-tmp/

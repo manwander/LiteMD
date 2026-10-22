@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "LiteMD 默认能力：原生对话框 + 核心默认权限 + 自定义标题栏窗口操作",
-  "windows": ["main"],
+  "description": "LiteMD 默认能力：原生对话框 + 核心默认权限 + 自定义标题栏窗口操作 + 产品化补录（打印/置顶/新窗口）",
+  "windows": ["main", "main-*"],
   "permissions": [
     "core:default",
     "dialog:default",
@@ -16,6 +16,9 @@
     "core:window:allow-set-title",
     "core:window:allow-start-dragging",
     "core:window:allow-start-resize-dragging",
-    "core:window:allow-is-maximized"
+    "core:window:allow-is-maximized",
+    "core:window:allow-print",
+    "core:window:allow-set-always-on-top",
+    "core:webview:allow-create-webview-window"
   ]
 }

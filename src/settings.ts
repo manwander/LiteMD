@@ -362,6 +362,12 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
   "view.focusMode": "F11",
   "view.fontIncrease": "Ctrl+=",
   "view.fontDecrease": "Ctrl+-",
+
+  // 产品化 B2-B5 补录：真值此前散落在 ActionDef.accel（仅展示用），keymap 实际匹配读这里
+  "view.typewriter": "F9",
+  "file.print": "Ctrl+Alt+P",
+  // 命令面板开合改为注册表驱动（改键即生效）；ActionDef 无此 id，属纯键值条目
+  "command.palette": "Ctrl+P",
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -442,9 +448,9 @@ const SHIFTED_TO_BASE: Record<string, string> = {
   "?": "/",
 };
 
-/** 统一加速键写法：修饰键顺序固定 Ctrl → Alt → Shift，主键大写 */
-export function normalizeAccel(accel: string): string {
-  const parts = accel
+/** 统一加速键写法：修饰键顺序固定 Ctrl → Alt → Shift，主键大写（容忍空值，返回空串） */
+export function normalizeAccel(accel?: string | null): string {
+  const parts = (accel ?? "")
     .split("+")
     .map((p) => p.trim())
     .filter(Boolean);
@@ -522,9 +528,9 @@ export function toCmKey(accel: string): string {
   return [...mods, key.length === 1 ? key.toLowerCase() : key].join("-");
 }
 
-/** 面板展示用：Ctrl + Shift + O */
-export function displayAccel(accel: string): string {
-  return normalizeAccel(accel).split("+").join(" + ");
+/** 面板展示用：Ctrl + Shift + O（容忍未配置/缺失的 id，空值返回空串） */
+export function displayAccel(accel?: string | null): string {
+  return normalizeAccel(accel ?? "").split("+").join(" + ");
 }
 
 /** 找出与给定加速键冲突的其它动作 id */
@@ -677,7 +683,7 @@ function sanitize(raw: unknown): Settings {
       ? s.roots.filter((p): p is string => typeof p === "string" && !!p)
       : [],
     recentFiles: Array.isArray(s.recentFiles)
-      ? s.recentFiles.filter((f): f is string => typeof f === "string").slice(0, 5)
+      ? s.recentFiles.filter((f): f is string => typeof f === "string").slice(0, 15)
       : [],
     assetsDir: sanitizeAssetsDir(s.assetsDir),
     attachmentMode: s.attachmentMode === "shared" ? "shared" : "perDocument",

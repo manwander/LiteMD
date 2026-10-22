@@ -28,6 +28,8 @@ function time(fn: () => void): number {
 }
 
 describe("性能回归：sanitizeHtml 区块清洗", () => {
+  // timeout 15s：全量跑时 jsdom/DOMPurify 冷启动时间会被计入本用例（单跑 ~2.8s，
+  // 全量跑在慢机上可超 vitest 默认 5s），放宽超时仅消除环境抖动，断言预算不变。
   it(`单次清洗应在预算内 (<=8ms/块，无 DOM 异常)`, () => {
     // 预热（JIT + DOMPurify 初始化）
     for (let i = 0; i < 50; i++) sanitizeHtml(BLOCK_HTML);
@@ -38,7 +40,7 @@ describe("性能回归：sanitizeHtml 区块清洗", () => {
     // 2000 次清洗应满足平均单次 < 8ms（DOMPurify 典型亚毫秒级，留足余量）
     expect(per).toBeLessThan(8);
     console.log(`[perf] sanitizeHtml 平均 ${per.toFixed(4)} ms/块 (${N_BLOCK} 次)`);
-  });
+  }, 15000);
 
   it("清洗后仍彻底剔除 script 与 on* 事件属性", () => {
     const out = sanitizeHtml(BLOCK_HTML);

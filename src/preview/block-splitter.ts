@@ -862,9 +862,10 @@ export function renderBlock(
  * 后处理 HTML：把任务列表 - [ ] / - [x] 渲染为带复选框的 li。
  */
 function postProcessHtml(html: string): string {
+  // C-4：复选框不加 disabled——预览层点击回写文档（[ ]↔[x]）需要可交互元素
   return html
-    .replace(/<li>\[ \] /g, '<li class="task"><input type="checkbox" disabled> ')
-    .replace(/<li>\[[xX]\] /g, '<li class="task"><input type="checkbox" checked disabled> ');
+    .replace(/<li>\[ \] /g, '<li class="task"><input type="checkbox"> ')
+    .replace(/<li>\[[xX]\] /g, '<li class="task"><input type="checkbox" checked> ');
 }
 
 /**

@@ -106,8 +106,8 @@ export async function createMd(options: CreateMdOptions = {}): Promise<MarkdownI
   });
   instance.linkify.set({ fuzzyLink: false, fuzzyEmail: false });
 
-  // C-4：任务列表（默认形态：disabled 复选框 + li.task-list-item）
-  instance.use(taskLists as TaskListsPlugin);
+  // C-4：任务列表（enabled=true → 复选框可交互，预览层点击回写文档 [ ]↔[x]）
+  instance.use(taskLists as TaskListsPlugin, { enabled: true });
 
   // C-5：数学公式（行内 / 块级）
   installMathRules(instance, katex);

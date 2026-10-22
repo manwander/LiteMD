@@ -38,6 +38,7 @@ import { runAction, type ActionHandlerMap } from "./action-dispatch";
 import { extractOutline, type OutlineItem } from "./outline";
 import { MENU_TREE, GROUP_ORDER, displayAccelOf, type MenuGroupId, type MenuNode } from "./menu-registry";
 import { needsMath } from "./needs-math";
+import { EditorView } from "@codemirror/view";
 import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizontalRule, insertToc, selectAllDoc, clearFormatting } from "./insert-actions";
   import StatusBar from "./StatusBar.svelte";
   import Toast from "./Toast.svelte";
@@ -295,6 +296,10 @@ console.log("Hello LiteMD");
   let showPreview = true;
   let focusMode = false;
   let beforeFocus = { tree: true, preview: true };
+  /** P2-3 / LM-08：打字机模式（光标行保持编辑区垂直居中） */
+  let typewriterMode = false;
+  /** P1-5：窗口置顶状态（toggleAlwaysOnTop 维护） */
+  let alwaysOnTop = false;
   // 大文档自动单栏（P1-7 矩阵行）：用户手动开过预览后不再自动折叠（本次会话尊重用户选择）
   let paneUserOverride = false;
   function togglePreviewPane() {
@@ -2249,7 +2254,17 @@ console.log("Hello LiteMD");
         fontSize: settings.fontSize,
         cmKeys: cmKeysOf(settings.shortcuts),
         onChange: (fa, ta, fb, tb) => onEditorDocChange(fa, ta, fb, tb),
-        onCursor: (l, c) => { cursorLine = l; cursorCol = c; },
+        onCursor: (l, c) => {
+          cursorLine = l; cursorCol = c;
+          // 打字机模式：光标行滚到编辑区垂直居中。microtask 派发，
+          // 避免在 CM update 监听器内同步 dispatch 造成重入。
+          if (typewriterMode && view) {
+            const v = view;
+            queueMicrotask(() =>
+              v.dispatch({ effects: EditorView.scrollIntoView(v.state.selection.main.head, { y: "center" }) })
+            );
+          }
+        },
         onQuickAction,
       });
       lastSaved = source;
@@ -2609,6 +2624,19 @@ console.log("Hello LiteMD");
     }
   }
 
+  /** P2-3 打字机模式：开关注册表 view.typewriter（F9），滚动逻辑挂在 onCursor */
+  function toggleTypewriter() {
+    typewriterMode = !typewriterMode;
+    if (typewriterMode && view) {
+      const v = view;
+      queueMicrotask(() =>
+        v.dispatch({ effects: EditorView.scrollIntoView(v.state.selection.main.head, { y: "center" }) })
+      );
+    }
+    status = typewriterMode ? "打字机模式已开启（光标行居中）" : "已退出打字机模式";
+    showToast(typewriterMode ? "打字机模式已开启" : "已退出打字机模式", "info");
+  }
+
   // ---------- 文件操作 ----------
   async function openFile() {
     const p = await pickOpenFile();
@@ -2824,6 +2852,17 @@ console.log("Hello LiteMD");
     "win.minimize": () => cmd(winMinimize),
     "win.toggleMax": () => cmd(winToggleMax),
     "win.close": () => cmd(winClose),
+
+    // ===== 产品化 B5 补录：此前注册表有条目、分发表无执行体的 8 个 action =====
+    "file.print": () => cmd(doPrint),
+    "file.exit": () => cmd(winClose), // 退出复用统一关闭（未保存先确认）
+    "help.docs": () => cmd(openDocs),
+    "help.checkUpdate": () => cmd(doCheckUpdate),
+    "view.typewriter": () => cmd(toggleTypewriter),
+    "win.newWindow": () => cmd(openNewWindow),
+    // 无 untitled 缓冲区架构（标签按路径 keyed），「新建标签」落地为新建笔记并开新标签
+    "win.newTab": () => cmd(() => treeRef?.requestNewFile()),
+    "win.alwaysOnTop": () => cmd(toggleAlwaysOnTop),
   };
   function setThemeMode(m: "light" | "dark" | "auto"): void {
     settings.theme = m;
@@ -4320,13 +4359,13 @@ ${bodyHtml}
       if (isSave) { e.preventDefault(); save(); }
       return;
     }
-    // ===== 产品化集成：Alt 菜单栏显隐 / Ctrl+P 命令面板 / Ctrl+1~3 视图模式 =====
+    // ===== 产品化集成：Alt 菜单栏显隐 / Ctrl+P 命令面板（注册表驱动，可改键）/ Ctrl+1~3 视图模式 =====
     if (e.key === "Alt" && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
       e.preventDefault();
       menubarVisible = !menubarVisible;
       return;
     }
-    if (e.ctrlKey && !e.altKey && !e.shiftKey && e.code === "KeyP") {
+    if (matchAccel(e, settings.shortcuts["command.palette"] ?? DEFAULT_SHORTCUTS["command.palette"] ?? "Ctrl+P")) {
       run(e, () => (paletteOpen = !paletteOpen));
       return;
     }
@@ -4382,6 +4421,8 @@ ${bodyHtml}
     else if (hit("format.quote")) run(e, quote);
     else if (hit("view.togglePreview")) run(e, () => togglePreviewPane());
     else if (hit("view.focusMode")) run(e, toggleFocus);
+    else if (hit("view.typewriter")) run(e, toggleTypewriter);
+    else if (hit("file.print")) run(e, doPrint);
     else if (hit("view.fontIncrease")) run(e, () => bumpFont(1));
     else if (hit("view.fontDecrease")) run(e, () => bumpFont(-1));
   }
@@ -4392,6 +4433,44 @@ ${bodyHtml}
       const target = e.target as HTMLElement;
       if (!target.closest(".color-wrap")) colorMenu = null;
     }
+    // C-4：预览任务列表复选框点击 → 回写文档 [ ]↔[x]
+    maybeToggleTaskCheckbox(e);
+  }
+
+  /**
+   * C-4 任务列表点击回写：预览里的第 N 个复选框 ↔ 文档里第 N 个任务行。
+   * 走 applyExternalEdit 通道（与预览编辑回写同路，不抢焦点、不破坏撤销栈）。
+   * - 仅处理 .preview-content / .preview-edit 两个整篇容器；VirtualPreview 按块懒渲染，
+   *   DOM 内复选框序号 ≠ 文档序号，不做回写（大文档预览本就降级）。
+   * - 预览编辑模式（previewEditMode）跳过：原生点击 + turndown gfm 已覆盖回写。
+   */
+  function maybeToggleTaskCheckbox(e: MouseEvent): void {
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement) || t.type !== "checkbox") return;
+    if (previewEditMode || !view) return;
+    const container = t.closest(".preview-content, .preview-edit");
+    if (!container) return;
+    const boxes = Array.from(container.querySelectorAll('input[type="checkbox"]'));
+    const idx = boxes.indexOf(t);
+    if (idx < 0) return;
+    const doc = view.state.doc;
+    let seen = -1;
+    let targetLine: { from: number; to: number; text: string } | null = null;
+    for (let i = 1; i <= doc.lines; i++) {
+      const line = doc.line(i);
+      if (/^\s*[-*+]\s+\[[ xX]\]/.test(line.text)) {
+        seen++;
+        if (seen === idx) {
+          targetLine = line;
+          break;
+        }
+      }
+    }
+    if (!targetLine) return;
+    const checked = /\[[xX]\]/.test(targetLine.text);
+    const insert = targetLine.text.replace(/\[[ xX]\]/, checked ? "[ ]" : "[x]");
+    applyExternalEdit(view, targetLine.from, targetLine.to, insert);
+    e.preventDefault(); // 阻止原生 checked 翻转与重渲染后状态抖动
   }
 
   // 菜单/工具栏点击统一入口：与 run() 相同地兜住同步异常与 Promise rejection，
@@ -4529,7 +4608,7 @@ ${bodyHtml}
     closeAllDialog = false;
   }
 
-  const accel = (id: string) => displayAccel(settings.shortcuts[id] ?? DEFAULT_SHORTCUTS[id]);
+  const accel = (id: string) => displayAccel(settings.shortcuts[id] ?? DEFAULT_SHORTCUTS[id] ?? "");
 
   // ---------- 自定义窗口控制（decorations: false）----------
   function winMinimize() {
@@ -4540,6 +4619,98 @@ ${bodyHtml}
   }
   function winClose() {
     requestClose();
+  }
+
+  // ---------- 产品化补录（B5 空档接线：打印 / 文档 / 检查更新 / 窗口管理 / 退出）----------
+
+  /** LM-24 / C-7：打印 = WebView 原生打印（PDF 归档走统一导出对话框，二者互补） */
+  function doPrint() {
+    try {
+      (tauriWindow as any)?.print?.();
+    } catch (err) {
+      showToast("打印不可用：" + String(err), "error");
+    }
+  }
+
+  /** LM-20：使用文档（GitHub README，独立轻量窗口打开） */
+  async function openDocs() {
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      new WebviewWindow(`docs-${Date.now()}`, {
+        url: "https://github.com/manwander/LiteMD#readme",
+        title: "LiteMD 使用文档",
+        width: 1024,
+        height: 768,
+      });
+    } catch (err) {
+      showToast("打开文档失败：" + String(err), "error");
+    }
+  }
+
+  /** LM-20 / P1-5：检查更新（GitHub Releases latest vs 本地版本号） */
+  function cmpVer(a: string, b: string): number {
+    const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+    const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  }
+
+  async function doCheckUpdate() {
+    status = "正在检查更新…";
+    try {
+      const res = await fetch("https://api.github.com/repos/manwander/LiteMD/releases/latest", {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { tag_name?: string };
+      const remote = String(data.tag_name ?? "").replace(/^v/i, "").trim();
+      const { getVersion } = await import("@tauri-apps/api/app");
+      const local = await getVersion();
+      if (remote && cmpVer(remote, local) > 0) {
+        showToast(`发现新版本 v${remote}（当前 v${local}）`, "warn", 6000);
+        status = `新版本 v${remote} 可用`;
+      } else {
+        showToast(`已是最新版本 v${local}`, "success");
+        status = "已是最新版本";
+      }
+    } catch (err) {
+      showToast("检查更新失败：无法连接 GitHub Releases", "error", 4000);
+      status = "检查更新失败";
+    }
+  }
+
+  /** P1-5：新窗口（同应用多实例窗口，单实例插件按进程去重不受影响） */
+  async function openNewWindow() {
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      new WebviewWindow(`main-${Date.now()}`, {
+        url: "index.html",
+        title: "LiteMD",
+        width: 1280,
+        height: 800,
+        minWidth: 800,
+        minHeight: 600,
+        decorations: false,
+      });
+    } catch (err) {
+      showToast("新建窗口失败：" + String(err), "error");
+    }
+  }
+
+  /** P1-5：置顶开关（注册表 win.alwaysOnTop） */
+  async function toggleAlwaysOnTop() {
+    try {
+      const next = !alwaysOnTop;
+      await (tauriWindow as any)?.setAlwaysOnTop?.(next);
+      alwaysOnTop = next;
+      showToast(next ? "窗口已置顶" : "已取消置顶", "info");
+      status = next ? "窗口置顶中" : "";
+    } catch (err) {
+      showToast("置顶操作失败：" + String(err), "error");
+    }
   }
 
   // 统一关闭：未保存先确认，确认后 destroy() 强制关闭。
@@ -4576,6 +4747,16 @@ ${bodyHtml}
       onOpenRecent={(p) => cmd(() => openFileByPath(p))}
     />
 
+    <!-- 自定义窗口控制按钮 -->
+    <div class="win-ctrl">
+      <button class="wc" on:click={winMinimize} title="最小化">─</button>
+      <button class="wc" on:click={winToggleMax} title="最大化 / 还原">□</button>
+      <button class="wc wc-close" on:click={winClose} title="关闭">✕</button>
+    </div>
+  </header>
+
+  <!-- 工具栏独立成行（方案 A 固定两行）：窄窗口时在自身行内换行，绝不侵入侧栏区域 -->
+  <div class="toolbar-row" data-tauri-drag-region>
     <Toolbar
       dispatch={dispatch}
       accelFn={accel}
@@ -4592,24 +4773,19 @@ ${bodyHtml}
       onToggleTheme={() => cmd(toggleTheme)}
       onAlignCol={(dir) => cmd(() => alignCol(dir))}
     />
-
-    <!-- 自定义窗口控制按钮 -->
-    <div class="win-ctrl">
-      <button class="wc" on:click={winMinimize} title="最小化">─</button>
-      <button class="wc" on:click={winToggleMax} title="最大化 / 还原">□</button>
-      <button class="wc wc-close" on:click={winClose} title="关闭">✕</button>
-    </div>
-  </header>
+  </div>
 
   <!-- --sbw：侧栏当前宽度（px），供 tab 条 / 大纲 / 搜索三块与文件树列对齐 -->
   <div class="body" style="--sbw: {sidebarWidth}px">
     {#if showTree}
-      <div class="sb-tabs" role="tablist" aria-label="侧栏面板">
-        <button class="sb-tab" class:on={sidebarTab === "tree"} role="tab" aria-selected={sidebarTab === "tree"} on:click={() => (sidebarTab = "tree")}>目录</button>
-        <button class="sb-tab" class:on={sidebarTab === "outline"} role="tab" aria-selected={sidebarTab === "outline"} on:click={() => (sidebarTab = "outline")}>大纲</button>
-        <button class="sb-tab" class:on={sidebarTab === "search"} role="tab" aria-selected={sidebarTab === "search"} on:click={() => (sidebarTab = "search")}>搜索</button>
-      </div>
-      <div class="sb-body" class:hidden={sidebarTab !== "tree"}>
+      <!-- 侧栏单列容器：tab 行 + 面板体上下堆叠，宽度共用 --sbw（修复：原三块并列各占一列） -->
+      <div class="sidebar-col">
+        <div class="sb-tabs" role="tablist" aria-label="侧栏面板">
+          <button class="sb-tab" class:on={sidebarTab === "tree"} role="tab" aria-selected={sidebarTab === "tree"} on:click={() => (sidebarTab = "tree")}>目录</button>
+          <button class="sb-tab" class:on={sidebarTab === "outline"} role="tab" aria-selected={sidebarTab === "outline"} on:click={() => (sidebarTab = "outline")}>大纲</button>
+          <button class="sb-tab" class:on={sidebarTab === "search"} role="tab" aria-selected={sidebarTab === "search"} on:click={() => (sidebarTab = "search")}>搜索</button>
+        </div>
+        <div class="sb-body" class:hidden={sidebarTab !== "tree"}>
         <FileTree
           bind:this={treeRef}
           store={treeStore}
@@ -4650,6 +4826,7 @@ ${bodyHtml}
           </button>
         </div>
       {/if}
+      </div>
       <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="splitter" on:mousedown={(e) => startDrag("sidebar", e)} title="拖动调整宽度"></div>
     {/if}
@@ -4785,6 +4962,7 @@ ${bodyHtml}
     autoSave={settings.autoSave}
     fontSize={settings.fontSize}
     previewNotice={previewDisabledNotice}
+    {focusMode}
     {syncText}
     {syncBusy}
     {syncConflicts}

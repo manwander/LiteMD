@@ -10,13 +10,14 @@
 
 <style>
   .toast-wrap {
+    /* LM-17：右下角堆叠（bottom 38 让出状态栏），右对齐、自下而上生长 */
     position: fixed;
-    top: 14px;
-    left: 50%;
-    transform: translateX(-50%);
+    right: 14px;
+    bottom: 38px;
     z-index: 99999;
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: 8px;
     pointer-events: none;
   }
@@ -36,6 +37,9 @@
   .toast-success {
     border-left: 3px solid var(--ok);
   }
+  .toast-warn {
+    border-left: 3px solid var(--warn);
+  }
   .toast-error {
     border-left: 3px solid var(--err);
   }
@@ -45,7 +49,8 @@
   @keyframes toast-in {
     from {
       opacity: 0;
-      transform: translateY(-8px);
+      /* 右下角入场：自下而上浮现 */
+      transform: translateY(8px);
     }
     to {
       opacity: 1;

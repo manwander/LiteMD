@@ -13,8 +13,8 @@
 //   并显式放行 Tauri 的 asset:// 协议（本地图片预览依赖它）。
 //
 // E5 渲染补强放行（最小原则，C-4/C-5/C-6）：
-//   - input[type=checkbox][disabled]：markdown-it-task-lists 产物（原有降级
-//     钩子已覆盖，input 不在禁用列表，属性经钩子归一化）；
+//   - input[type=checkbox]：markdown-it-task-lists 产物（C-4 起为可交互形态，
+//     input 不在禁用列表，属性经钩子归一化为 type=checkbox [+ checked]）；
 //   - data-src：Mermaid 占位 div 的原文属性（ADD_ATTR 定向放行，不开放全部 data-*）；
 //   - .katex 子树内的 position/top/border-bottom-width：KaTeX 分式/根式行内
 //     堆叠所必需（position 仅放行 relative；fixed/absolute 点击劫持面继续全拦）。
@@ -46,7 +46,7 @@ const ALLOWED_URI_REGEXP =
  *  - style/link/base/meta：可注入 CSS 泄漏（背景图外链）或改写文档基址
  *  - form/input(非任务列表)/button/textarea/select：诱导性交互面
  * 说明：任务列表复选框由 block-splitter 后处理生成，需保留 input，
- *      因此 input 不在禁用列表，而是通过属性白名单限制为 type=checkbox+disabled。
+ *      因此 input 不在禁用列表，而是通过属性白名单限制为 type=checkbox（C-4 起可交互）。
  */
 const FORBID_TAGS = [
   "script",
@@ -202,11 +202,12 @@ function ensureHooks(): void {
       }
     }
     if (el.tagName === "INPUT") {
-      // 只允许「禁用的复选框」这一种形态（任务列表），其余属性一律剥离
+      // 只允许「复选框」这一种形态（任务列表），其余属性一律剥离。
+      // C-4：不再强制 disabled——预览复选框需可点击以回写文档（[ ]↔[x]）。
+      // 剥离后无 name/value/form 归属，不参与任何表单提交，无脚本面，安全性不变。
       const checked = el.hasAttribute("checked");
       for (const attr of Array.from(el.attributes)) el.removeAttribute(attr.name);
       el.setAttribute("type", "checkbox");
-      el.setAttribute("disabled", "");
       if (checked) el.setAttribute("checked", "");
     }
   });

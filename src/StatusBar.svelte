@@ -21,6 +21,8 @@
   export let syncText: string = "";
   export let syncBusy: boolean = false;
   export let syncConflicts: number = 0;
+  /** LM-11：专注模式开启时常驻提示「再按 F11 退出」 */
+  export let focusMode: boolean = false;
 </script>
 
 <footer class="statusbar">
@@ -46,6 +48,9 @@
   {/if}
   <span>行 {cursorLine} : 列 {cursorCol}</span>
   <span>{words} 字 · {chars} 字符</span>
+  {#if focusMode}
+    <span class="sb-focus" title="专注模式已开启：侧栏与工具栏已隐藏">专注模式 · F11 退出</span>
+  {/if}
   <span>{autoSave ? "自动保存开" : "自动保存关"}</span>
   <span>{fontSize}px</span>
 </footer>
@@ -71,5 +76,12 @@
   }
   .sb-sync.busy {
     color: var(--p);
+  }
+  .sb-focus {
+    color: var(--p);
+    background: var(--tint);
+    border-radius: 4px;
+    padding: 0 6px;
+    white-space: nowrap;
   }
 </style>

@@ -92,18 +92,19 @@ describe("C-01 外链加安全属性（防 window.opener 劫持）", () => {
 });
 
 describe("C-01/M-04 任务列表 input 降级", () => {
-  it("非任务列表 <input type=text> 降级为禁用复选框", () => {
+  it("非任务列表 <input type=text> 归一化为可交互复选框（C-4，不强制 disabled）", () => {
     const out = sanitizeHtml('<input type="text" name="x">');
     expect(out).toContain('type="checkbox"');
-    expect(out).toContain("disabled");
+    expect(out).not.toContain("disabled");
+    expect(out).not.toContain("name");
     expect(out).not.toContain('type="text"');
   });
 
-  it("任务列表复选框（checked）保留为禁用 checkbox", () => {
+  it("任务列表复选框（checked）保留 checked 且保持可交互", () => {
     const out = sanitizeHtml('<input type="checkbox" checked>');
     expect(out).toContain('type="checkbox"');
-    expect(out).toContain("disabled");
     expect(out).toContain("checked");
+    expect(out).not.toContain("disabled");
   });
 });
 
@@ -197,22 +198,31 @@ describe("内联样式白名单（布局劫持 / CSS 外链防护）", () => {
 // ---------------------------------------------------------------------------
 
 describe("E5 C-4 任务列表复选框经 sanitize 存活", () => {
-  it("markdown-it-task-lists 产物（input disabled + li.task-list-item）保留", () => {
+  it("markdown-it-task-lists 产物（input + li.task-list-item）保留", () => {
     const out = sanitizeHtml(
       '<ul class="contains-task-list"><li class="task-list-item">' +
-        '<input class="task-list-item-checkbox" disabled="" type="checkbox">done</li></ul>'
+        '<input class="task-list-item-checkbox" type="checkbox">done</li></ul>'
     );
     expect(out).toContain('type="checkbox"');
-    expect(out).toContain("disabled");
+    // C-4：复选框可交互（不强制 disabled），点击回写文档依赖此形态
+    expect(out).not.toContain("disabled");
     // li 上的 task-list-item 类是 CSS 挂钩，必须存活
     expect(out).toContain("task-list-item");
   });
 
-  it("勾选态复选框 checked 保留且仍带 disabled", () => {
-    const out = sanitizeHtml('<input class="task-list-item-checkbox" checked="" disabled="" type="checkbox">');
+  it("勾选态复选框 checked 保留且保持可交互", () => {
+    const out = sanitizeHtml('<input class="task-list-item-checkbox" checked="" type="checkbox">');
     expect(out).toContain('type="checkbox"');
-    expect(out).toContain("disabled");
     expect(out).toContain("checked");
+    expect(out).not.toContain("disabled");
+  });
+
+  it("input 的其他属性（name/value/onfocus）一律剥离", () => {
+    const out = sanitizeHtml('<input type="checkbox" name="evil" value="x" onfocus="alert(1)">');
+    expect(out).not.toContain("name");
+    expect(out).not.toContain("value");
+    expect(out).not.toContain("onfocus");
+    expect(out).toContain('type="checkbox"');
   });
 });
 
@@ -279,11 +289,11 @@ describe("E5 C-6 Mermaid 占位 data-src 放行", () => {
 });
 
 describe("E5 管线集成（createMd + safeRender 端到端）", () => {
-  it("任务列表：渲染出 disabled 复选框，li 带 task-list-item，经 sanitize 存活", async () => {
+  it("任务列表：渲染出可交互复选框（C-4），li 带 task-list-item，经 sanitize 存活", async () => {
     const md = await createMd();
     const out = safeRender(md, "- [x] done\n- [ ] todo\n");
     expect(out).toContain('type="checkbox"');
-    expect(out).toContain("disabled");
+    expect(out).not.toContain("disabled"); // C-4：enabled 形态，预览点击回写依赖
     expect(out).toContain("task-list-item");
     expect(out).toContain("checked"); // [x] 勾选态
   });
