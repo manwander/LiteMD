@@ -24,7 +24,7 @@ const MAX_ENTRIES: usize = 50_000;
 /// （业务上限仍由 engine 的 max_file_size 控制，这里是最后一道防线）。
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebDavConfig {
     pub url: String,
     pub username: String,
@@ -36,6 +36,22 @@ pub struct WebDavConfig {
     pub proxy_timeout_sec: u64,
 }
 
+// 手写 Debug：口令与证书内容不得随 {:?}/日志外泄（报告 2-B 零依赖纵深）。
+impl std::fmt::Debug for WebDavConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebDavConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("ignore_tls_errors", &self.ignore_tls_errors)
+            .field("custom_tls_certs", &format_args!("<{} bytes>", self.custom_tls_certs.len()))
+            .field("proxy_enabled", &self.proxy_enabled)
+            .field("proxy_url", &self.proxy_url)
+            .field("proxy_timeout_sec", &self.proxy_timeout_sec)
+            .finish()
+    }
+}
+
 pub struct WebDav {
     client: reqwest::Client,
     /// 归一后的完整基 URL（含路径、以 '/' 结尾），如 https://host/notes/
@@ -45,6 +61,8 @@ pub struct WebDav {
     credentials: Option<(String, String)>,
     /// 首次上传前是否已尝试创建基目录（本轮内只尝试一次）
     base_ready: AtomicBool,
+    /// 本轮内已成功 MKCOL 的相对目录集合：避免每个文件上传都重建整条祖先链（N+1 往返）。
+    created_dirs: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// 把用户填的 url + 文件夹 basePath 归一成完整基 URL。
@@ -65,12 +83,20 @@ pub fn normalize_base(url: &str, folder_base_path: &str) -> Result<(String, Stri
         return Err("URL 必须以 https:// 开头（本机调试可用 http://localhost）".into());
     };
     let without_scheme = &u[scheme.len()..];
-    let (authority, path) = match without_scheme.find('/') {
+    // 以第一个 '/' 或 '\' 为界切分 authority 与 path——与 reqwest/url 的 WHATWG 解析一致
+    // （特殊 scheme 下 '\' 等价于 '/'），防止用 `evil.com:80\@localhost` 把回环主机名塞进
+    // authority 尾段、借下方 is_loopback_authority 的 rsplit('@') 末段判定绕过明文 http 白名单。
+    let (authority, path) = match without_scheme.find(['/', '\\']) {
         Some(i) => (&without_scheme[..i], &without_scheme[i..]),
         None => (without_scheme, "/"),
     };
     if authority.is_empty() {
         return Err("URL 缺少主机名".into());
+    }
+    // 纵深防御：拒绝 URL 内嵌 userinfo（账号密码必须走专用字段），杜绝 `user@host` 与
+    // `host\@localhost` 之类把真实主机藏到 '@' 之前的绕过手法。
+    if authority.contains('@') {
+        return Err("WebDAV URL 不得内嵌用户名/密码，请在专用字段填写".into());
     }
     if scheme == "http://" && !is_loopback_authority(authority) {
         return Err("WebDAV 必须使用 HTTPS（localhost 除外）：明文 http 会以明文传输账号密码".into());
@@ -122,6 +148,15 @@ fn is_loopback_authority(authority: &str) -> bool {
     matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
+/// 归一 ETag：去首尾空白、剥弱验证 `W/` 前缀、去包裹双引号。
+/// 同一文件在 PUT 响应头（常为强 ETag `"abc"`）与 PROPFIND `<getetag>`（常为弱 ETag
+/// `W/"abc"`）之间形式不同，若不统一会导致 remote_maybe_changed 每轮判变→全量重下。
+fn normalize_etag(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s.strip_prefix("W/").unwrap_or(s);
+    s.trim_matches('"').to_string()
+}
+
 impl WebDav {
     pub fn new(cfg: &WebDavConfig, folder_base_path: &str) -> Result<Self, String> {
         let (base, base_path) = normalize_base(&cfg.url, folder_base_path)?;
@@ -158,6 +193,7 @@ impl WebDav {
             base_path,
             credentials,
             base_ready: AtomicBool::new(false),
+            created_dirs: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -319,15 +355,37 @@ impl WebDav {
             }
         }
         let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        // 先展开祖先目录路径（不含文件本身），跳过本轮已确认建成的目录，仅对缺失者 MKCOL，
+        // 成功后写入缓存 → 消除「每个文件上传都重建整条祖先链」的 N+1 网络往返。
+        let mut ancestors: Vec<String> = Vec::new();
         let mut cur = String::new();
         for seg in segs.iter().take(segs.len().saturating_sub(1)) {
             if !cur.is_empty() {
                 cur.push('/');
             }
             cur.push_str(seg);
-            let url = self.url_for(&cur);
-            let req = self.with_auth(self.client.request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url));
-            let _ = req.send().await;
+            ancestors.push(cur.clone());
+        }
+        let pending: Vec<String> = {
+            let g = self.created_dirs.lock().unwrap_or_else(|e| e.into_inner());
+            ancestors.into_iter().filter(|a| !g.contains(a)).collect()
+        };
+        for dir in pending {
+            let url = self.url_for(&dir);
+            let req = self.with_auth(
+                self.client
+                    .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url),
+            );
+            if let Ok(resp) = req.send().await {
+                let s = resp.status().as_u16();
+                // 2xx=新建成功；405/409=已存在（同样视为就绪，纳入缓存不再重复探测）
+                if (200..300).contains(&s) || s == 405 || s == 409 {
+                    self.created_dirs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(dir);
+                }
+            }
         }
     }
 }
@@ -527,7 +585,7 @@ impl Transport for WebDav {
         }
         let headers = resp.headers().clone();
         Ok(UploadResult {
-            etag: header_str(&headers, "etag").map(|s| s.trim().trim_matches('"').to_string()),
+            etag: header_str(&headers, "etag").map(|s| normalize_etag(&s)),
             last_modified: header_str(&headers, "last-modified").and_then(|s| httpdate_to_unix(&s)),
         })
     }
@@ -745,7 +803,7 @@ fn handle_element(ctx: &mut ParseCtx, name: &[u8], inner: &str) {
                     match name {
                         b"getetag" => {
                             ctx.wrote.etag = true;
-                            c.etag = if inner.is_empty() { None } else { Some(inner.trim().trim_matches('"').to_string()) }
+                            c.etag = if inner.is_empty() { None } else { Some(normalize_etag(&inner)) }
                         }
                         b"getcontentlength" => {
                             ctx.wrote.size = true;

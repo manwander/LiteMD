@@ -808,9 +808,23 @@ async fn do_upload<T: Transport>(
     item: &PlanItem,
     force: bool,
 ) -> Result<Vec<OutcomeTag>, String> {
-    let bytes = read_bytes(root.join(slash(&item.rel))).await?;
-    let hash = sha256_bytes(&bytes);
-    let st = stat_of(root, &item.rel).await?;
+    // 消除 TOCTOU：读字节前后各 stat 一次；若期间被再次保存（size/mtime 抖动）则重读，
+    // 最多 3 次，确保「上传的字节 + 写入快照的 size/mtime」严格同源。旧实现先读 v1 再 stat
+    // 到 v2，会把「v1 哈希 + v2 元数据」写进快照，下一轮 size/mtime 相等判未变 → v2 永不上传。
+    let (mut size, mut mtime) = stat_of(root, &item.rel).await?;
+    let mut bytes = read_bytes(root.join(slash(&item.rel))).await?;
+    let mut hash = sha256_bytes(&bytes);
+    for _ in 0..3 {
+        let (s2, m2) = stat_of(root, &item.rel).await?;
+        if s2 == size && m2 == mtime {
+            break;
+        }
+        // 读取窗口内又被保存：以最新元数据为基准重读，直至稳定或次数用尽
+        size = s2;
+        mtime = m2;
+        bytes = read_bytes(root.join(slash(&item.rel))).await?;
+        hash = sha256_bytes(&bytes);
+    }
     // 强制上传（ForceUpload / ReUpload）必须真正推送：远端可能已被删除或篡改，
     // 而快照哈希与本地一致（无 etag 服务器每轮保守重传），不能因此跳过。
     if !force {
@@ -821,7 +835,7 @@ async fn do_upload<T: Transport>(
             if old.hash == hash {
                 s.upsert(
                     &item.rel,
-                    FileState { size: st.0, mtime: st.1, synced_at: unix_now(), ..old },
+                    FileState { size, mtime, synced_at: unix_now(), ..old },
                 );
                 return Ok(vec![]);
             }
@@ -833,8 +847,8 @@ async fn do_upload<T: Transport>(
         &item.rel,
         FileState {
             hash,
-            size: st.0,
-            mtime: st.1,
+            size,
+            mtime,
             remote_etag: up.etag,
             remote_mtime: up.last_modified,
             synced_at: unix_now(),
@@ -905,17 +919,18 @@ async fn do_conflict<T: Transport>(
     let local_exists = tokio::fs::metadata(&local_path).await.is_ok();
     let local_bytes = if local_exists { read_bytes(local_path.clone()).await? } else { Vec::new() };
     let local_hash = sha256_bytes(&local_bytes);
+    // 与 local_bytes 同源取元数据，避免「读→stat」之间被再次保存导致快照哈希/元数据错配（TOCTOU）
+    let (local_size, local_mtime) = if local_exists { stat_of(root, &item.rel).await? } else { (0u64, 0i64) };
 
     if remote_hash == local_hash && local_exists {
         // 内容一致：认领入快照，双方都不动
-        let st = stat_of(root, &item.rel).await?;
         let mut s = snap.lock().await;
         s.upsert(
             &item.rel,
             FileState {
                 hash: local_hash,
-                size: st.0,
-                mtime: st.1,
+                size: local_size,
+                mtime: local_mtime,
                 remote_etag: item.remote_etag.clone(),
                 remote_mtime: item.remote_mtime,
                 synced_at: unix_now(),
@@ -957,7 +972,6 @@ async fn do_conflict<T: Transport>(
             )
             .await;
             write_bytes_atomic(root.join(slash(&copy_rel)), &remote_bytes).await?;
-            let (lsize, lmtime) = stat_of(root, &item.rel).await?;
             let up_orig = t.upload(&item.rel, local_bytes).await?;
             let up_copy = t.upload(&copy_rel, remote_bytes).await?;
             let mut s = snap.lock().await;
@@ -965,8 +979,8 @@ async fn do_conflict<T: Transport>(
                 &item.rel,
                 FileState {
                     hash: local_hash,
-                    size: lsize,
-                    mtime: lmtime,
+                    size: local_size,
+                    mtime: local_mtime,
                     remote_etag: up_orig.etag,
                     remote_mtime: up_orig.last_modified,
                     synced_at: unix_now(),

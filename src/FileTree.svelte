@@ -22,7 +22,7 @@
   import { flatten } from "./filetree/flatten";
   import { loadFolderNode, reloadFolder, refreshFolderOf, reloadAllLoaded, refreshTree as refreshAllTree, revealCreated as opsRevealCreated, applyFsChanges as opsApplyFsChanges, addFolderNode, addFileNode } from "./filetree/ops";
   import { ensureVisible } from "./filetree/locate";
-  import { startWatching, stopWatching, pauseWatcher, resumeWatcher } from "./filetree/watcher";
+  import { startWatching, stopWatching, pauseWatcher, resumeWatcher, retainFsWatcher, releaseFsWatcher } from "./filetree/watcher";
   import type { FsChange } from "./filetree/watcher";
   import type { TreeStore } from "./filetree/store";
   import {
@@ -770,6 +770,11 @@
     const res = await handlers.prompt({ title: "新建笔记", label: "笔记名", value: def, path: target0 });
     if (!res || !res.name.trim()) return;
     const target = norm(res.path.trim() || target0);
+    // 纵深：PromptModal 里的目标目录可被编辑成任意绝对路径，限制必须落在已打开的工作区根内
+    if (!target || !state.rootPaths.some((r) => { const rn = norm(r); return target === rn || target.startsWith(rn + "/"); })) {
+      handlers.setStatus("只能在已打开的工作区目录内新建");
+      return;
+    }
     const cleanName = sanitizeName(res.name.trim());
     if (!cleanName) {
       handlers.setStatus("文件名不能为空或仅含非法字符");
@@ -808,6 +813,11 @@
     const res = await handlers.prompt({ title: "新建文件夹", label: "文件夹名", value: def, path: target0 });
     if (!res || !res.name.trim()) return;
     const target = norm(res.path.trim() || target0);
+    // 纵深：目标目录不得越过已打开的工作区根（与 newFileIn 同规则）
+    if (!target || !state.rootPaths.some((r) => { const rn = norm(r); return target === rn || target.startsWith(rn + "/"); })) {
+      handlers.setStatus("只能在已打开的工作区目录内新建");
+      return;
+    }
     const cleanName = sanitizeName(res.name.trim());
     if (!cleanName) {
       handlers.setStatus("文件夹名不能为空或仅含非法字符");
@@ -1108,13 +1118,18 @@
   async function runRemoteSearch() {
     const q = state.filter.trim();
     if (!q) return;
+    const myToken = q;
     remoteSearching = true;
     try {
+      // 并行发起各根搜索（此前 for-await 串行 N 次往返）；单根失败不再伪装成「无结果」，显式上报。
+      const errors: string[] = [];
+      const perRoot = await Promise.all(state.rootPaths.map((root) =>
+        searchFilenames(root, q, state.showHidden, 200).catch((e: unknown) => { errors.push(String(e)); return [] as string[]; })
+      ));
+      if (state.filter.trim() !== myToken) return; // 迟到结果丢弃，避免覆盖更新的过滤（报告 1-H 竞态）
       const all: string[] = [];
-      for (const root of state.rootPaths) {
-        const hits = await searchFilenames(root, q, state.showHidden, 200).catch(() => [] as string[]);
-        all.push(...hits);
-      }
+      for (const hits of perRoot) all.push(...hits);
+      if (errors.length) handlers.setStatus(`搜索失败 ${errors.length}/${state.rootPaths.length} 个目录（权限/网络？）`);
       const visible = new Set(flatTree.filter((f) => f.kind === "file" || f.kind === "folder").map((f) => norm(f.path)));
       const uniq = [...new Set(all.map(norm))].filter(
         (p) => !visible.has(p) && (state.showNonMd || baseName(p).toLowerCase().endsWith(".md"))
@@ -1126,7 +1141,7 @@
         return { kind: "remote" as const, name: baseName(p), path: p, depth: 0, expanded: false, remoteRel: rel };
       });
     } finally {
-      remoteSearching = false;
+      if (state.filter.trim() === myToken) remoteSearching = false;
     }
   }
   async function openRemote(n: FlatNode) {
@@ -1181,10 +1196,11 @@
   let watchOn = false;
   let watchBusy = false;
   $: watchRootsKey = state.rootPaths.join("|");
-  $: if (watchRootsKey) void restartWatch();
+  // 逗号表达式：读 watchRootsKey 建立依赖（根列表变化即重跑），并对空列表也 re-arm（watchDirs([]) 停监视）
+  $: void watchRootsKey, restartWatch();
   async function restartWatch(): Promise<boolean> {
-    if (!state.rootPaths.length) return false;
-    stopWatching();
+    // startWatching 已幂等（内部退订旧监听 + 以新 roots 重新 arm），无需先 stopWatching；
+    // 持有计数由挂载期 retainFsWatcher()/卸载 releaseFsWatcher() 统一管理，避免误停 App 依赖的全局监视器。
     watchBusy = true;
     watchOn = await startWatching(state.rootPaths, onFsChange);
     watchBusy = false;
@@ -1258,6 +1274,8 @@
   }
 
   onMount(() => {
+    // 文件树持有一份全局监视器引用；卸载时释放。App 另常驻一份，故收起侧栏不会误停监视（报告 1-C）。
+    retainFsWatcher();
     // 挂载时补一次已加载层刷新（弥补监视未启动期间的外部变更；读操作不会触发监视事件循环）
     if (store.get().rootPaths.length) void reloadAllLoaded(store, store.get().showHidden);
     // Pointer Events 内部拖拽：在 window 上监听 move/up，确保光标移出行外仍能追踪
@@ -1285,12 +1303,16 @@
     }
     return () => {
       disposed = true;
+      // 卸载时归还 body.style.userSelect、移除挂在 body 的悬浮镜像 <li>、清 dragExpandTimer。
+      // 此前 destructor 漏调 cleanupDrag()：若拖拽进行中失去 showTree（专注模式/弹模态触发重建），
+      // 整个应用再也选不中文字，须重启。
+      cleanupDrag();
       if (typeof window !== "undefined") {
         window.removeEventListener("pointermove", onPointerMove);
         window.removeEventListener("pointerup", onPointerUp);
       }
       if (unlistenDrop) unlistenDrop();
-      stopWatching();
+      releaseFsWatcher();
       if (prefsTimer) clearTimeout(prefsTimer);
       if (remoteTimer) clearTimeout(remoteTimer);
     };

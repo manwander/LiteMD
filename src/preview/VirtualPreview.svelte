@@ -86,6 +86,7 @@
   let topPad = 0;
   let bottomPad = 0;
   let pendingQueue: number[] = [];
+  let pendingSet = new Set<number>(); // 与 pendingQueue 同步，把 includes 的 O(n) 判重降为 O(1)
   let rafId = 0;
   let windowRafId = 0;
   // Fenwick 前缀和：把 updateVisibleWindow 的 O(n) 总高 + 起止扫描降到 O(log²n)，
@@ -160,6 +161,7 @@
     htmls = newHtml;
     renderedFlags = newFlags;
     pendingQueue = [];
+    pendingSet.clear();
     // 用当前有效高度（realHeights[i] || heights[i]）重建 Fenwick 前缀和
     const hs = new Array<number>(n);
     for (let i = 0; i < n; i++) hs[i] = blockH(i);
@@ -228,8 +230,9 @@
   function queueUnrendered(s: number, e: number) {
     let queued = false;
     for (let i = s; i < e; i++) {
-      if (!renderedFlags[i] && !pendingQueue.includes(i)) {
+      if (!renderedFlags[i] && !pendingSet.has(i)) {
         pendingQueue.push(i);
+        pendingSet.add(i);
         queued = true;
       }
     }
@@ -250,6 +253,7 @@
     for (let k = 0; k < budget; k++) {
       const idx = pendingQueue.shift();
       if (idx === undefined) break;
+      pendingSet.delete(idx);
       renderOne(idx);
     }
     // 触发响应式更新（只重算已挂载的 visible 块，成本 O(视口)）

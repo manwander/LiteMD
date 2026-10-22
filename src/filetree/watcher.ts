@@ -15,9 +15,24 @@ let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let pending: FsChange[] = [];
 let paused = false;
 let onChangesRef: ((changes: FsChange[]) => void) | null = null;
+// 持有者计数：App 常驻持有 1 份，文件树挂载时再持有 1 份。Rust 侧监视器是全局单例，
+// 只有归零才真正 stopWatching，避免收起侧栏/专注模式卸载文件树时误停 App 依赖的外部变更检测（报告 1-C）。
+let holders = 0;
+
+/** App 在挂载期常驻持有一份，使文件树的卸载不会停掉全局监视器。 */
+export function retainFsWatcher(): void {
+  holders++;
+}
+/** 释放一份持有；归零才真正停止 Rust 监视器与前端事件订阅。 */
+export function releaseFsWatcher(): void {
+  if (holders > 0) holders--;
+  if (holders > 0) return;
+  hardStop();
+}
 
 /**
- * 启动监视 roots。返回是否成功。
+ * （重新）启动对 roots 的监视并订阅 fs-change。幂等：可在根列表变化时反复调用，
+ * 内部会退订旧监听、以新 roots 重新 arm Rust 监视器。不改动持有者计数。
  * 事件 300ms 防抖合并后一次性回调 onChanges（外部据此刷新受影响的已加载目录）。
  */
 export async function startWatching(
@@ -72,8 +87,13 @@ export function resumeWatcher(): void {
   }
 }
 
-/** 停止监视（应用卸载 / 根列表变化时） */
+/** 停止监视（释放一份持有；仍有持有者时保持全局监视器运行）。 */
 export function stopWatching(): void {
+  releaseFsWatcher();
+}
+
+/** 真正停止：清防抖、停 Rust 监视器、退订前端事件。仅在持有者归零时调用。 */
+function hardStop(): void {
   if (debounceTimer) {
     clearTimeout(debounceTimer);
     debounceTimer = null;

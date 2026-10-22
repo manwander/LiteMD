@@ -17,7 +17,12 @@
     if (modalCmps[name]) return;
     modalLoaders[name]().then((m) => {
       modalCmps = { ...modalCmps, [name]: m.default };
-    }).catch(() => {});
+    }).catch((e) => {
+      // 模态 chunk 加载失败（离线/发布后 WebView 缓存旧 index/hash 不符）此前被完全吞掉，
+      // 导致点「设置/导出/新建」静默无反应。上报并允许用户再次点击重试（modalCmps 仍为
+      // undefined，故再次进入本函数会重新发起 import）。
+      ioFail("加载 " + name + " 组件", e);
+    });
   }
   // 窗口级查找面板命令：焦点不在编辑器内容区时 Ctrl+F / Ctrl+H 也能打开（兜底）
   import { openSearchPanel as openSearchPanelCmd } from "./search-panel";
@@ -114,6 +119,7 @@ import { setHeadingLevel, wrapInlineCode, wrapMath, insertDateTime, insertHorizo
   import { createTreeStore } from "./filetree/store";
   import { loadFolderNode, refreshTree } from "./filetree/ops";
   import type { FsChange } from "./filetree/watcher";
+  import { retainFsWatcher, releaseFsWatcher } from "./filetree/watcher";
   import {
     rewriteAttachmentRefs,
     resolveAttachmentDir,
@@ -1306,7 +1312,9 @@ console.log("Hello LiteMD");
       }
       const noteDir = (mp.replace(/[\\/][^\\/]+$/, "") || mp).replace(/\\/g, "/");
       const assetsName = currentAttachmentName();
-      const isRemote = /^(https?:|data:)/i.test(ref);
+      // 外链/data URL 判定：本地图经 convertFileSrc 会变成 http(s)://asset.localhost/...，
+      // 属本地协议而非真·外链，不可走 fetch 重新下载（否则收编出孤儿副本）。
+      const isRemote = /^(https?:|data:)/i.test(ref) && !/^https?:\/\/(asset|tauri)\.localhost\//i.test(ref);
       let newRef: string;
       try {
         if (isRemote) {
@@ -1583,9 +1591,24 @@ console.log("Hello LiteMD");
     return next;
   }
   async function flushPendingWrites(): Promise<void> {
-    while (writeQueues.size) {
-      await Promise.all([...writeQueues.values()].map((p) => p.catch(() => {})));
+    // 此前 `.catch(()=>{})` 丢弃写失败 → 磁盘仍是旧内容却继续 saveSettings/destroy；
+    // while 无上限 → 任一 IPC 永久 pending 就关不掉窗口。现：迭代上限 + 捕获失败并提示。
+    const failed = new Set<string>();
+    let guard = 0;
+    while (writeQueues.size && guard++ < 50) {
+      const entries = [...writeQueues.entries()];
+      const results = await Promise.all(
+        entries.map(([, p]) => p.then(() => null, (e: unknown) => e) as Promise<unknown>)
+      );
+      for (let i = 0; i < entries.length; i++) {
+        if (results[i] !== null) {
+          failed.add(entries[i][0]);
+          logError("退出前写盘失败: " + entries[i][0] + " - " + String(results[i]));
+        }
+      }
     }
+    if (guard >= 50 && writeQueues.size) logError("退出前写盘队列未收敛，剩余 " + writeQueues.size + " 项");
+    if (failed.size) showToast(failed.size + " 个文件退出前未保存成功，请检查磁盘或文件占用", "error", 6000);
   }
   /** 写盘成功后提交保存状态；若 await 期间又有编辑（rev 变化），保持脏标记并续排自动保存 */
   function commitTabSaved(tab: TabState, path: string, text: string, gen: number): void {
@@ -1946,6 +1969,10 @@ console.log("Hello LiteMD");
   onMount(() => {
     let disposed = false;
 
+    // App 常驻持有全局 fs 监视器一份引用：文件树收起/专注模式卸载时只做部分释放，不会误停监视，
+    // 从而保住「外部变更 → 脏标签冲突保护」这条数据安全链（报告 1-C）。
+    retainFsWatcher();
+
     // 轻量崩溃日志：仅记录未捕获异常，供排障回传（平时无日志、不影响体验）
     // H4：命名 handler + 保存 matchMedia 引用，卸载时统一 remove，
     // 否则 App 重挂载（或 HMR）会叠加 window error/rejection 监听与 onScheme 监听。
@@ -2005,7 +2032,11 @@ console.log("Hello LiteMD");
         e.preventDefault();
         // 延迟到事件处理结束后再弹同步确认框，避免阻塞关闭事件回调
         setTimeout(() => requestClose(), 0);
-      }).then((fn: () => void) => { if (disposed) { fn(); return; } unlistenClose = fn; }).catch(() => {});
+      }).then((fn: () => void) => { if (disposed) { fn(); return; } unlistenClose = fn; }).catch((e: unknown) => {
+        // 关闭拦截是「未保存内容保护」的入口：注册失败 → Alt+F4/✕ 直接杀进程静默丢内容（P0）。
+        logError("关闭拦截注册失败：" + String(e));
+        try { showToast("未保存内容保护不可用，关闭前请手动保存", "error", 8000); } catch { /* ignore */ }
+      });
       // 拖拽文件到窗口：.md 直接打开；图片文件收编并插入
       // 注意：getCurrentWindow().onDragDropEvent 的数据在 e.payload 里（payload.type / payload.paths），
       // 顶层没有 type/paths 字段——直接读 e.type 会永远为 undefined 导致拖拽失效。
@@ -2143,7 +2174,12 @@ console.log("Hello LiteMD");
       }).then((unlisten) => {
         if (disposed) { unlisten(); return; }
         unlistenFs = unlisten;
-      }).catch(() => {});
+      }).catch((e) => {
+        // 外部变更协调是覆盖保护（P1-1）的事件源：注册失败必须上报，否则脏标签被外部改后
+        // 用户保存会静默覆盖他人修改而毫无提示。
+        logError("fs-change 监听注册失败：" + String(e));
+        showToast("文件外部变更检测不可用，保存前请留意他人修改", "error", 6000);
+      });
 
       // ---- 启动前先消费 Rust 端待打开文件，避免欢迎页先渲染再被替换（q15）----
       // 冷启动：take_open_files 拿到 .md 关联 / 命令行参数；热启动（single-instance 插件
@@ -2410,6 +2446,7 @@ console.log("Hello LiteMD");
 
     return () => {
       disposed = true;
+      releaseFsWatcher();
       clearTimeout(showFailsafe);
       syncScheduler.stop();
       document.removeEventListener("visibilitychange", onVisChange);
@@ -2743,7 +2780,12 @@ console.log("Hello LiteMD");
       outlineItems = [];
       return;
     }
-    outlineItems = extractOutline(view && tabs[activeIdx] === tab ? pullDoc() : (tab.content ?? ""));
+    // 大文档（> OUTLINE_MAX_BYTES）改用已同步的 tab.content，避免每击键 pullDoc() 全量 toString + 重扫
+    // （低端模式目标）。大纲最多滞后一个保存/预览节拍，可接受。
+    const OUTLINE_MAX_BYTES = 2 << 20;
+    const overSize = !!view && view.state.doc.length > OUTLINE_MAX_BYTES;
+    const useLive = view && tabs[activeIdx] === tab && !overSize;
+    outlineItems = extractOutline(useLive ? pullDoc() : (tab.content ?? ""));
   }
   $: activeIdx, sidebarTab, refreshOutline();
 

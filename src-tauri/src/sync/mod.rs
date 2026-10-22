@@ -28,7 +28,7 @@ static SYNC_CANCEL: AtomicBool = AtomicBool::new(false);
 
 // ---------------- DTO（camelCase 对齐前端） ----------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountDto {
     pub url: String,
@@ -36,6 +36,17 @@ pub struct AccountDto {
     pub username: String,
     #[serde(default)]
     pub password: String,
+}
+
+// 手写 Debug：避免任何 {:?}/日志误印把 WebDAV 口令外泄（报告 2-B 零依赖纵深）。
+impl std::fmt::Debug for AccountDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountDto")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,7 +160,9 @@ fn build_opts(cfg: &SyncConfigDto, folder: &FolderDto, mode: SyncMode) -> Engine
             Some("newerWins") => ConflictPolicy::NewerWins,
             _ => ConflictPolicy::KeepBoth,
         },
-        max_file_size: (cfg.max_file_size_mb.unwrap_or(100) as u64) * 1024 * 1024,
+        // 下限钳制为 1MB：0（误填/前端缺省）会使 scan 侧 `len > 0` 把全部文件判为超限跳过，
+        // 语义反转为「不同步任何文件」。真正「不限制」应显式配置超大值。
+        max_file_size: (cfg.max_file_size_mb.unwrap_or(100).max(1) as u64) * 1024 * 1024,
         ignore_patterns: cfg.ignore_patterns.clone(),
         open_dirty,
         mode,
@@ -292,16 +305,14 @@ pub async fn sync_run(
     SYNC_CANCEL.store(false, Ordering::SeqCst);
 
     let folder = resolve_folder(&config, folder_id.as_deref().unwrap_or(""))?;
-    let mode = match mode.as_deref() {
-        Some("forceUpload") => SyncMode::ForceUpload,
-        Some("forceDownload") => SyncMode::ForceDownload,
-        _ => {
-            if dry_run.unwrap_or(false) {
-                SyncMode::DryRun
-            } else {
-                SyncMode::Normal
-            }
-        }
+    // dry_run 具一票否决：预览（即便同时传 forceUpload/forceDownload）只出计划、
+    // 绝不落任何传输/删除/回收站动作，避免「预览强制同步」产生不可逆副作用。
+    let dry = dry_run.unwrap_or(false);
+    let mode = match (dry, mode.as_deref()) {
+        (true, _) => SyncMode::DryRun,
+        (false, Some("forceUpload")) => SyncMode::ForceUpload,
+        (false, Some("forceDownload")) => SyncMode::ForceDownload,
+        (false, _) => SyncMode::Normal,
     };
     let transport = build_transport(&config, &folder)?;
     let opts = build_opts(&config, &folder, mode);

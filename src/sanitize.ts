@@ -231,8 +231,11 @@ export function sanitizeHtml(html: string): string {
     FORBID_ATTR,
     ALLOWED_URI_REGEXP,
     // data-src：Mermaid 占位 div 的原文属性（md-pipeline C-6，URI 编码后注入）；
-    // ALLOW_DATA_ATTR=false 保持不动，仅定向放行这一个属性
-    ADD_ATTR: ["target", "loading", "decoding", "align", "colspan", "rowspan", "data-src"],
+    // data-md-ref / data-md-src：图片/块的原始 markdown 引用串（initMd 注入，供预览右键
+    // 「图片保存到附件」精确改写正文旧引用、预览编辑回写定位）；此前未列入白名单被
+    // ALLOW_DATA_ATTR=false 剥离，导致该功能静默失效，现定向放行。
+    // ALLOW_DATA_ATTR=false 保持不动，仅定向放行上述属性
+    ADD_ATTR: ["target", "loading", "decoding", "align", "colspan", "rowspan", "data-src", "data-md-ref", "data-md-src"],
     ALLOW_DATA_ATTR: false,
     // 保留完整文档片段结构（表格 / 列表等），不做 body 提取
     WHOLE_DOCUMENT: false,

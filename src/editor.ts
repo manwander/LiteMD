@@ -16,6 +16,7 @@ import {
   markFenceDirty,
   scheduleFenceRebuild,
   isInsideCodeBlock as fenceInsideCodeBlock,
+  findFenceCloseLine,
 } from "./fence-index";
 // 中文查找/替换面板（替代 @codemirror/search 默认英文面板）
 import { chineseSearchPanel, openSearchPanel as openCnSearchPanel } from "./search-panel";
@@ -402,10 +403,12 @@ export function createEditor(opts: {
             // 围栏索引维护：若本次变更涉及换行或 ``` 字面量，标记索引落后，
             // 空闲帧重建（期间 Enter 判定走有界上扫，安全降级）。
             let touchesFence = false;
-            u.changes.iterChanges((_fa, _ta, fb, tb) => {
+            u.changes.iterChanges((fa, ta, fb, tb) => {
               if (touchesFence) return;
               const ins = u.state.doc.sliceString(fb, Math.min(tb, fb + 600));
-              if (ins.includes("\n") || /```/.test(ins)) touchesFence = true;
+              // 删除侧同样要判：删掉一整行 ``` / ~~~（无插入）同样改变奇偶，旧实现只查插入侧会漏标脏
+              const del = u.startState.doc.sliceString(fa, Math.min(ta, fa + 600));
+              if (ins.includes("\n") || del.includes("\n") || /```|~~~/.test(ins) || /```|~~~/.test(del)) touchesFence = true;
             });
             if (touchesFence) {
               markFenceDirty();
@@ -1161,10 +1164,8 @@ export function smartEnter(view: EditorView): boolean {
   // 代码块必须最先判定：代码中的 `> ` 或 `|` 行同样满足引用/表格前缀，
   // 旧顺序会把代码块内的 Enter 改写成引用/表格，直接破坏代码。
   if (isInsideCodeBlock(state, head)) {
-    let closeLine = -1;
-    for (let n = line.number + 1; n <= state.doc.lines; n++) {
-      if (/^\s*```/.test(state.doc.line(n).text)) { closeLine = n; break; }
-    }
+    // 长度/字符感知的闭栏查找：避开块内出现的 ``` 示例、正确匹配 ~~~ 与 ≥ 开栏长度
+    const closeLine = findFenceCloseLine(state.doc as unknown as FenceDoc, line.number + 1);
     if (closeLine > 0) {
       const pos = state.doc.line(closeLine).to;
       view.dispatch({ changes: { from: pos, insert: "\n\n" }, selection: { anchor: pos + 2 } });

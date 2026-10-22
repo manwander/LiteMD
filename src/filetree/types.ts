@@ -154,8 +154,15 @@ export interface TreeHandlers {
 // 清洗用户输入的文件/文件夹名：去除路径分隔符与 Windows 非法字符，并剥离 ".."，
 // 防止拼接成 "C:/notes/../evil.md" 之类的路径穿越。结果为空时调用方应报错。
 export function sanitizeName(name: string): string {
-  return name
+  let s = name
     .replace(/[\/\:*?"<>|]/g, "") // 路径分隔符与 Windows 非法字符
     .replace(/\.\./g, "") // 单处或连续 .. 防穿越
     .trim();
+  // Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）与结尾点/空格会产生
+  // 不可删除或怪异的文件：命中则前置下划线（仅避免脏名，不改变用户可见业务名语义）
+  s = s.replace(/[. ]+$/, "");
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(s)) {
+    s = "_" + s;
+  }
+  return s.trim();
 }
