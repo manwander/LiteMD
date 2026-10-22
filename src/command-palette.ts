@@ -1,41 +1,46 @@
-// 命令面板（Command Palette）核心逻辑：三类源的装配 + 模糊匹配排序。
+// 命令面板（Command Palette）核心逻辑：四类源的装配 + 模糊匹配排序。
 // 纯函数模块（无 DOM / 无 Tauri 依赖），可单测；UI 见 CommandPalette.svelte。
 //
-// 三类源（B3）：
+// 四类源（B3 + LM-13）：
 //   command —— 来自 settings.ts 的 ActionDef（surfaces 含 "palette" 或无 surfaces 字段的）
 //   file    —— 来自 fs.ts listMdFiles 的文件路径列表
 //   setting —— 设置项快捷跳转（调用方提供 id/label；本模块内置 DEFAULT_SETTING_LABELS）
+//   outline —— 大纲标题跳转（LM-13：query 以 @ 前缀时专用，跳编辑器对应行）
 import type { ActionDef } from "./settings";
 
 /** 命令面板的一条候选 */
 export interface PalItem {
-  /** 命令：actionId；文件：完整路径；设置：设置项 id（如 "setting:theme"） */
+  /** 命令：actionId；文件：完整路径；设置：设置项 id（如 "setting:theme"）；大纲：`outline:<line>` */
   id: string;
   label: string;
-  /** 次要说明：文件为所在目录；命令/设置可空 */
+  /** 次要说明：文件为所在目录；大纲为行号提示；命令/设置可空 */
   hint?: string;
-  group: "command" | "file" | "setting";
+  group: "command" | "file" | "setting" | "outline";
+  /** 大纲组专用：标题所在行（0-based，与 OutlinePanel/jumpToLine 契约一致） */
+  line?: number;
   /** 匹配得分（buildSources 置 0，rank 时按 query 重算） */
   score: number;
 }
 
-/** rank 的组内上限；默认命令 6 / 文件 5 / 设置 4（B3 规格） */
+/** rank 的组内上限；默认命令 6 / 文件 5 / 设置 4 / 大纲 6 */
 export interface PalCaps {
   command: number;
   file: number;
   setting: number;
+  outline: number;
 }
 
-export const DEFAULT_CAPS: PalCaps = { command: 6, file: 5, setting: 4 };
+export const DEFAULT_CAPS: PalCaps = { command: 6, file: 5, setting: 4, outline: 6 };
 
-/** 组展示顺序：command → file → setting（rank 输出与 UI 分组共用） */
-export const GROUP_ORDER: PalItem["group"][] = ["command", "file", "setting"];
+/** 组展示顺序：command → file → setting → outline（rank 输出与 UI 分组共用） */
+export const GROUP_ORDER: PalItem["group"][] = ["command", "file", "setting", "outline"];
 
 /** 组标题（UI 展示用，与 rank 的组序一致） */
 export const GROUP_TITLES: Record<PalItem["group"], string> = {
   command: "命令",
   file: "文件",
   setting: "设置",
+  outline: "大纲标题",
 };
 
 // ---------------- 内置设置源 ----------------
@@ -107,22 +112,33 @@ export function fuzzy(query: string, text: string): number {
  *
  * - 空 query：只回 command 组（「最近命令」占位，不做持久化），保持传入顺序；
  * - 非空 query：组内按得分降序（同分保持传入顺序，sort 稳定性保证），
- *   组间严格按 command → file → setting 输出，各组上限取 caps（默认 6/5/4）。
+ *   组间严格按 command → file → setting → outline 输出，各组上限取 caps；
+ * - LM-13：query 以 @ 前缀 = 大纲标题专用模式——剥离 @ 后只在 outline 组内
+ *   模糊匹配（跳编辑器对应行），不与命令/文件混排；普通 query 不混入大纲组。
  */
 export function rank(items: PalItem[], q: string, caps?: PalCaps): PalItem[] {
   const c: PalCaps = caps ?? DEFAULT_CAPS;
-  const query = q.trim();
+  const raw = q.trim();
+  const atMode = raw.startsWith("@");
+  const query = atMode ? raw.slice(1).trim() : raw;
+
+  // @ 模式只看大纲组；普通模式把大纲组挡在外面（保持既有三源混排语义）
+  const pool = atMode
+    ? items.filter((it) => it.group === "outline")
+    : items.filter((it) => it.group !== "outline");
 
   if (!query) {
-    return items.filter((it) => it.group === "command").slice(0, c.command);
+    if (atMode) return pool.slice(0, c.outline); // 空 @：全量大纲（传入序即文档序）
+    return pool.filter((it) => it.group === "command").slice(0, c.command);
   }
 
   const byGroup: Record<PalItem["group"], PalItem[]> = {
     command: [],
     file: [],
     setting: [],
+    outline: [],
   };
-  for (const it of items) {
+  for (const it of pool) {
     const score = fuzzy(query, it.label);
     if (score <= 0) continue; // 不匹配直接淘汰
     byGroup[it.group].push({ ...it, score });
@@ -153,7 +169,7 @@ function dirname(path: string): string {
 }
 
 /**
- * 装配三类候选源。
+ * 装配四类候选源。
  *
  * @param actions      命令来源（settings.ts ALL_ACTIONS）。仅收录 surfaces 含
  *                     "palette" 或无 surfaces 字段的动作——B2 扩展 ActionDef
@@ -161,11 +177,14 @@ function dirname(path: string): string {
  * @param files        文件来源（fs.ts listMdFiles 的返回）。label 取 basename，
  *                     hint 取 dirname（无目录时 hint 为空）。
  * @param settingLabels 设置来源。为空时回退内置 DEFAULT_SETTING_LABELS。
+ * @param outline      大纲来源（LM-13）。label 取标题文本，line 为 0-based 行号
+ *                     （OutlinePanel/jumpToLine 同契约）；仅 @ 前缀查询可见。
  */
 export function buildSources(
   actions: ActionDef[],
   files: string[],
-  settingLabels?: { id: string; label: string }[]
+  settingLabels?: { id: string; label: string }[],
+  outline?: { line: number; label: string }[]
 ): PalItem[] {
   const out: PalItem[] = [];
 
@@ -193,6 +212,18 @@ export function buildSources(
   for (const s of settings) {
     if (!s.id || !s.label) continue;
     out.push({ id: s.id, label: s.label, group: "setting", score: 0 });
+  }
+
+  for (const o of outline ?? []) {
+    if (!o.label || typeof o.line !== "number") continue;
+    out.push({
+      id: `outline:${o.line}`,
+      label: o.label,
+      hint: `第 ${o.line + 1} 行`,
+      group: "outline",
+      line: o.line,
+      score: 0,
+    });
   }
 
   return out;

@@ -1467,7 +1467,10 @@ console.log("Hello LiteMD");
     }
 
     // ---- 分栏拖动（侧边栏宽度 / 预览宽度）----
-    let sidebarWidth = 240;
+    // 侧栏最小 272px：目录面板头 8 个按钮单行固有效率宽 270px（实测），低于此值会被遮挡
+    const SBW_MIN = 272;
+    const SBW_MAX = 640;
+    let sidebarWidth = 280;
     let previewWidth = 440;
     let dragMode: "sidebar" | "preview" | null = null;
     let dragStartX = 0;
@@ -1483,7 +1486,7 @@ console.log("Hello LiteMD");
       if (!dragMode) return;
       const dx = e.clientX - dragStartX;
       if (dragMode === "sidebar") {
-        sidebarWidth = Math.max(150, Math.min(640, dragStartW + dx));
+        sidebarWidth = Math.max(SBW_MIN, Math.min(SBW_MAX, dragStartW + dx));
       } else {
         previewWidth = Math.max(240, Math.min(900, dragStartW - dx));
       }
@@ -5089,6 +5092,8 @@ ${bodyHtml}
 <CommandPalette
   open={paletteOpen}
   mdRoot={settings.lastFolder}
+  outlineItems={outlineItems.map((o) => ({ line: o.line, label: o.text }))}
+  onJumpOutline={(line) => jumpToLine(line)}
   onClose={() => {
     paletteOpen = false;
     if (view) view.focus();

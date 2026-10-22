@@ -23,6 +23,10 @@
   export let dispatch: (id: string) => void;
   /** 文件组执行：打开对应路径 */
   export let onOpenFile: (path: string) => void;
+  /** 大纲组执行（LM-13 @ 模式）：跳编辑器对应行（0-based，与 OutlinePanel 契约一致） */
+  export let onJumpOutline: (line: number) => void = () => {};
+  /** 大纲源：当前文档的标题列表（随光标/文档在集成方侧刷新） */
+  export let outlineItems: { line: number; label: string }[] = [];
   /** 当前文件夹根；null 时文件源为空 */
   export let mdRoot: string | null;
 
@@ -77,7 +81,7 @@
     }
   }
 
-  $: sources = buildSources(ALL_ACTIONS, files, DEFAULT_SETTING_LABELS);
+  $: sources = buildSources(ALL_ACTIONS, files, DEFAULT_SETTING_LABELS, outlineItems);
   $: ranked = rank(sources, query);
 
   // 分组渲染（保持 command → file → setting 组序；空组不渲染标题）
@@ -112,7 +116,10 @@
 
   function execute(item: PalItem): void {
     if (item.group === "file") onOpenFile(item.id);
-    else dispatch(item.id); // command / setting
+    else if (item.group === "outline") {
+      // LM-13：@ 大纲标题 → 跳编辑器对应行（0-based）
+      if (typeof item.line === "number") onJumpOutline(item.line);
+    } else dispatch(item.id); // command / setting
     onClose();
   }
 
@@ -181,8 +188,8 @@
           bind:value={query}
           class="cp-input"
           type="text"
-          placeholder="搜索命令、文件、设置…"
-          aria-label="搜索命令、文件、设置"
+          placeholder="搜索命令、文件、设置；@ 跳大纲标题…"
+          aria-label="搜索命令、文件、设置；输入 @ 前缀跳大纲标题"
           spellcheck="false"
           autocomplete="off"
         />

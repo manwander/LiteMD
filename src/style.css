@@ -149,6 +149,24 @@ body {
   background-clip: text;
 }
 
+/* 工具栏独立行（方案 A 固定两行）：窄窗口时按钮在自身行内换行，绝不侵入侧栏区域 */
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  padding-left: calc(12px + var(--safe-left));
+  padding-right: calc(12px + var(--safe-right));
+  background: var(--bg);
+  border-bottom: 1px solid var(--div-nav);
+  box-sizing: border-box;
+}
+.toolbar-row .tb {
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
 .tb {
   display: flex;
   align-items: center;
@@ -325,12 +343,14 @@ body {
   height: 36px;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 12px;
+  justify-content: space-between; /* 拉宽时按钮等额分布 */
+  gap: 4px;
+  padding: 0 10px;
   font-size: 13px;
   color: var(--t2);
   border-bottom: 1px solid var(--div);
   flex-shrink: 0;
+  white-space: nowrap;
 }
 
 /* 超大文档预览降级提示 */
@@ -930,6 +950,15 @@ button:disabled:hover {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+  /* LM-21：预览正文卡 L2——容器留边，滚动面呈同色凸起卡。
+     铁律①：卡背景 = 页面色（.virtual-preview 无独立底色，继承 --bg），
+     层级只靠光影（--rs）表达；低端降级自动随 --rs 环影化。 */
+  padding: 10px 14px 12px;
+}
+
+.preview-content .virtual-preview {
+  box-shadow: var(--rs);
+  border-radius: 14px;
 }
 
 .preview-content h1 {
@@ -1930,7 +1959,7 @@ body.low-end * {
   position: relative;
 }
 
-/* 根按钮：L3 控件面，悬停 --hov，展开 --tint（覆盖通用 button 基线） */
+/* 根按钮：新拟态凸起键面，悬停/展开高亮（对齐工具栏 .tbb 规范） */
 .menubar .mb-btn {
   display: inline-flex;
   align-items: center;
@@ -1939,21 +1968,23 @@ body.low-end * {
   padding: 0 10px;
   border: none;
   border-radius: 8px;
-  background: transparent;
-  box-shadow: none;
+  background: var(--bg);
+  box-shadow: var(--rs-s);
   color: var(--t1);
   font-size: 12.5px;
   font-weight: 500;
   cursor: pointer;
+  transition: box-shadow 0.15s, color 0.15s, background 0.15s;
 }
 
 .menubar .mb-btn:hover {
-  background: var(--hov);
-  color: var(--t1);
+  color: var(--p);
+  box-shadow: var(--rs-s);
 }
 
 .menubar .mb-btn.open {
-  background: var(--tint);
+  background: var(--bg);
+  box-shadow: var(--is-s);
   color: var(--p);
 }
 
@@ -2120,12 +2151,22 @@ body.low-end * {
 }
 
 /* ---- 侧栏三 tab（LM-04：目录 / 大纲 / 搜索）---- */
-/* 宽度传递：.body 内联 --sbw（与 FileTree 的 .sidebar 列同宽，保证三块对齐） */
+/* 侧栏单列容器：tab 行 + 面板体上下堆叠，宽度统一由 --sbw 控制（修复：原先三块并列各占一列，多出 240px 空白列） */
+.sidebar-col {
+  width: var(--sbw, 240px);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  box-sizing: border-box;
+  border-right: 1px solid var(--div);
+}
+/* 宽度传递：改为撑满 .sidebar-col，宽度只由容器一处控制 */
 .sb-tabs,
 .sb-body,
 .ol-panel,
 .sb-search {
-  width: var(--sbw, 240px);
+  width: 100%;
   flex-shrink: 0;
   box-sizing: border-box;
 }
@@ -2134,7 +2175,6 @@ body.low-end * {
   gap: 4px;
   padding: 6px 8px;
   background: var(--sl);
-  border-right: 1px solid var(--div);
   border-bottom: 1px solid var(--div-nav);
 }
 /* tab：32×28 r9，静息 rs-s 凸起；选中 is 内嵌 + primary（E3 契约） */
@@ -2166,6 +2206,11 @@ body.low-end * {
   min-height: 0;
   flex: 1;
 }
+/* 大纲面板：与 sb-body 同规格撑满列剩余高度 */
+.ol-panel {
+  flex: 1;
+  min-height: 0;
+}
 .sb-body.hidden {
   display: none;
 }
@@ -2180,10 +2225,11 @@ body.low-end * {
 .sb-search {
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 0;
   gap: 10px;
   padding: 16px 12px;
   background: var(--sl);
-  border-right: 1px solid var(--div);
 }
 .sb-search-hint {
   margin: 0;

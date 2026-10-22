@@ -103,7 +103,7 @@ describe("rank 排序与截断", () => {
       file("/a/笔记3.md", "笔记3.md", "/a"),
       cmd("file.new", "新建笔记"),
     ];
-    const r = rank(items, "笔记", { command: 6, file: 2, setting: 4 });
+    const r = rank(items, "笔记", { command: 6, file: 2, setting: 4, outline: 6 });
     expect(r.filter((x) => x.group === "file").length).toBe(2);
     expect(r.filter((x) => x.group === "command").length).toBe(1);
   });
@@ -176,5 +176,56 @@ describe("buildSources 三类源装配", () => {
     const settingItems = items.filter((x) => x.group === "setting");
     expect(settingItems.length).toBe(DEFAULT_SETTING_LABELS.length);
     expect(settingItems[0].id).toBe(DEFAULT_SETTING_LABELS[0].id);
+  });
+
+  it("大纲源装配：label 取标题、hint 为 1-based 行号提示、line 随条目携带（LM-13）", () => {
+    const items = buildSources([], [], [], [
+      { line: 0, label: "第一章" },
+      { line: 4, label: "第二章" },
+    ]);
+    const outline = items.filter((x) => x.group === "outline");
+    expect(outline.map((x) => x.label)).toEqual(["第一章", "第二章"]);
+    expect(outline.map((x) => x.line)).toEqual([0, 4]);
+    expect(outline.map((x) => x.hint)).toEqual(["第 1 行", "第 5 行"]);
+    expect(outline.map((x) => x.id)).toEqual(["outline:0", "outline:4"]);
+  });
+});
+
+// ---------------- rank @ 大纲模式（LM-13） ----------------
+
+function heading(line: number, label: string): PalItem {
+  return { id: `outline:${line}`, label, group: "outline", line, score: 0 };
+}
+
+describe("rank @ 前缀大纲模式", () => {
+  const items: PalItem[] = [
+    cmd("file.save", "保存"),
+    file("/docs/a.md", "a.md", "/docs"),
+    heading(0, "安装指南"),
+    heading(3, "快速开始"),
+    heading(9, "常见问题"),
+  ];
+
+  it("普通 query 不混入大纲组（保持既有三源混排语义）", () => {
+    const r = rank(items, "开始");
+    expect(r.some((x) => x.group === "outline")).toBe(false);
+  });
+
+  it("@ 前缀只在大纲组内模糊匹配，命中项携带行号", () => {
+    const r = rank(items, "@开始");
+    expect(r.length).toBe(1);
+    expect(r[0].group).toBe("outline");
+    expect(r[0].line).toBe(3);
+    expect(r[0].label).toBe("快速开始");
+  });
+
+  it("空 @（仅前缀）回全量大纲，传入序即文档序", () => {
+    const r = rank(items, "@");
+    expect(r.map((x) => x.group)).toEqual(["outline", "outline", "outline"]);
+    expect(r.map((x) => x.line)).toEqual([0, 3, 9]);
+  });
+
+  it("@ 无匹配返回空列表", () => {
+    expect(rank(items, "@不存在").length).toBe(0);
   });
 });
