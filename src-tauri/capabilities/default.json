@@ -17,7 +17,7 @@
     "core:window:allow-start-dragging",
     "core:window:allow-start-resize-dragging",
     "core:window:allow-is-maximized",
-    "core:window:allow-print",
+    "core:webview:allow-print",
     "core:window:allow-set-always-on-top",
     "core:webview:allow-create-webview-window"
   ]

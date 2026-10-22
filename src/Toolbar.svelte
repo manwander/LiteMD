@@ -100,6 +100,5 @@
       {theme === "dark" ? "☀" : "🌙"}
     </button>
     <button on:click={() => dispatch("view.focusMode")} class:on={focusMode} title="专注模式 {accelFn("view.focusMode")}">⛶</button>
-    <button on:click={() => dispatch("app.settings")} title="设置">⚙</button>
   </div>
 </div>

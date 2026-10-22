@@ -252,7 +252,8 @@ impl WebDav {
             Ok(d) => d.to_string(),
             Err(_) => return false,
         };
-        let segs = match split_path_segments(&decoded.replace('\\', "/")) {
+        let normalized = decoded.replace('\\', "/");
+        let segs = match split_path_segments(&normalized) {
             Some(s) => s,
             None => return false,
         };

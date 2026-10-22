@@ -465,14 +465,11 @@ export function setKeymap(view: EditorView, cmKeys: Record<string, string>): voi
 export function setDoc(view: EditorView, text: string): void {
   // 整篇替换不是用户编辑：抑制有序列表自动重编号，避免打开/重载文档时
   // 静默改写文末列表序号（随后还会被自动保存落盘）。
-  renumberGuard = true;
-  try {
+  suppressRenumber(view, () => {
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: text },
     });
-  } finally {
-    renumberGuard = false;
-  }
+  });
   // 文档整体替换后重建围栏索引：改为空闲帧重建。
   // 旧实现逐行 .text 分配整行字符串，50MB 下同步重建约 ~1.3s 冻结；
   // 现在（1）rebuildFenceIndex 仅取行首 ≤32 字符检测、零整行分配，
@@ -1070,9 +1067,23 @@ export function renumberBlock(view: EditorView, lineNo: number): boolean {
 
 // 仅当某次变更删除了含换行的片段（整行/多行被删）时，对受影响位置尝试重编号。
 // guard 防递归；重编号不删换行，天然不会二次触发。
-let renumberGuard = false;
+// 用 WeakSet 按 EditorView 维度隔离「抑制标志」：预览编辑模式下主编辑器与「备份」
+// EditorView 并存、都挂载本监听器；原 module 级全局布尔在理论上会被两个实例共享，
+// 虽因 JS 单线程 + 同步段内 finally 复位而实际不可达，但收敛为实例维度更稳健、可维护。
+const renumberSuppressed = new WeakSet<EditorView>();
+
+/** 在 fn 执行期间抑制指定 view 的有序列表自动重编号（用于整篇替换/载入）。 */
+function suppressRenumber(view: EditorView, fn: () => void): void {
+  renumberSuppressed.add(view);
+  try {
+    fn();
+  } finally {
+    renumberSuppressed.delete(view);
+  }
+}
+
 const orderedListRenumber = EditorView.updateListener.of((u) => {
-  if (!u.docChanged || renumberGuard) return;
+  if (!u.docChanged || renumberSuppressed.has(u.view)) return;
   const positions: number[] = [];
   u.changes.iterChanges((fromA, toA, _fromB, toB) => {
     const deleted = u.startState.doc.sliceString(fromA, toA);
@@ -1080,7 +1091,9 @@ const orderedListRenumber = EditorView.updateListener.of((u) => {
   });
   if (!positions.length) return;
   const tried = new Set<number>();
-  renumberGuard = true;
+  // 抑制本 view：renumberBlock 内部 dispatch 会再次触发本监听器，但重编号只替换
+  // 行首序号、不删换行，理论上不会二次触发；此处仍以实例维度守卫，保证确定性、防递归。
+  renumberSuppressed.add(u.view);
   try {
     for (const pos of positions) {
       const ln = u.state.doc.lineAt(Math.min(pos, u.state.doc.length)).number;
@@ -1089,7 +1102,7 @@ const orderedListRenumber = EditorView.updateListener.of((u) => {
       }
     }
   } finally {
-    renumberGuard = false;
+    renumberSuppressed.delete(u.view);
   }
 });
 

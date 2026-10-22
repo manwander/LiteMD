@@ -1696,7 +1696,7 @@ fn replace_in_folder_sync(
                 continue;
             }
         }
-        let bak_path = unique_bak(path);
+        let bak_path = unique_bak(Path::new(path));
         if let Err(e) = fs::copy(path, &bak_path) {
             // 复制失败：删除已创建的 .bak 备份（原始文件尚未改动，无需从 bak 恢复）
             for (_orig, bak) in &bak_paths {
@@ -2049,6 +2049,37 @@ struct CjkFont {
 
 static FONT_CACHE: std::sync::Mutex<Option<CjkFont>> = std::sync::Mutex::new(None);
 
+/// 从字体数据（可能是 TTC 集合）中解析出「字形覆盖最丰富」的 face（W-6 修复）。
+///
+/// `printpdf 0.6` 的 `add_external_font` 不接受 face 索引，内部 `ttf-parser` 固定取
+/// 集合第 0 个字体。对于微软雅黑等 `.ttc`，face 0 通常是常规字重、覆盖主体字形；
+/// 但某些变体/字重的字形仅存在于其他 face。这里遍历集合内全部 face，选
+/// `number_of_glyphs` 最大的一个，最大化 CJK 覆盖、降低缺字概率。
+/// 单 face 的 `.ttf` 自然只命中 face 0。带安全上限，避免异常集合导致无限循环。
+fn parse_best_face(data: &'static [u8]) -> Option<otp::Face<'static>> {
+    let mut best: Option<otp::Face<'static>> = None;
+    let mut best_glyphs: u32 = 0;
+    let mut idx: u32 = 0;
+    loop {
+        match otp::Face::parse(data, idx) {
+            Ok(face) => {
+                let g = face.number_of_glyphs() as u32;
+                // 同字形数时保留先遇到的（通常是常规字重 face 0），更稳妥。
+                if g > best_glyphs {
+                    best_glyphs = g;
+                    best = Some(face);
+                }
+                idx += 1;
+            }
+            Err(_) => break,
+        }
+        if idx > 32 {
+            break; // 防御：异常大集合上限
+        }
+    }
+    best
+}
+
 fn get_cjk_font() -> Option<&'static CjkFont> {
     // 双重检查：fast path 完全无锁（读 + 命中），slow path 拿锁再判断
     if let Some(ref f) = *FONT_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -2076,7 +2107,7 @@ fn get_cjk_font() -> Option<&'static CjkFont> {
             if let Ok(data) = fs::read(p) {
                 // 只泄漏一次（Mutex 缓存保证），换回 'static 生命周期供 Face 借用
                 let data: &'static [u8] = Box::leak(data.into_boxed_slice());
-                if let Ok(face) = otp::Face::parse(data, 0) {
+                if let Some(face) = parse_best_face(data) {
                     *guard = Some(CjkFont { data, face });
                     break;
                 }
@@ -2174,7 +2205,13 @@ impl PdfLayout {
         // 先完整生成到内存，再走 atomic_write：避免写到一半失败/崩溃把已有的同名 PDF
         // 截断成损坏文件（与 write_file / 导出 HTML 的落盘语义一致）。
         let mut buf: Vec<u8> = Vec::new();
-        self.doc.save(&mut buf).map_err(|e| e.to_string())?;
+        {
+            use std::io::Write;
+            // printpdf 0.6 的 save 需要 BufWriter<W>，写完后 flush 再取回底层 Vec
+            let mut writer = std::io::BufWriter::new(&mut buf);
+            self.doc.save(&mut writer).map_err(|e| e.to_string())?;
+            writer.flush().map_err(|e| e.to_string())?;
+        }
         atomic_write(path, &buf)
     }
 }
@@ -2273,11 +2310,29 @@ fn export_pdf_sync(path: String, markdown: String) -> Result<(), String> {
             let mut rest = with_prefix.as_str();
             loop {
                 let (one, consumed) = split_line(face, rest, size_pt, CONTENT_W_MM - indent);
-                if consumed == 0 || consumed >= rest.chars().count() {
-                    lines.push(one);
-                    break;
+                if consumed == 0 {
+                    // W-7 防御边界（单个字形渲染宽度超过内容区，正常文档不可达）：
+                    // split_line 对非空输入不会返回 0，但为绝对安全，至少前进 1 个字符，
+                    // 避免死循环或丢失该字符（而非丢弃整行）。
+                    if rest.is_empty() {
+                        if !one.is_empty() {
+                            lines.push(one);
+                        }
+                        break;
+                    }
+                    let next = rest
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(rest.len());
+                    lines.push(rest[..next].to_string());
+                    rest = &rest[next..];
+                    continue;
                 }
                 lines.push(one);
+                if consumed >= rest.chars().count() {
+                    break;
+                }
                 rest = &rest[rest.char_indices().nth(consumed).map(|(i, _)| i).unwrap_or(rest.len())..];
             }
         }

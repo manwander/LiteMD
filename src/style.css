@@ -1988,6 +1988,22 @@ body.low-end * {
   color: var(--p);
 }
 
+/* 菜单栏隐藏时的 Alt 提示芯片（新拟态小凸起，点击等效 Alt 呼出） */
+.alt-hint {
+  height: 24px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: var(--bg);
+  box-shadow: var(--rs-s);
+  color: var(--t3);
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.alt-hint:hover { color: var(--p); }
+.alt-hint:active { box-shadow: var(--is-s); }
+
 .mb-caret {
   font-size: 9px;
   line-height: 1;
@@ -2055,7 +2071,8 @@ body.low-end * {
 .mb-sep {
   height: 1px;
   background: var(--div);
-  margin: 5px 6px;
+  box-shadow: 0 1px 0 var(--sl);
+  margin: 6px 8px;
 }
 
 /* 分组小标题（最近打开/导出/标题…）：10.5/700 字距 1 · t3 */
@@ -2066,6 +2083,13 @@ body.low-end * {
   letter-spacing: 1px;
   color: var(--t3);
   user-select: none;
+}
+
+/* 功能分组之间的分界线：小标题上方细分割线（首个小标题不加，避免顶边双线） */
+.mb-drop .mb-group:not(:first-child) {
+  border-top: 1px solid var(--div);
+  margin-top: 5px;
+  padding-top: 9px;
 }
 
 /* 「最近打开」空态占位 */
@@ -2213,6 +2237,10 @@ body.low-end * {
 }
 .sb-body.hidden {
   display: none;
+}
+/* 搜索停靠模式：FileTree 只剩头部按钮行，不参与拉伸，让搜索面板占据剩余高度 */
+.sb-body.searching > .sidebar {
+  flex: 0 0 auto;
 }
 /* FileTree 根 .sidebar 原为 .body 行布局直接子项（stretch 撑高）；
    包进 .sb-body 列布局后需显式 flex:1 保持撑满，否则树区下方露空 */

@@ -4750,6 +4750,12 @@ ${bodyHtml}
       onOpenRecent={(p) => cmd(() => openFileByPath(p))}
     />
 
+    {#if !menubarVisible}
+      <!-- 菜单栏隐藏时的 Alt 提示（点击等效 Alt） -->
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <button class="alt-hint" on:click={() => (menubarVisible = true)} title="菜单栏已隐藏：按 Alt 键显示（点击此处等效）">菜单栏 Alt</button>
+    {/if}
+
     <!-- 自定义窗口控制按钮 -->
     <div class="win-ctrl">
       <button class="wc" on:click={winMinimize} title="最小化">─</button>
@@ -4786,9 +4792,8 @@ ${bodyHtml}
         <div class="sb-tabs" role="tablist" aria-label="侧栏面板">
           <button class="sb-tab" class:on={sidebarTab === "tree"} role="tab" aria-selected={sidebarTab === "tree"} on:click={() => (sidebarTab = "tree")}>目录</button>
           <button class="sb-tab" class:on={sidebarTab === "outline"} role="tab" aria-selected={sidebarTab === "outline"} on:click={() => (sidebarTab = "outline")}>大纲</button>
-          <button class="sb-tab" class:on={sidebarTab === "search"} role="tab" aria-selected={sidebarTab === "search"} on:click={() => (sidebarTab = "search")}>搜索</button>
         </div>
-        <div class="sb-body" class:hidden={sidebarTab !== "tree"}>
+        <div class="sb-body" class:hidden={sidebarTab === "outline"} class:searching={sidebarTab === "search"}>
         <FileTree
           bind:this={treeRef}
           store={treeStore}
@@ -4816,18 +4821,22 @@ ${bodyHtml}
             onRootsChanged: onTreeRootsChanged,
             checkPathExists: (p) => pathExists(p),
           }}
+          searchActive={sidebarTab === "search"}
+          contentHidden={sidebarTab === "search"}
           on:collapse={() => (showTree = false)}
+          on:toggleSearch={() => (sidebarTab = sidebarTab === "search" ? "tree" : "search")}
         />
+        {#if sidebarTab === "search"}
+          <div class="sb-search">
+            <p class="sb-search-hint">在整个文件夹内查找 / 替换</p>
+            <button class="sb-search-btn" on:click={() => cmd(openFolderSearch)} disabled={!settings.lastFolder}>
+              {settings.lastFolder ? "打开文件夹查找替换" : "请先打开一个文件夹"}
+            </button>
+          </div>
+        {/if}
       </div>
       {#if sidebarTab === "outline"}
         <OutlinePanel items={outlineItems} activeLine={cursorLine - 1} onJump={jumpToLine} />
-      {:else if sidebarTab === "search"}
-        <div class="sb-search">
-          <p class="sb-search-hint">在整个文件夹内查找 / 替换</p>
-          <button class="sb-search-btn" on:click={() => cmd(openFolderSearch)} disabled={!settings.lastFolder}>
-            {settings.lastFolder ? "打开文件夹查找替换" : "请先打开一个文件夹"}
-          </button>
-        </div>
       {/if}
       </div>
       <!-- svelte-ignore a11y-no-static-element-interactions -->

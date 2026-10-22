@@ -41,6 +41,10 @@
   export let store: TreeStore;
   export let sidebarWidth: number;
   export let currentPath: string | null = null;
+  /** 搜索停靠面板激活（头部 🔍 高亮；由 App 传 sidebarTab === "search"） */
+  export let searchActive = false;
+  /** 隐藏头部以下内容（搜索面板接管内容区，但头部按钮行保持可见可切换） */
+  export let contentHidden = false;
   export let defaultDir: string | null = null;
   export let hiddenPaths: string[] = [];
   /** 文件树是否隐藏附件文件夹（名称由 assetsDir 指定，默认 _attachment） */
@@ -609,9 +613,14 @@
   function onRenameKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
       e.preventDefault();
+      // 阻断冒泡：重命名输入框是父级 <ul on:keydown={onListKeydown}> 的子节点，
+      // 若不 stopPropagation，回车会冒泡到 onListKeydown 用「旧路径」误打开文件 /
+      // 误折叠文件夹；Esc 会误清空搜索过滤框（S-1）。
+      e.stopPropagation();
       void commitRename();
     } else if (e.key === "Escape") {
       e.preventDefault();
+      e.stopPropagation(); // 同上，阻断冒泡到 onListKeydown
       cancelRename();
     }
   }
@@ -1173,21 +1182,25 @@
   let watchBusy = false;
   $: watchRootsKey = state.rootPaths.join("|");
   $: if (watchRootsKey) void restartWatch();
-  async function restartWatch() {
-    if (!state.rootPaths.length) return;
+  async function restartWatch(): Promise<boolean> {
+    if (!state.rootPaths.length) return false;
     stopWatching();
     watchBusy = true;
     watchOn = await startWatching(state.rootPaths, onFsChange);
     watchBusy = false;
+    return watchOn;
   }
-  function toggleWatch() {
+  async function toggleWatch() {
     if (watchOn) {
       stopWatching();
       watchOn = false;
       handlers.setStatus("目录监视已暂停");
     } else {
-      void restartWatch();
-      handlers.setStatus(watchOn ? "目录监视已开启" : "正在开启目录监视…");
+      handlers.setStatus("正在开启目录监视…");
+      // W-4 修复：状态文案以 startWatching 的真实返回值兜底，避免开启瞬间
+      // 读取到旧值（从关闭态开启时 watchOn 恒为 false）导致文案与真实状态不一致。
+      const ok = await restartWatch();
+      handlers.setStatus(ok ? "目录监视已开启" : "目录监视启动失败");
     }
   }
   function onFsChange(changes: FsChange[]) {
@@ -1340,10 +1353,13 @@
 
 <aside class="sidebar" style="width:{sidebarWidth}px">
   <div class="panel-head">
-    <span style="flex:1"></span>
     <button on:click={() => addRoot()} title="添加文件夹为根目录">＋</button>
     <button on:click={() => newFileIn(newTargetDir())} title="新建笔记（在当前上下文文件夹下创建）">📄+</button>
     <button on:click={() => newFolderIn(newTargetDir())} title="新建文件夹（在当前上下文文件夹下创建）">+</button>
+    <button
+      on:click={locateCurrent}
+      disabled={!currentPath}
+      title="在树中定位当前文件">⌖</button>
     <button on:click={doRefreshTree} title="刷新目录">↻</button>
     <button
       on:click={toggleHiddenItems}
@@ -1353,13 +1369,14 @@
       on:click={() => (showHiddenManage = true)}
       class:on={showHiddenManage || hiddenPaths.length > 0}
       title="隐藏文件/文件夹管理（含取消隐藏）">隐</button>
-    <button on:click={() => dispatch("collapse")} title="折叠">‹</button>
     <button
-      on:click={locateCurrent}
-      disabled={!currentPath}
-      title="在树中定位当前文件">⌖</button>
+      on:click={() => dispatch("toggleSearch")}
+      class:on={searchActive}
+      title="文件夹内查找 / 替换">🔍</button>
+    <button on:click={() => dispatch("collapse")} title="折叠">‹</button>
   </div>
 
+  {#if !contentHidden}
   <div class="tree-filter">
     <input
       type="text"
@@ -1523,14 +1540,9 @@
         class:on={state.showNonMd}
         title="显示资源文件（非 .md 附件）"
         on:click={toggleShowNonMd}>资源</button>
-      <button class="ts-btn" title="全部折叠" on:click={collapseAll}>⤢</button>
-      <button
-        class="ts-btn"
-        class:on={watchOn}
-        title={watchBusy ? "正在启动监视…" : watchOn ? "目录监视中：外部变更自动刷新（点击暂停）" : "目录监视已暂停（点击开启）"}
-        on:click={toggleWatch}>{watchOn ? "👁" : "🚫"}</button>
     {/if}
   </div>
+  {/if}
 
   {#if ctxMenu}
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->

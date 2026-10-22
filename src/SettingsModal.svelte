@@ -926,29 +926,99 @@
     padding: 6px 12px;
     font-size: 13px;
     border-radius: 9px;
+    border: none;
+    background: var(--bg);
+    color: var(--t1);
+    box-shadow: var(--rs-s);
+    cursor: pointer;
+    transition: box-shadow 0.15s, color 0.15s, background 0.15s;
+  }
+
+  .btn:hover {
+    color: var(--p);
+  }
+
+  .btn:active {
+    box-shadow: var(--is-s);
+    color: var(--p);
   }
 
   .btn:disabled {
     opacity: 0.4;
     cursor: default;
+    box-shadow: none;
   }
 
   .btn.primary {
-    background: var(--p);
-    border-color: var(--p);
+    background: linear-gradient(135deg, var(--pt), var(--pb));
+    border: none;
     color: #fff;
+    box-shadow: 2px 2px 5px var(--ps), -2px -2px 5px var(--sl);
+  }
+
+  .btn.primary:hover {
+    color: #fff;
+  }
+
+  .btn.primary:disabled {
+    opacity: 0.5;
+    box-shadow: none;
   }
 
   .chip {
     padding: 5px 14px;
     font-size: 13px;
-    border-radius: 6px;
+    border-radius: 9px;
+    border: none;
+    background: var(--bg);
+    color: var(--t2);
+    box-shadow: var(--rs-s);
+    cursor: pointer;
+    transition: box-shadow 0.15s, color 0.15s, background 0.15s;
+  }
+
+  .chip:hover {
+    color: var(--t1);
   }
 
   .chip.on {
     background: var(--tint);
-    border-color: var(--p);
+    box-shadow: var(--is-s);
     color: var(--p);
+    font-weight: 500;
+  }
+
+  /* 单选组：内凹轨道 + 选中项凸起高亮（对齐设计规范 .modeseg） */
+  .radio-group {
+    display: inline-flex;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 10px;
+    background: var(--bg);
+    box-shadow: var(--is-s);
+  }
+
+  .radio-group label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--t2);
+    cursor: pointer;
+    transition: box-shadow 0.15s, color 0.15s, background 0.15s;
+  }
+
+  .radio-group label:has(input:checked) {
+    background: var(--tint);
+    box-shadow: var(--rs-s);
+    color: var(--p);
+    font-weight: 500;
+  }
+
+  .radio-group input[type="radio"] {
+    accent-color: var(--p);
   }
 
   .tag {
@@ -1007,15 +1077,85 @@
     margin-top: 4px;
   }
 
+  /* 复选框：内凹底 + 选中凸起渐变（对齐新拟态） */
   input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    accent-color: var(--p);
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 6px;
+    background: var(--bg);
+    box-shadow: var(--is-s);
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+    transition: box-shadow 0.15s, background 0.15s;
   }
 
+  input[type="checkbox"]:checked {
+    background: linear-gradient(135deg, var(--pt), var(--pb));
+    box-shadow: 2px 2px 4px var(--ps), -2px -2px 4px var(--sl);
+  }
+
+  input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 2px;
+    width: 5px;
+    height: 10px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+
+  input[type="checkbox"]:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  /* 滑块：内凹轨道 + 渐变凸起拇指（对齐新拟态） */
   input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
     width: 180px;
-    accent-color: var(--p);
+    height: 22px;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 6px;
+    border-radius: 6px;
+    background: var(--bg);
+    box-shadow: var(--is-s);
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    margin-top: -5px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--pt), var(--pb));
+    box-shadow: 2px 2px 4px var(--ps), -2px -2px 4px var(--sl);
+  }
+
+  input[type="range"]::-moz-range-track {
+    height: 6px;
+    border-radius: 6px;
+    background: var(--bg);
+    box-shadow: var(--is-s);
+  }
+
+  input[type="range"]::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border: none;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--pt), var(--pb));
+    box-shadow: 2px 2px 4px var(--ps), -2px -2px 4px var(--sl);
   }
 
   input[type="range"]:disabled {
